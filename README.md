@@ -6,6 +6,8 @@
 
 LektorAI by Slawaspr0 to aplikacja do tworzenia polskiej ścieżki lektorskiej dla filmów i seriali. Program korzysta z wybranego silnika TTS, generuje głos lektora na podstawie napisów, składa go w jedną ścieżkę audio, miksuje z oryginalnym tłem filmu i dodaje do wynikowego pliku MKV.
 
+Projekt jest świadomie skupiony na języku polskim. Nie jest tworzony jako uniwersalna, wielojęzyczna platforma TTS. Priorytetem jest polski lektor, poprawna polska wymowa, dobra synchronizacja z napisami i jakość końcowej ścieżki audio.
+
 Projekt jest rozwijany z myślą o jakości lektora, kontroli nad procesem i pracy na wielu silnikach TTS bez mieszania ich zależności.
 
 ## Co robi program?
@@ -402,6 +404,6 @@ Projekt powstał dzięki analizie, testom i inspiracji wieloma rozwiązaniami TT
 
 Szczególne podziękowania:
 
-- użytkownikowi `gangg111` i projektowi [Lektor_AI](https://github.com/gangg111/Lektor_AI/) za inspirację,
+- użytkownikowi [gangg111](https://github.com/gangg111) i projektowi [Lektor_AI](https://github.com/gangg111/Lektor_AI/) za inspirację,
 - projektowi [Chatterbox TTS](https://github.com/resemble-ai/chatterbox) za silnik TTS wykorzystywany w lokalnym generowaniu głosu,
 - projektowi [OmniVoice TTS](https://github.com/k2-fsa/OmniVoice) za silnik TTS wykorzystywany w lokalnym generowaniu głosu.
