@@ -14,6 +14,7 @@ from app.core.dictionary import load_dictionary, save_dictionary
 from app.core.logging import setup_app_logger
 from app.core.media_tools import (
     BINARY_LOOKUP_HINT,
+    DEFAULT_AAC_BITRATE,
     DEFAULT_BACKGROUND_LUFS,
     DEFAULT_BACKGROUND_WEIGHT,
     DEFAULT_LEKTOR_LUFS,
@@ -149,7 +150,7 @@ def audio_defaults_summary() -> dict[str, object]:
         "lektor_weight": DEFAULT_LEKTOR_WEIGHT,
         "background_lufs": DEFAULT_BACKGROUND_LUFS,
         "background_weight": DEFAULT_BACKGROUND_WEIGHT,
-        "aac_bitrate": "256k",
+        "aac_bitrate": DEFAULT_AAC_BITRATE,
         "lektor_delay_ms": DEFAULT_LEKTOR_DELAY_MS,
         "create_stereo_for_surround": True,
     }

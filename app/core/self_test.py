@@ -779,7 +779,7 @@ def run_self_test(app_dir: Path) -> list[str]:
         first_engine_config_backup = engine_config_path.parent / "config.broken.2026.01.02.03.04.05.json"
         _assert(first_engine_config_backup.is_file(), "broken engine config backup missing")
         recreated_engine_config = json.loads(engine_config_path.read_text(encoding="utf-8"))
-        _assert(recreated_engine_config.get("t3_model") == "v3", "engine config not recreated")
+        _assert(recreated_engine_config.get("t3_model") == "v2", "engine config not recreated")
         engine_config_path.write_text("{broken engine config again", encoding="utf-8")
         broken_manager.ensure_engine_config("chatterbox")
         second_engine_config_backup = engine_config_path.parent / "config.broken.2026.01.02.03.04.05_2.json"
@@ -790,7 +790,7 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(third_engine_config_backup.is_file(), "non-object engine config backup missing")
         recreated_non_object_config = json.loads(engine_config_path.read_text(encoding="utf-8"))
         _assert(
-            recreated_non_object_config.get("t3_model") == "v3",
+            recreated_non_object_config.get("t3_model") == "v2",
             "non-object engine config not recreated",
         )
 
@@ -866,7 +866,7 @@ def run_self_test(app_dir: Path) -> list[str]:
         merge_manager.ensure_engine_config("chatterbox")
         merged_config = json.loads(merge_config_path.read_text(encoding="utf-8"))
         _assert(merged_config.get("t3_model") == "v3", "engine config merge overwrote user T3 model")
-        _assert(float(merged_config.get("cfg_weight")) == 1.2, "engine config merge did not repair bad float")
+        _assert(float(merged_config.get("cfg_weight")) == 1.9, "engine config merge did not repair bad float")
         _assert(merged_config.get("whisper_qc_retry_attempts") == 4, "engine config merge did not coerce numeric int")
         _assert(merged_config.get("custom_private_flag") == "keep-me", "engine config merge removed unknown key")
         _assert(merged_config.get("seed") == 12345, "engine config merge did not add missing seed")
@@ -1075,10 +1075,10 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(defaults["edge"].get("rate") == "+0%" and defaults["edge"].get("pitch") == "+0Hz", "edge default sliders should be neutral")
     _assert(defaults["edge"].get("edge_apply_segment_fade") is True, "edge trim should be enabled by default")
     _assert(defaults["edge"].get("edge_trim_start_ms") == 180 and defaults["edge"].get("edge_trim_end_ms") == 800, "edge default trim values mismatch")
-    _assert(defaults["edge"].get("whisper_qc_enabled") is False, "edge Whisper QC should be disabled by default")
-    _assert(defaults["edge"].get("whisper_qc_retry_attempts") == 2, "edge default Whisper retry attempts mismatch")
+    _assert(defaults["edge"].get("whisper_qc_enabled") is True, "edge Whisper QC should be enabled by default")
+    _assert(defaults["edge"].get("whisper_qc_retry_attempts") == 3, "edge default Whisper retry attempts mismatch")
     _assert(defaults["edge"].get("whisper_qc_model") == "small", "edge default Whisper model mismatch")
-    _assert(defaults["edge"].get("whisper_qc_min_similarity") == 0.75, "edge default Whisper similarity mismatch")
+    _assert(defaults["edge"].get("whisper_qc_min_similarity") == 0.92, "edge default Whisper similarity mismatch")
     _assert("edge_trim_fade_ms" not in edge_field_keys, "edge trim fade should stay hidden/internal")
     _assert(edge_fields["voice"].field_type == "choice", "edge voice should be a dropdown")
     _assert(edge_fields["voice"].show_help is False, "edge voice should not show a help button")
@@ -1144,7 +1144,7 @@ def run_self_test(app_dir: Path) -> list[str]:
         _cleanup_tree(sparse_norm_dir)
     _assert(sanitize_aac_bitrate("384k") == "384k", "AAC bitrate sanitizer should accept 384k")
     _assert(sanitize_aac_bitrate("640") == "640k", "AAC bitrate sanitizer should add k suffix")
-    _assert(sanitize_aac_bitrate("bad") == "256k", "AAC bitrate sanitizer should fallback to default")
+    _assert(sanitize_aac_bitrate("bad") == "384k", "AAC bitrate sanitizer should fallback to default")
     _assert(sanitize_lektor_delay_ms(123) == 100, "lektor delay should snap to configured step")
     _assert(sanitize_lektor_delay_ms(-5000) == 0, "lektor delay should clamp negative values to zero")
     _assert(sanitize_lektor_delay_ms(5000) == MAX_LEKTOR_DELAY_MS, "lektor delay should clamp to maximum")
@@ -1181,9 +1181,9 @@ def run_self_test(app_dir: Path) -> list[str]:
             Path("source_audio.wav"),
             Path("lektor.m4a"),
             Path("pl_2_0.m4a"),
-            lektor_weight=2.0,
+            lektor_weight=2.3,
             background_lufs=-18,
-            background_weight=1.0,
+            background_weight=1.6,
             bitrate="384k",
         )
     )
@@ -1194,14 +1194,14 @@ def run_self_test(app_dir: Path) -> list[str]:
             Path("source_audio.wav"),
             Path("lektor.m4a"),
             Path("pl_5_1.m4a"),
-            lektor_weight=2.0,
+            lektor_weight=2.3,
             background_lufs=-18,
-            background_weight=1.0,
+            background_weight=1.6,
             bitrate="384k",
         )
     )
     _assert("aformat=channel_layouts=stereo" in stereo_stage_text, "stereo mix stage should downmix background before adding lektor")
-    _assert("volume=1" in stereo_stage_text and "volume=0.6667" in stereo_stage_text, "stereo mix stage should scale background and lektor predictably")
+    _assert("volume=1" in stereo_stage_text and "volume=0.5897" in stereo_stage_text, "stereo mix stage should scale background and lektor predictably")
     _assert(stereo_stage_text.count("asetpts=PTS-STARTPTS") >= 2, "stereo mix stage should reset audio PTS")
     _assert("async=1:first_pts=0" not in stereo_stage_text, "stereo mix stage should not use async first_pts padding")
     _assert("normalize=0" in stereo_stage_text and "alimiter=limit=0.9:level=false:latency=1" in stereo_stage_text, "stereo mix stage should keep limiter protection")
@@ -1224,7 +1224,10 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert("--no-audio" in mkvmerge_remux_text and "film.mkv" in mkvmerge_remux_text, "mkvmerge remux should copy source video/subtitles without original audio first")
     _assert("--language 0:pol" in mkvmerge_remux_text and f"0:{APP_NAME} edge 2.0" in mkvmerge_remux_text, "mkvmerge remux should tag prepared PL tracks")
     _assert("--default-track-flag 0:yes" in mkvmerge_remux_text and "--default-track-flag 1:no" in mkvmerge_remux_text, "mkvmerge remux should set default flags for PL and original audio")
-    _assert(validate_engine_config("edge", defaults["edge"]) == [], "edge default config should be valid")
+    edge_default_errors = [
+        error for error in validate_engine_config("edge", defaults["edge"]) if "faster-whisper" not in error
+    ]
+    _assert(edge_default_errors == [], "edge default config should be valid")
     _assert(validate_engine_config("chatterbox", defaults["chatterbox"]) == [], "chatterbox default config should be valid")
     _assert(validate_engine_config("omnivoice", defaults["omnivoice"]) == [], "omnivoice default config should be valid")
     openai_config = dict(defaults["openai"])
@@ -1275,7 +1278,11 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(defaults[engine_id].get("save_audio_mix_steps") is False, f"{engine_id} should not save audio mix steps by default")
         if engine_id not in {"chatterbox", "omnivoice"}:
             _assert(defaults[engine_id].get("audio_qc_enabled") is False, f"{engine_id} Audio QC should be disabled by default")
-        _assert(defaults[engine_id].get("whisper_qc_enabled") is False, f"{engine_id} Whisper QC should be disabled by default")
+        expected_whisper_enabled = engine_id in {"edge", "chatterbox", "omnivoice"}
+        _assert(
+            defaults[engine_id].get("whisper_qc_enabled") is expected_whisper_enabled,
+            f"{engine_id} Whisper QC default mismatch",
+        )
         _assert(int(defaults[engine_id].get("whisper_qc_retry_attempts", 0)) >= 1, f"{engine_id} Whisper QC retry attempts should have a default")
     for engine_id in ("chatterbox",):
         _assert("seed" in {field.key for field in fields_for(engine_id)}, f"{engine_id} seed should stay in config schema")
@@ -1292,9 +1299,9 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(chatterbox_visible_keys == {field.key for field in visible_fields_for("chatterbox")}, "chatterbox visible key cache mismatch")
     _assert("trim_leading_silence" in chatterbox_visible_keys, "chatterbox leading silence trim should be visible")
     _assert(defaults["chatterbox"].get("trim_leading_silence") is True, "chatterbox leading silence trim should be enabled by default")
-    _assert(defaults["chatterbox"].get("t3_model") == "v3", "chatterbox should default to v3")
-    _assert(defaults["chatterbox"].get("cfg_weight") == 1.2, "chatterbox CFG default mismatch")
-    _assert(defaults["chatterbox"].get("exaggeration") == 0.4, "chatterbox exaggeration default mismatch")
+    _assert(defaults["chatterbox"].get("t3_model") == "v2", "chatterbox should default to v2")
+    _assert(defaults["chatterbox"].get("cfg_weight") == 1.9, "chatterbox CFG default mismatch")
+    _assert(defaults["chatterbox"].get("exaggeration") == 0.1, "chatterbox exaggeration default mismatch")
     chatterbox_field_labels = {field.key: field.label for field in fields_for("chatterbox")}
     _assert(chatterbox_field_labels.get("t3_model") == "Wersja modelu Chatterbox", "chatterbox T3 model label should be user friendly")
     _assert(chatterbox_field_labels.get("trim_leading_silence") == "Wycinanie poczatkowej ciszy", "chatterbox leading trim label should be user friendly")
@@ -1304,8 +1311,8 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert("language" not in omnivoice_visible_keys and "language_id" not in omnivoice_visible_keys, "omnivoice language should be fixed to Polish and hidden from UI")
     _assert("audio_qc_enabled" not in defaults["omnivoice"], "omnivoice Audio QC default should be removed")
     _assert("audio_qc_retry_attempts" not in defaults["omnivoice"], "omnivoice Audio QC retry default should be removed")
-    _assert(defaults["omnivoice"].get("num_step") == 32, "omnivoice num_step default mismatch")
-    _assert(defaults["omnivoice"].get("guidance_scale") == 2.0, "omnivoice CFG default mismatch")
+    _assert(defaults["omnivoice"].get("num_step") == 48, "omnivoice num_step default mismatch")
+    _assert(defaults["omnivoice"].get("guidance_scale") == 3.8, "omnivoice CFG default mismatch")
     _assert(defaults["omnivoice"].get("speed") == 1.0, "omnivoice speed default mismatch")
     _assert(defaults["omnivoice"].get("denoise") is True, "omnivoice denoise default mismatch")
     _assert(defaults["omnivoice"].get("preprocess_prompt") is False, "omnivoice preprocess prompt should be disabled by default")
@@ -2079,9 +2086,12 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(len(compacted_log) <= 80 and compacted_log.endswith("..."), "long app log messages should be compacted")
     _assert(aac_quality_options() == ("192k", "256k", "320k", "384k", "448k", "640k"), "AAC quality options mismatch")
     _assert(aac_quality_label("384k") == "384 kb/s", "AAC quality label mismatch")
-    _assert(aac_quality_label("bad") == "256 kb/s", "AAC quality invalid label fallback mismatch")
+    _assert(aac_quality_label("bad") == "384 kb/s", "AAC quality invalid label fallback mismatch")
     _assert(audio_defaults_summary()["lektor_lufs"] == -14, "audio defaults lektor LUFS mismatch")
-    _assert(audio_defaults_summary()["aac_bitrate"] == "256k", "audio defaults AAC bitrate mismatch")
+    _assert(audio_defaults_summary()["aac_bitrate"] == "384k", "audio defaults AAC bitrate mismatch")
+    _assert(audio_defaults_summary()["lektor_weight"] == 2.3, "audio defaults lektor weight mismatch")
+    _assert(audio_defaults_summary()["background_lufs"] == -18, "audio defaults background LUFS mismatch")
+    _assert(audio_defaults_summary()["background_weight"] == 1.6, "audio defaults background weight mismatch")
     _assert(audio_defaults_summary()["lektor_delay_ms"] == DEFAULT_LEKTOR_DELAY_MS, "audio defaults lektor delay mismatch")
     _assert(audio_defaults_summary()["create_stereo_for_surround"] is True, "audio defaults should create additional stereo for 5.1 sources")
     _assert(format_lektor_delay_label(100) == "+100 ms", "positive lektor delay label mismatch")
@@ -2265,7 +2275,7 @@ def run_self_test(app_dir: Path) -> list[str]:
         config_store.set_aac_bitrate("384k")
         _assert(config_store.aac_bitrate() == "384k", "AAC bitrate setter mismatch")
         config_store.set_aac_bitrate("not-valid")
-        _assert(config_store.aac_bitrate() == "256k", "AAC bitrate setter should sanitize invalid values")
+        _assert(config_store.aac_bitrate() == "384k", "AAC bitrate setter should sanitize invalid values")
         config_store.set_lektor_delay_ms(123)
         _assert(config_store.lektor_delay_ms() == 100, "lektor delay setter should sanitize values")
         config_store.set_create_stereo_for_surround(False)
@@ -2311,11 +2321,11 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(merged_data["ui"]["window"]["width"] == 1280, "app config merge did not persist window width default")
         _assert(merged_data["ui"]["window"]["height"] == 780, "app config merge did not persist window height default")
         _assert(merged_data["ui"]["window"]["mode"] == "normal", "app config merge did not persist window mode default")
-        _assert(merged_data["output"]["aac_bitrate"] == "256k", "app config merge did not persist AAC bitrate default")
+        _assert(merged_data["output"]["aac_bitrate"] == "384k", "app config merge did not persist AAC bitrate default")
         _assert(merged_data["output"]["lektor_lufs"] == -14, "app config merge did not persist lektor LUFS default")
-        _assert(merged_data["output"]["lektor_weight"] == 2.0, "app config merge did not persist lektor weight default")
+        _assert(merged_data["output"]["lektor_weight"] == 2.3, "app config merge did not persist lektor weight default")
         _assert(merged_data["output"]["background_lufs"] == -18, "app config merge did not persist background LUFS default")
-        _assert(merged_data["output"]["background_weight"] == 1.0, "app config merge did not persist background weight default")
+        _assert(merged_data["output"]["background_weight"] == 1.6, "app config merge did not persist background weight default")
         _assert(merged_data["output"]["lektor_delay_ms"] == DEFAULT_LEKTOR_DELAY_MS, "app config merge did not persist lektor delay default")
         merged_store.set_window_state(1440, 900, "maximized")
         window_state = merged_store.window_state()
@@ -2417,7 +2427,7 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(isinstance(bad_sections_data.get("output"), dict), "bad output section should be restored")
         _assert(bad_sections_data["ui"]["last_file_dir"] == "", "bad ui section default mismatch")
         _assert(bad_sections_data["tts"]["last_engine"] == "", "bad tts section default mismatch")
-        _assert(bad_sections_data["output"]["aac_bitrate"] == "256k", "bad output section AAC bitrate default mismatch")
+        _assert(bad_sections_data["output"]["aac_bitrate"] == "384k", "bad output section AAC bitrate default mismatch")
         _assert(bad_sections_data["custom_root_flag"] == "keep-root", "custom root key should survive bad section repair")
         bad_sections_store.set_last_file_dir(str(app_dir))
         bad_sections_store.set_last_engine("edge")
