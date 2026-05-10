@@ -1,0 +1,2583 @@
+﻿from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import wave
+from array import array
+from pathlib import Path
+
+from app.core.dictionary import sanitize_dictionary, save_dictionary
+from app.core.config import AppConfigStore
+from app.core.diagnostics import collect_diagnostics
+from app.core.logging import app_log_path, broken_json_backup_path, engine_log_path, safe_name, setup_app_logger
+from app.core.media_tools import (
+    BINARY_LOOKUP_HINT,
+    DEFAULT_LEKTOR_DELAY_MS,
+    MAX_LEKTOR_DELAY_MS,
+    MIN_LEKTOR_DELAY_MS,
+    OUTPUT_AUDIO_SAMPLE_RATE,
+    audio_stream_summary,
+    extract_primary_audio_command,
+    find_binary,
+    find_ffmpeg,
+    find_mkvmerge,
+    find_ffprobe,
+    encode_wav_to_aac_command,
+    mix_lektor_stereo_audio_command,
+    mix_lektor_surround_audio_command,
+    normalize_lektor_wav,
+    normalize_lektor_wav_command,
+    prepare_voice_sample_command,
+    probe_media_duration,
+    remux_with_prepared_lektor_audio_mkvmerge_command,
+    sanitize_aac_bitrate,
+    sanitize_lektor_delay_ms,
+    ffmpeg_command_with_progress,
+    select_subtitle_stream_index,
+    select_text_subtitle_stream_index,
+    supported_voice_sample_extensions,
+    trim_fixed_and_fade_wav_edges,
+    voice_sample_sample_rate,
+    wav_audio_diagnostics,
+)
+from app.core.paths import build_paths
+from app.core.preflight import build_preflight_report
+from app.core.version import APP_NAME, APP_VERSION
+from app.cli.engine_commands import remove_engine_command
+from app.engines.config_schema import fields_for, is_audio_qc_field, is_diagnostic_field, is_speech_qc_field, visible_fields_for
+from app.engines.config_validation import validate_engine_config, validate_whisper_qc_dependency
+from app.engines.install_specs import TORCH_CU126_INDEX, TORCH_CU128_INDEX, get_install_spec
+from app.engines.manager import EngineManager
+from app.engines.protocol import (
+    EngineRequest,
+    EngineResult,
+    SegmentRequest,
+    SegmentResult,
+    read_result,
+    write_request,
+    write_result,
+)
+from app.engines.registry import get_engine_definitions
+from app.engines.runner import DEFAULT_WORKER_TIMEOUT_S
+from app.engines.schemas import EngineStatus
+from app.pipeline.manifest import write_segments_manifest
+from app.pipeline.progress import (
+    FILE_PROGRESS_TOTAL,
+    decode_progress_marker,
+    encode_progress_marker,
+    ffmpeg_progress_ratio,
+    format_progress_status,
+    progress_value_for_stage,
+    safe_unit_eta_seconds,
+)
+from app.pipeline.audio_qc import analyze_generated_segments
+from app.pipeline.subtitles import (
+    SUPPORTED_SUBTITLE_EXTENSIONS,
+    SubtitleSegment,
+    apply_dictionary,
+    clean_subtitle_text,
+    load_srt,
+    save_srt,
+)
+from app.pipeline.whisper_qc import (
+    faster_whisper_missing_message,
+    normalize_for_whisper_qc,
+    score_whisper_transcript,
+    text_similarity,
+)
+from app.pipeline.tts_job import (
+    _build_local_engine_request,
+    _find_sidecar_subtitles,
+    _format_builtin_qc_retry_message,
+    _format_builtin_qc_selected_message,
+    _edge_retry_text,
+    _edge_retry_text_variants,
+    _generated_audio_from_worker_result,
+    _cleanup_lektor_debug_files,
+    apply_lektor_delay_to_segments,
+    _local_worker_qc_warning_summary,
+    _model_activity_message_for_worker_line,
+    _quality_chain_label,
+    _quality_controls_summary,
+    _validated_worker_generated_audio,
+    local_worker_timeout_seconds,
+    run_tts_job,
+)
+from app.pipeline.audio_timeline import SAMPLE_RATE, SEGMENT_EDGE_FADE_MS, build_lektor_wav
+from app.pipeline.workspace import lektor_assets_dir, lektorai_workspace_for, next_output_stem
+from app.ui.main_window import (
+    audio_defaults_summary,
+    build_start_confirmation_text,
+    clear_engine_status_cache,
+    compact_app_log_message,
+    engine_combo_label,
+    aac_quality_label,
+    aac_quality_options,
+    format_lektor_delay_label,
+    format_duration,
+    is_sidecar_for_existing_video,
+    missing_ffmpeg_message,
+    missing_mkvmerge_message,
+    missing_ffprobe_message,
+    natural_path_key,
+    progress_bar_style,
+    should_enable_engine_actions,
+    should_enable_start_button,
+    stored_engine_after_selection,
+    main_window_minimum_size,
+    main_window_refresh_keeps_engine_signals_blocked,
+    slider_value_to_weight,
+    weight_to_slider_value,
+)
+from app.ui.dialogs.settings_dialog import (
+    choice_value_for_widget,
+    coerce_bool_for_widget,
+    coerce_float_for_widget,
+    coerce_int_for_widget,
+    choice_data_for_widget,
+    edge_slider_value_for_widget,
+    format_edge_slider_value,
+    merge_engine_settings_values,
+    settings_help_button_label,
+)
+from app.ui.dialogs.dictionary_dialog import should_show_dictionary_row
+from app.ui.dialogs.dictionary_dialog import load_dictionary_external_file, save_dictionary_external_file
+from app.ui.dialogs.diagnostics_dialog import diagnostic_table_text
+from app.ui.dialogs.scrollable_text_dialog import scrollable_details_line_wrap_mode
+from app.ui.dialogs.tts_manager_dialog import initial_install_button_label, should_enable_keep_settings_remove
+
+
+def run_self_test(app_dir: Path) -> list[str]:
+    messages: list[str] = []
+    paths = build_paths(app_dir)
+    _assert(paths.app_dir == app_dir.resolve(), "portable app_dir mismatch")
+    _assert(paths.app_packages_dir == app_dir.resolve() / "packages", "portable app packages dir mismatch")
+    messages.append("paths: OK")
+
+    start_module = _load_start_module(app_dir / "START.py")
+    _assert(getattr(start_module, "APP_NAME", None) == APP_NAME, "START.py APP_NAME mismatch")
+    _assert(getattr(start_module, "APP_VERSION", None) == APP_VERSION, "START.py APP_VERSION mismatch")
+    _assert(hasattr(start_module, "APP_PACKAGES_DIR"), "START.py should expose portable app packages dir")
+    messages.append("version sync: OK")
+
+    version_result = subprocess.run(
+        [sys.executable, "-B", str(app_dir / "START.py"), "--version"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=5,
+    )
+    _assert(version_result.returncode == 0, "START.py --version should exit with 0")
+    _assert(version_result.stdout.strip() == f"{APP_NAME} {APP_VERSION}", "START.py --version output mismatch")
+    messages.append("launcher version: OK")
+
+    help_probe_dir = app_dir / "_self_test_help_runtime"
+    saved_srt_path = app_dir / "_self_test_saved.srt"
+    try:
+        help_probe_dir.mkdir(parents=True, exist_ok=True)
+        help_start = app_dir / "START.py"
+        help_result = subprocess.run(
+            [sys.executable, "-B", str(help_start), "--help"],
+            cwd=str(help_probe_dir),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        _assert(help_result.returncode == 0, "START.py --help should exit with 0")
+        _assert("START.py --version" in help_result.stdout, "START.py --help output missing version command")
+        _assert(
+            "--remove-engine ID      usuwa caly folder lokalnego TTS" in help_result.stdout,
+            "START.py --help remove wording mismatch",
+        )
+        _assert(
+            not (help_probe_dir / "config.json").exists()
+            and not (help_probe_dir / "logs").exists()
+            and not (help_probe_dir / "engines").exists(),
+            "START.py --help should not create runtime files in cwd",
+        )
+    finally:
+        _cleanup_tree(help_probe_dir)
+    messages.append("launcher help: OK")
+
+    cli_probe_dir = app_dir / "_self_test_cli_readonly_cwd"
+    try:
+        cli_probe_dir.mkdir(parents=True, exist_ok=True)
+        cli_commands = [
+            (
+                ["--diagnose"],
+                ("Aplikacja", "Python", "TTS: Edge TTS"),
+                "START.py --diagnose",
+            ),
+            (
+                ["--list-engines"],
+                ("Edge TTS", "Chatterbox", "OmniVoice"),
+                "START.py --list-engines",
+            ),
+            (
+                ["--engine-install-plan", "chatterbox"],
+                ("Silnik: Chatterbox", "Venv:", "Pakiety:"),
+                "START.py --engine-install-plan chatterbox",
+            ),
+        ]
+        for args, expected_parts, label in cli_commands:
+            result = subprocess.run(
+                [sys.executable, "-B", str(app_dir / "START.py"), *args],
+                cwd=str(cli_probe_dir),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+            )
+            _assert(result.returncode == 0, f"{label} should exit with 0")
+            for expected in expected_parts:
+                _assert(expected in result.stdout, f"{label} output missing {expected!r}")
+        preflight_result = subprocess.run(
+            [sys.executable, "-B", str(app_dir / "START.py"), "--preflight"],
+            cwd=str(cli_probe_dir),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+        _assert(preflight_result.returncode in {0, 1}, "START.py --preflight should exit with readiness status")
+        _assert(f"Preflight {APP_NAME}" in preflight_result.stdout, "START.py --preflight output missing header")
+        _assert("Silniki gotowe" in preflight_result.stdout, "START.py --preflight output missing engine count")
+        _assert(
+            not (cli_probe_dir / "config.json").exists()
+            and not (cli_probe_dir / "logs").exists()
+            and not (cli_probe_dir / "engines").exists(),
+            "readonly CLI commands should not create runtime files in cwd",
+        )
+    finally:
+        _cleanup_tree(cli_probe_dir)
+    messages.append("launcher readonly CLI: OK")
+
+    _assert(not (app_dir / "app" / "app").exists(), "nested app/app directory should not exist")
+    forbidden_path_fragments = tuple(
+        drive + separator + "LektorAI" + separator + folder
+        for drive, separator in (("C:", "\\"), ("C:", "/"))
+        for folder in ("TEST", "FINAL")
+    )
+    offenders: list[str] = []
+    for scan_file in _portable_scan_files(app_dir):
+        text = scan_file.read_text(encoding="utf-8", errors="replace")
+        for fragment in forbidden_path_fragments:
+            if fragment in text:
+                offenders.append(f"{scan_file.relative_to(app_dir)}: {fragment}")
+    _assert(not offenders, "hardcoded portable paths found: " + "; ".join(offenders[:5]))
+    messages.append("portable layout: OK")
+
+    portable_bins_dir = app_dir / "_self_test_portable_bins"
+    portable_bin_paths = build_paths(portable_bins_dir)
+    try:
+        bin_dir = portable_bins_dir / "bin"
+        tools_dir = portable_bins_dir / "tools"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        tools_dir.mkdir(parents=True, exist_ok=True)
+        ffmpeg_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+        ffprobe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+        mkvmerge_name = "mkvmerge.exe" if os.name == "nt" else "mkvmerge"
+        path_dir = portable_bins_dir / "_path"
+        path_dir.mkdir()
+        path_ffmpeg = path_dir / ffmpeg_name
+        path_ffprobe = path_dir / ffprobe_name
+        path_mkvmerge = path_dir / mkvmerge_name
+        path_ffmpeg.write_text("", encoding="utf-8")
+        path_ffprobe.write_text("", encoding="utf-8")
+        path_mkvmerge.write_text("", encoding="utf-8")
+        (portable_bins_dir / ffmpeg_name).write_text("", encoding="utf-8")
+        (portable_bins_dir / ffprobe_name).write_text("", encoding="utf-8")
+        (portable_bins_dir / mkvmerge_name).write_text("", encoding="utf-8")
+        (bin_dir / ffmpeg_name).write_text("", encoding="utf-8")
+        (tools_dir / ffprobe_name).write_text("", encoding="utf-8")
+        original_which = find_binary.__globals__["shutil"].which
+
+        def fake_which(binary_name):
+            mapping = {
+                ffmpeg_name: path_ffmpeg,
+                "ffmpeg": path_ffmpeg,
+                ffprobe_name: path_ffprobe,
+                "ffprobe": path_ffprobe,
+                mkvmerge_name: path_mkvmerge,
+                "mkvmerge": path_mkvmerge,
+            }
+            candidate = mapping.get(str(binary_name))
+            return str(candidate) if candidate is not None else None
+
+        find_binary.__globals__["shutil"].which = fake_which
+        _assert(find_ffmpeg(portable_bin_paths) == path_ffmpeg, "portable ffmpeg PATH lookup mismatch")
+        _assert(find_ffprobe(portable_bin_paths) == path_ffprobe, "portable ffprobe PATH lookup mismatch")
+        _assert(find_mkvmerge(portable_bin_paths) == path_mkvmerge, "portable mkvmerge PATH lookup mismatch")
+        find_binary.__globals__["shutil"].which = lambda _binary_name: None
+        _assert(find_ffmpeg(portable_bin_paths) == portable_bins_dir / ffmpeg_name, "portable ffmpeg root fallback mismatch")
+        _assert(find_ffprobe(portable_bin_paths) == portable_bins_dir / ffprobe_name, "portable ffprobe root fallback mismatch")
+        _assert(find_mkvmerge(portable_bin_paths) == portable_bins_dir / mkvmerge_name, "portable mkvmerge root fallback mismatch")
+        find_binary.__globals__["shutil"].which = original_which
+        _assert("mkvmerge.exe" in BINARY_LOOKUP_HINT and "START.py" in BINARY_LOOKUP_HINT, "binary lookup hint mismatch")
+        _assert("PATH" in BINARY_LOOKUP_HINT and "bin/tools" not in BINARY_LOOKUP_HINT, "binary lookup hint should mention PATH and not bin/tools")
+    finally:
+        try:
+            find_binary.__globals__["shutil"].which = original_which
+        except UnboundLocalError:
+            pass
+        _cleanup_tree(portable_bins_dir)
+    messages.append("portable binary lookup: OK")
+
+    subtitle_streams = [
+        {"codec_name": "subrip", "tags": {"language": "eng", "title": "Plain subtitles"}},
+        {"codec_name": "subrip", "tags": {"language": "", "title": "Polish subtitles"}},
+    ]
+    _assert(select_subtitle_stream_index(subtitle_streams) == 1, "plain title should not count as Polish marker")
+    subtitle_streams = [
+        {"codec_name": "hdmv_pgs_subtitle", "tags": {"language": "pol", "title": "Polskie PGS"}},
+        {"codec_name": "subrip", "tags": {"language": "eng", "title": "English SRT"}},
+    ]
+    _assert(select_subtitle_stream_index(subtitle_streams) == 1, "bitmap subtitles should not beat text subtitles")
+    _assert(select_text_subtitle_stream_index(subtitle_streams) == 1, "text subtitle selector mismatch")
+    bitmap_only_streams = [
+        {"codec_name": "hdmv_pgs_subtitle", "tags": {"language": "pol", "title": "Polskie PGS"}},
+        {"codec_name": "dvd_subtitle", "tags": {"language": "eng", "title": "English VobSub"}},
+    ]
+    _assert(select_text_subtitle_stream_index(bitmap_only_streams) is None, "bitmap-only subtitles should not be selected as text")
+    forced_streams = [
+        {"codec_name": "subrip", "tags": {"language": "pol", "title": "Polskie forced"}},
+        {"codec_name": "subrip", "tags": {"language": "eng", "title": "English full"}},
+    ]
+    _assert(select_text_subtitle_stream_index(forced_streams) == 1, "forced subtitles should not beat full subtitles")
+    regional_language_streams = [
+        {"codec_name": "subrip", "tags": {"language": "eng", "title": "English full"}},
+        {"codec_name": "subrip", "tags": {"language": "pl-PL", "title": "Full subtitles"}},
+    ]
+    _assert(select_text_subtitle_stream_index(regional_language_streams) == 1, "regional Polish language tag mismatch")
+    forced_disposition_streams = [
+        {"codec_name": "subrip", "disposition": {"forced": 1}, "tags": {"language": "pol", "title": "Polskie"}},
+        {"codec_name": "subrip", "tags": {"language": "eng", "title": "English full"}},
+    ]
+    _assert(
+        select_text_subtitle_stream_index(forced_disposition_streams) == 1,
+        "forced disposition should not beat full subtitles",
+    )
+    default_disposition_streams = [
+        {"codec_name": "subrip", "tags": {"language": "eng", "title": "English A"}},
+        {"codec_name": "subrip", "disposition": {"default": 1}, "tags": {"language": "eng", "title": "English B"}},
+    ]
+    _assert(
+        select_text_subtitle_stream_index(default_disposition_streams) == 1,
+        "default disposition should break equal subtitle score ties",
+    )
+    messages.append("subtitle stream scoring: OK")
+
+    sibling_test_dir = app_dir.parent / "TEST"
+    sibling_final_dir = app_dir.parent / "FINAL"
+    if sibling_test_dir.is_dir() and sibling_final_dir.is_dir():
+        shared_files = ("START.py", "requirements.txt")
+        mismatches = [
+            name
+            for name in shared_files
+            if (sibling_test_dir / name).read_bytes() != (sibling_final_dir / name).read_bytes()
+        ]
+        _assert(not mismatches, "TEST/FINAL shared files mismatch: " + ", ".join(mismatches))
+        messages.append("test/final shared files: OK")
+
+        test_app_files = _relative_app_files(sibling_test_dir / "app")
+        final_app_files = _relative_app_files(sibling_final_dir / "app")
+        missing_in_final = sorted(test_app_files - final_app_files)
+        extra_in_final = sorted(final_app_files - test_app_files)
+        _assert(not missing_in_final, "FINAL app missing files: " + ", ".join(str(rel) for rel in missing_in_final[:5]))
+        _assert(not extra_in_final, "FINAL app has extra files: " + ", ".join(str(rel) for rel in extra_in_final[:5]))
+        app_mismatches = [
+            rel
+            for rel in sorted(test_app_files)
+            if (sibling_test_dir / "app" / rel).read_bytes() != (sibling_final_dir / "app" / rel).read_bytes()
+        ]
+        _assert(not app_mismatches, "TEST/FINAL app files mismatch: " + ", ".join(str(rel) for rel in app_mismatches[:5]))
+        messages.append("test/final app files: OK")
+
+    requirements_path = app_dir / "requirements.txt"
+    _assert(requirements_path.is_file(), "requirements.txt missing")
+    app_requirements = _requirement_names(requirements_path)
+    expected_app_requirements = {"pyqt6", "edge-tts", "faster-whisper", "openai"}
+    _assert(expected_app_requirements.issubset(app_requirements), "app requirements missing expected packages")
+    forbidden_app_requirements = {
+        "torch",
+        "torchaudio",
+        "torchvision",
+        "chatterbox-tts",
+        "protobuf",
+        "transformers",
+        "diffusers",
+        "onnx",
+        "onnxruntime",
+        "onnxruntime-gpu",
+        "soundfile",
+    }
+    heavy_packages = sorted(app_requirements & forbidden_app_requirements)
+    _assert(not heavy_packages, "heavy local TTS packages in app requirements: " + ", ".join(heavy_packages))
+    messages.append("app requirements: OK")
+
+    if app_dir.name.upper() == "FINAL":
+        allowed_final_items = {
+            "START.py",
+            "requirements.txt",
+            "config.json",
+            "app",
+            "logs",
+            "ffmpeg.exe",
+            "ffprobe.exe",
+            "mkvmerge.exe",
+            "ffmpeg",
+            "ffprobe",
+            "mkvmerge",
+        }
+        unexpected_final_items = sorted(
+            child.name
+            for child in app_dir.iterdir()
+            if child.name not in allowed_final_items and child.name != "__pycache__" and not child.name.startswith("_self_test_")
+        )
+        _assert(
+            not unexpected_final_items,
+            "FINAL package contains unexpected top-level items: " + ", ".join(unexpected_final_items[:8]),
+        )
+        forbidden_final_items = (
+            "engines",
+            "bin",
+            "tools",
+            "bin/ffmpeg.exe",
+            "bin/ffprobe.exe",
+            "bin/mkvmerge.exe",
+            "bin/ffmpeg",
+            "bin/ffprobe",
+            "bin/mkvmerge",
+            "tools/ffmpeg.exe",
+            "tools/ffprobe.exe",
+            "tools/mkvmerge.exe",
+            "tools/ffmpeg",
+            "tools/ffprobe",
+            "tools/mkvmerge",
+        )
+        present_final_items = [name for name in forbidden_final_items if (app_dir / name).exists()]
+        _assert(
+            not present_final_items,
+            "FINAL package contains runtime/heavy items: " + ", ".join(present_final_items),
+        )
+        messages.append("final minimal package: OK")
+    elif app_dir.name.upper() == "TEST":
+        allowed_test_items = {
+            "START.py",
+            "requirements.txt",
+            "config.json",
+            "app",
+            "logs",
+            "engines",
+            "ffmpeg.exe",
+            "ffprobe.exe",
+            "mkvmerge.exe",
+            "ffmpeg",
+            "ffprobe",
+            "mkvmerge",
+            "bin",
+            "tools",
+            "packages",
+        }
+        unexpected_test_items = sorted(
+            child.name
+            for child in app_dir.iterdir()
+            if child.name not in allowed_test_items and child.name != "__pycache__" and not child.name.startswith("_self_test_")
+        )
+        _assert(
+            not unexpected_test_items,
+            "TEST package contains unexpected top-level items: " + ", ".join(unexpected_test_items[:8]),
+        )
+        messages.append("test package layout: OK")
+
+    local_specs = {engine_id: get_install_spec(engine_id) for engine_id in ("chatterbox", "omnivoice")}
+    for engine_id, spec in local_specs.items():
+        _assert(spec.engine_id == engine_id, f"{engine_id} install spec id mismatch")
+        _assert(spec.torch_requirements, f"{engine_id} torch install spec has no torch requirements")
+        _assert(spec.requirements, f"{engine_id} install spec has no requirements")
+        _assert(spec.import_checks, f"{engine_id} install spec has no import checks")
+        _assert(
+            any(requirement.startswith("torch") for requirement in spec.torch_requirements),
+            f"{engine_id} install spec missing torch package",
+        )
+        _assert(
+            any(requirement.startswith("torch") for requirement in spec.constraints),
+            f"{engine_id} install spec missing torch constraint",
+        )
+        _assert(
+            not any("faster-whisper" in requirement for requirement in spec.requirements),
+            f"{engine_id} should use app-level faster-whisper instead of installing it into venv",
+        )
+        _assert(
+            "faster_whisper" not in spec.import_checks,
+            f"{engine_id} install import checks should not validate app-level faster_whisper",
+        )
+    _assert(local_specs["chatterbox"].torch_requirements == ("torch==2.6.0", "torchaudio==2.6.0"), "chatterbox should use original torch pair")
+    _assert(local_specs["chatterbox"].torch_index_url == TORCH_CU126_INDEX, "chatterbox torch index mismatch")
+    _assert(
+        any("chatterbox-tts" in requirement and "github.com/resemble-ai/chatterbox" in requirement for requirement in local_specs["chatterbox"].requirements),
+        "chatterbox should install current upstream repo",
+    )
+    _assert("chatterbox-tts" not in local_specs["chatterbox"].no_deps_requirements, "chatterbox should install original deps")
+    _assert(not local_specs["chatterbox"].allowed_pip_check_prefixes, "chatterbox should not tolerate dependency conflicts in original env")
+    _assert(local_specs["omnivoice"].torch_requirements == ("torch==2.8.0+cu128", "torchaudio==2.8.0+cu128"), "omnivoice should use its upstream torch pair")
+    _assert(local_specs["omnivoice"].torch_index_url == TORCH_CU128_INDEX, "omnivoice torch index mismatch")
+    _assert("omnivoice==0.1.5" in local_specs["omnivoice"].requirements, "omnivoice should install pinned PyPI release")
+    messages.append("local install specs: OK")
+
+    manager = EngineManager(paths)
+    manager._package_check_cache[("chatterbox|dummy", "chatterbox")] = ("chatterbox",)
+    clear_engine_status_cache(manager)
+    _assert(not manager._package_check_cache, "engine package cache should be clearable before explicit refresh")
+    states = manager.list_states()
+    _assert(any(state.definition.engine_id == "edge" for state in states), "missing edge definition")
+    _assert(any(state.definition.engine_id == "openai" for state in states), "missing openai definition")
+    _assert(any(state.definition.engine_id == "chatterbox" for state in states), "missing chatterbox definition")
+    _assert(any(state.definition.engine_id == "omnivoice" for state in states), "missing omnivoice definition")
+    for state in states:
+        if state.definition.engine_id in {"chatterbox", "omnivoice"}:
+            install_checks = set(get_install_spec(state.definition.engine_id).import_checks)
+            if state.definition.engine_id == "chatterbox":
+                _assert(
+                    "faster_whisper" in state.definition.import_checks,
+                    f"{state.definition.engine_id} runtime status should still see app-level faster_whisper",
+                )
+            _assert(install_checks.issubset(set(state.definition.import_checks)), f"{state.definition.engine_id} registry import checks should cover install import checks")
+    missing_runtime_manager = EngineManager(build_paths(app_dir / "_self_test_missing_runtime"))
+    _assert(not missing_runtime_manager.local_runtime_exists("chatterbox"), "missing venv should not count as local runtime")
+    missing_script = manager._import_missing_script(("json", "missing_package_for_self_test"))
+    _assert("missing_package_for_self_test" in missing_script, "missing import script should include checked names")
+    diagnostics_script = manager._import_diagnostics_script(("json", "missing_package_for_self_test"))
+    _assert("IMPORT OK" in diagnostics_script, "import diagnostics should log successful imports")
+    _assert("IMPORT MISSING" in diagnostics_script, "import diagnostics should log missing imports")
+    _assert("__file__" in diagnostics_script, "import diagnostics should log package origin")
+    messages.append("engine registry: OK")
+
+    readonly_probe_dir = app_dir / "_self_test_readonly_probe"
+    readonly_paths = build_paths(readonly_probe_dir)
+    readonly_manager = EngineManager(readonly_paths)
+    _assert(not readonly_probe_dir.exists(), "readonly probe dir should start missing")
+    readonly_manager.list_states()
+    readonly_rows = collect_diagnostics(readonly_paths, readonly_manager)
+    preflight_ok, preflight_lines = build_preflight_report(readonly_paths, readonly_manager)
+    _assert(isinstance(preflight_ok, bool), "preflight should return boolean status")
+    _assert(any(f"Preflight {APP_NAME}" in line for line in preflight_lines), "preflight report missing header")
+    _assert(
+        importlib.util.find_spec("faster_whisper") is not None
+        or any("faster-whisper" in line for line in preflight_lines),
+        "preflight should warn when faster-whisper is missing",
+    )
+    _assert(not readonly_probe_dir.exists(), "preflight should not create app runtime dirs")
+    readonly_ffmpeg_row = next(row for row in readonly_rows if row[0] == "ffmpeg")
+    readonly_mkvmerge_row = next(row for row in readonly_rows if row[0] == "mkvmerge")
+    readonly_fw_row = next(row for row in readonly_rows if row[0] == "Pakiet: faster_whisper")
+    _assert(readonly_fw_row[1] in {"OK", "brak"}, "faster_whisper diagnostic row status mismatch")
+    _assert(
+        readonly_fw_row[1] == "OK" or "pip install -r" in readonly_fw_row[2],
+        "missing app package diagnostic should include install hint",
+    )
+    _assert(
+        readonly_ffmpeg_row[2] == BINARY_LOOKUP_HINT or readonly_ffmpeg_row[1] == "OK",
+        "missing ffmpeg diagnostic should show lookup hint",
+    )
+    _assert(
+        readonly_mkvmerge_row[2] == BINARY_LOOKUP_HINT or readonly_mkvmerge_row[1] == "OK",
+        "missing mkvmerge diagnostic should show lookup hint",
+    )
+    _assert(not readonly_probe_dir.exists(), "diagnostic/list commands should not create app runtime dirs")
+    messages.append("readonly diagnostics: OK")
+
+    install_preview_dir = app_dir / "_self_test_install_preview"
+    install_preview_paths = build_paths(install_preview_dir)
+    install_preview_manager = EngineManager(install_preview_paths)
+    try:
+        _assert(not install_preview_dir.exists(), "install preview dir should start missing")
+        for engine_id in ("chatterbox", "omnivoice"):
+            lines = install_preview_manager.local_install_preview(engine_id)
+            joined = "\n".join(lines)
+            _assert("PyTorch CUDA:" in joined, f"install preview missing torch section for {engine_id}")
+            _assert(f"  --index-url {get_install_spec(engine_id).torch_index_url}" in joined, f"install preview missing torch index for {engine_id}")
+            _assert("Constraints:" in joined, f"install preview missing constraints for {engine_id}")
+            _assert(
+                any(f"  {constraint}" in joined for constraint in get_install_spec(engine_id).constraints),
+                f"install preview missing constraint entries for {engine_id}",
+            )
+            _assert("Pakiety:" in joined, f"install preview missing requirements for {engine_id}")
+            _assert("faster-whisper" not in joined, f"install preview should not install faster-whisper inside {engine_id}")
+            _assert("Pakiety bez zaleznosci:" not in joined, f"{engine_id} should not use no-deps install section")
+            _assert("  faster_whisper" not in joined, f"install preview should not show app-level faster_whisper for {engine_id}")
+            _assert("Venv:" in joined, f"install preview missing venv path for {engine_id}")
+            engine_dir = install_preview_paths.engine_dir(engine_id)
+            torch_command = install_preview_manager._torch_install_command(
+                engine_dir / "venv" / "Scripts" / "python.exe",
+                get_install_spec(engine_id),
+                engine_dir / "constraints.txt",
+            )
+            _assert("-c" in torch_command and str(engine_dir / "constraints.txt") in torch_command, f"torch install command missing constraints for {engine_id}")
+        build_tools_command = install_preview_manager._build_tools_install_command(Path("python.exe"))
+        _assert("--upgrade" not in build_tools_command, "build tools install should not upgrade pip on every retry")
+        _assert("wheel" in build_tools_command and "setuptools" in build_tools_command, "build tools command missing expected packages")
+        tolerated_pip_check = "chatterbox-tts 0.1.7 has requirement torch==2.6.0; python_version < \"3.14\", but you have torch 2.11.0+cu126."
+        _assert(
+            not install_preview_manager._is_allowed_pip_check_line(local_specs["chatterbox"], tolerated_pip_check),
+            "chatterbox original env should not tolerate torch metadata conflicts",
+        )
+        _assert(
+            not install_preview_manager._is_allowed_pip_check_line(local_specs["chatterbox"], "other-package 1.0 requires missing-package"),
+            "unexpected pip check conflicts should not be tolerated",
+        )
+        try:
+            install_preview_manager.local_install_preview("edge")
+            raise AssertionError("edge install preview should fail")
+        except ValueError:
+            pass
+        _assert(not install_preview_dir.exists(), "install preview should not create app runtime dirs")
+    finally:
+        _cleanup_tree(install_preview_dir)
+    messages.append("install preview readonly: OK")
+
+    old_openai_key = os.environ.pop("OPENAI_API_KEY", None)
+    openai_probe_dir = app_dir / "_self_test_openai_key"
+    openai_paths = build_paths(openai_probe_dir)
+    openai_manager = EngineManager(openai_paths)
+    try:
+        no_key_state = openai_manager.state_for("openai")
+        _assert(no_key_state.status == EngineStatus.REQUIRES_CONFIG, "openai without key should require config")
+        _assert("api_key: brak" in no_key_state.components, "openai missing key label mismatch")
+        config_path = openai_manager.ensure_engine_config("openai")
+        config_data = json.loads(config_path.read_text(encoding="utf-8"))
+        config_data["api_key"] = "test-key"
+        config_path.write_text(json.dumps(config_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        config_key_state = openai_manager.state_for("openai")
+        _assert("api_key: config" in config_key_state.components, "openai config key label mismatch")
+        os.environ["OPENAI_API_KEY"] = "env-test-key"
+        env_key_state = openai_manager.state_for("openai")
+        _assert("api_key: ENV" in env_key_state.components, "openai env key label mismatch")
+    finally:
+        if old_openai_key is None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        else:
+            os.environ["OPENAI_API_KEY"] = old_openai_key
+        _cleanup_tree(openai_probe_dir)
+    messages.append("openai api key source: OK")
+
+    log_probe_dir = app_dir / "_self_test_engine_logs"
+    original_timestamp = engine_log_path.__globals__["timestamp"]
+    try:
+        engine_log_path.__globals__["timestamp"] = lambda: "2026.01.02.03.04.05"
+        app_log_path.__globals__["timestamp"] = lambda: "2026.01.02.03.04.05"
+        first_app_log = app_log_path(log_probe_dir)
+        first_app_log.write_text("test\n", encoding="utf-8")
+        second_app_log = app_log_path(log_probe_dir)
+        _assert(first_app_log != second_app_log, "app log path should avoid collisions")
+        _assert(second_app_log.name == "app_2026.01.02.03.04.05_2.log", f"unexpected app log suffix: {second_app_log.name}")
+        first_log = engine_log_path(log_probe_dir, "chatterbox", "Film.mkv")
+        first_log.write_text("test\n", encoding="utf-8")
+        second_log = engine_log_path(log_probe_dir, "chatterbox", "Film.mkv")
+        _assert(first_log != second_log, "engine log path should avoid collisions")
+        _assert(second_log.name.endswith("_2.log"), f"unexpected engine log suffix: {second_log.name}")
+        long_log = engine_log_path(log_probe_dir, "chatterbox", ("Zażółć" * 40) + ".mkv")
+        _assert(len(long_log.name) < 140, f"engine log name should be bounded: {len(long_log.name)}")
+        polish_filename = (
+            "Za"
+            + chr(0x017C)
+            + chr(0x00F3)
+            + chr(0x0142)
+            + chr(0x0107)
+            + " g"
+            + chr(0x0119)
+            + chr(0x015B)
+            + "l"
+            + chr(0x0105)
+            + " ja"
+            + chr(0x017A)
+            + chr(0x0144)
+            + " "
+            + chr(0x0141)
+            + chr(0x00F3)
+            + "d"
+            + chr(0x017A)
+            + ".mkv"
+        )
+        _assert(safe_name(polish_filename) == "Zazolc_gesla_jazn_Lodz.mkv", "safe_name Polish transliteration mismatch")
+    finally:
+        engine_log_path.__globals__["timestamp"] = original_timestamp
+        app_log_path.__globals__["timestamp"] = original_timestamp
+        _cleanup_tree(log_probe_dir)
+    messages.append("log naming: OK")
+
+    app_logger_probe_dir = app_dir / "_self_test_app_logger"
+    original_timestamp = app_log_path.__globals__["timestamp"]
+    try:
+        app_log_path.__globals__["timestamp"] = lambda: "2026.01.02.03.04.05"
+        logger, first_log = setup_app_logger(app_logger_probe_dir)
+        logger.info("first")
+        logger, second_log = setup_app_logger(app_logger_probe_dir)
+        logger.info("second")
+        for handler in list(logger.handlers):
+            handler.flush()
+            logger.removeHandler(handler)
+            handler.close()
+        _assert(first_log.name == "app_2026.01.02.03.04.05.log", "unexpected first app logger name")
+        _assert(second_log.name == "app_2026.01.02.03.04.05_2.log", "unexpected second app logger name")
+        _assert("first" in first_log.read_text(encoding="utf-8"), "first app log missing message")
+        _assert("second" in second_log.read_text(encoding="utf-8"), "second app log missing message")
+    finally:
+        app_log_path.__globals__["timestamp"] = original_timestamp
+        _cleanup_tree(app_logger_probe_dir)
+    messages.append("app logger reopen: OK")
+
+    broken_probe_dir = app_dir / "_self_test_broken_json"
+    broken_probe_dir.mkdir(parents=True, exist_ok=True)
+    broken_json = broken_probe_dir / "config.json"
+    original_timestamp = broken_json_backup_path.__globals__["timestamp"]
+    try:
+        broken_json_backup_path.__globals__["timestamp"] = lambda: "2026.01.02.03.04.05"
+        first_backup = broken_json_backup_path(broken_json)
+        first_backup.write_text("broken-1\n", encoding="utf-8")
+        second_backup = broken_json_backup_path(broken_json)
+        _assert(first_backup != second_backup, "broken json backup path should avoid collisions")
+        _assert(
+            second_backup.name == "config.broken.2026.01.02.03.04.05_2.json",
+            f"unexpected broken backup suffix: {second_backup.name}",
+        )
+    finally:
+        broken_json_backup_path.__globals__["timestamp"] = original_timestamp
+        _cleanup_tree(broken_probe_dir)
+    messages.append("broken json naming: OK")
+
+    broken_runtime_dir = app_dir / "_self_test_broken_runtime_json"
+    broken_runtime_paths = build_paths(broken_runtime_dir)
+    original_timestamp = broken_json_backup_path.__globals__["timestamp"]
+    try:
+        broken_json_backup_path.__globals__["timestamp"] = lambda: "2026.01.02.03.04.05"
+        broken_config = broken_runtime_dir / "config.json"
+        broken_runtime_dir.mkdir(parents=True, exist_ok=True)
+        broken_config.write_text("{broken config", encoding="utf-8")
+        AppConfigStore(broken_config).load()
+        first_config_backup = broken_runtime_dir / "config.broken.2026.01.02.03.04.05.json"
+        _assert(first_config_backup.is_file(), "broken app config backup missing")
+        _assert(json.loads(broken_config.read_text(encoding="utf-8")).get("version") == 1, "app config not recreated")
+        broken_config.write_text("{broken config again", encoding="utf-8")
+        AppConfigStore(broken_config).load()
+        second_config_backup = broken_runtime_dir / "config.broken.2026.01.02.03.04.05_2.json"
+        _assert(second_config_backup.is_file(), "second broken app config backup missing")
+
+        broken_manager = EngineManager(broken_runtime_paths)
+        engine_config_path = broken_runtime_paths.engine_dir("chatterbox") / "config.json"
+        engine_config_path.parent.mkdir(parents=True, exist_ok=True)
+        engine_config_path.write_text("{broken engine config", encoding="utf-8")
+        broken_manager.ensure_engine_config("chatterbox")
+        first_engine_config_backup = engine_config_path.parent / "config.broken.2026.01.02.03.04.05.json"
+        _assert(first_engine_config_backup.is_file(), "broken engine config backup missing")
+        recreated_engine_config = json.loads(engine_config_path.read_text(encoding="utf-8"))
+        _assert(recreated_engine_config.get("t3_model") == "v3", "engine config not recreated")
+        engine_config_path.write_text("{broken engine config again", encoding="utf-8")
+        broken_manager.ensure_engine_config("chatterbox")
+        second_engine_config_backup = engine_config_path.parent / "config.broken.2026.01.02.03.04.05_2.json"
+        _assert(second_engine_config_backup.is_file(), "second broken engine config backup missing")
+        engine_config_path.write_text('["not", "an", "object"]\n', encoding="utf-8")
+        broken_manager.ensure_engine_config("chatterbox")
+        third_engine_config_backup = engine_config_path.parent / "config.broken.2026.01.02.03.04.05_3.json"
+        _assert(third_engine_config_backup.is_file(), "non-object engine config backup missing")
+        recreated_non_object_config = json.loads(engine_config_path.read_text(encoding="utf-8"))
+        _assert(
+            recreated_non_object_config.get("t3_model") == "v3",
+            "non-object engine config not recreated",
+        )
+
+        dictionary_path = broken_runtime_paths.engine_dir("chatterbox") / "dictionary.json"
+        dictionary_path.write_text("{broken dictionary", encoding="utf-8")
+        broken_manager.ensure_engine_dictionary("chatterbox")
+        first_dictionary_backup = dictionary_path.parent / "dictionary.broken.2026.01.02.03.04.05.json"
+        _assert(first_dictionary_backup.is_file(), "broken dictionary backup missing")
+        _assert(json.loads(dictionary_path.read_text(encoding="utf-8")) == {}, "dictionary not recreated")
+        dictionary_path.write_text("{broken dictionary again", encoding="utf-8")
+        broken_manager.ensure_engine_dictionary("chatterbox")
+        second_dictionary_backup = dictionary_path.parent / "dictionary.broken.2026.01.02.03.04.05_2.json"
+        _assert(second_dictionary_backup.is_file(), "second broken dictionary backup missing")
+        dictionary_path.write_text('["not", "a", "dictionary"]\n', encoding="utf-8")
+        broken_manager.ensure_engine_dictionary("chatterbox")
+        third_dictionary_backup = dictionary_path.parent / "dictionary.broken.2026.01.02.03.04.05_3.json"
+        _assert(third_dictionary_backup.is_file(), "non-object dictionary backup missing")
+        _assert(json.loads(dictionary_path.read_text(encoding="utf-8")) == {}, "non-object dictionary not recreated")
+    finally:
+        broken_json_backup_path.__globals__["timestamp"] = original_timestamp
+        _cleanup_tree(broken_runtime_dir)
+    messages.append("broken JSON quarantine: OK")
+
+    lazy_dictionary_dir = app_dir / "_self_test_lazy_dictionary"
+    lazy_dictionary_paths = build_paths(lazy_dictionary_dir)
+    lazy_dictionary_manager = EngineManager(lazy_dictionary_paths)
+    try:
+        config_path = lazy_dictionary_manager.ensure_engine_config("edge")
+        dictionary_path = lazy_dictionary_paths.engine_dir("edge") / "dictionary.json"
+        _assert(config_path.is_file(), "engine config should be created on engine selection")
+        _assert(config_path.read_text(encoding="utf-8").endswith("\n"), "engine config should end with newline")
+        _assert(not dictionary_path.exists(), "dictionary should not be created with engine config")
+        created_dictionary_path = lazy_dictionary_manager.ensure_engine_dictionary("edge")
+        _assert(created_dictionary_path == dictionary_path, "dictionary path mismatch")
+        _assert(json.loads(dictionary_path.read_text(encoding="utf-8")) == {}, "lazy dictionary content mismatch")
+        dictionary_path.write_text(
+            json.dumps({"alfa": "al fa", "x": "skip", "batman": "bat man", "joker": ""}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        lazy_dictionary_manager.ensure_engine_dictionary("edge")
+        normalized_dictionary_text = dictionary_path.read_text(encoding="utf-8")
+        normalized_dictionary = json.loads(normalized_dictionary_text)
+        _assert(normalized_dictionary == {"alfa": "al fa", "batman": "bat man"}, "existing dictionary normalize mismatch")
+        _assert(
+            normalized_dictionary_text.index('"alfa"') < normalized_dictionary_text.index('"batman"'),
+            "existing dictionary normalize sort mismatch",
+        )
+        _assert(normalized_dictionary_text.endswith("\n"), "existing dictionary normalize newline mismatch")
+    finally:
+        _cleanup_tree(lazy_dictionary_dir)
+    messages.append("lazy dictionary creation: OK")
+
+    merge_config_dir = app_dir / "_self_test_engine_config_merge"
+    merge_paths = build_paths(merge_config_dir)
+    merge_manager = EngineManager(merge_paths)
+    merge_config_path = merge_paths.engine_dir("chatterbox") / "config.json"
+    try:
+        merge_config_path.parent.mkdir(parents=True, exist_ok=True)
+        merge_config_path.write_text(
+            json.dumps(
+                {
+                    "t3_model": "v3",
+                    "cfg_weight": True,
+                    "whisper_qc_retry_attempts": "4",
+                    "custom_private_flag": "keep-me",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        merge_manager.ensure_engine_config("chatterbox")
+        merged_config = json.loads(merge_config_path.read_text(encoding="utf-8"))
+        _assert(merged_config.get("t3_model") == "v3", "engine config merge overwrote user T3 model")
+        _assert(float(merged_config.get("cfg_weight")) == 1.2, "engine config merge did not repair bad float")
+        _assert(merged_config.get("whisper_qc_retry_attempts") == 4, "engine config merge did not coerce numeric int")
+        _assert(merged_config.get("custom_private_flag") == "keep-me", "engine config merge removed unknown key")
+        _assert(merged_config.get("seed") == 12345, "engine config merge did not add missing seed")
+    finally:
+        _cleanup_tree(merge_config_dir)
+    messages.append("engine config merge: OK")
+
+    temp_app_dir = app_dir / "_self_test_engine_manager"
+    temp_paths = build_paths(temp_app_dir)
+    temp_manager = EngineManager(temp_paths)
+    engine_dir = temp_paths.engine_dir("chatterbox")
+    try:
+        temp_manager.prepare_local_engine("chatterbox")
+        prepared_items = sorted(path.name for path in engine_dir.iterdir())
+        _assert(prepared_items == ["install.log"], f"prepare local engine should not create user config: {prepared_items}")
+        temp_manager.remove_engine_completely("chatterbox")
+        temp_manager._ensure_venv = lambda _venv_dir, _log: None
+        temp_manager._run_logged = lambda _command, _log: None
+        temp_manager._run_pip_check = lambda _python_path, _spec, _log: None
+        temp_manager._run_import_checks = lambda _definition, _python_path, _log: None
+        temp_manager.install_worker_script = lambda engine_id: (temp_paths.engine_dir(engine_id) / "worker.py")
+        temp_manager.install_local_engine("chatterbox")
+        installed_items = sorted(path.name for path in engine_dir.iterdir())
+        _assert("config.json" not in installed_items, f"install should not create user config: {installed_items}")
+        _assert("dictionary.json" not in installed_items, f"install should not create user dictionary: {installed_items}")
+        temp_manager.remove_engine_completely("chatterbox")
+        temp_manager.ensure_engine_config("chatterbox")
+        temp_manager.ensure_engine_dictionary("chatterbox")
+        (engine_dir / "venv").mkdir(parents=True, exist_ok=True)
+        (engine_dir / "cache").mkdir(parents=True, exist_ok=True)
+        (engine_dir / "logs").mkdir(parents=True, exist_ok=True)
+        (engine_dir / "install.log").write_text("test\n", encoding="utf-8")
+        _assert(
+            not temp_manager._has_model_cache(engine_dir),
+            "empty local TTS cache should not count as downloaded model",
+        )
+        (engine_dir / "cache" / "whisper" / "model.bin").parent.mkdir(parents=True, exist_ok=True)
+        (engine_dir / "cache" / "whisper" / "model.bin").write_text("whisper\n", encoding="utf-8")
+        _assert(
+            not temp_manager._has_model_cache(engine_dir),
+            "Whisper QC cache should not count as downloaded TTS model",
+        )
+        (engine_dir / "cache" / "hf" / "model.bin").parent.mkdir(parents=True, exist_ok=True)
+        (engine_dir / "cache" / "hf" / "model.bin").write_text("model\n", encoding="utf-8")
+        _assert(temp_manager._has_model_cache(engine_dir), "non-empty local TTS cache should count as model payload")
+        temp_manager.remove_engine_keep_user_settings("chatterbox")
+        remaining = sorted(path.name for path in engine_dir.iterdir())
+        _assert(remaining == ["config.json", "dictionary.json"], f"keep settings remove mismatch: {remaining}")
+        _assert(not temp_manager.local_runtime_exists("chatterbox"), "removed runtime should not be selectable")
+        temp_manager.remove_engine_completely("chatterbox")
+        _assert(not engine_dir.exists(), "complete remove should delete engine dir")
+        venv_env = temp_manager._venv_creation_env(engine_dir / "venv")
+        _assert(venv_env["TEMP"].startswith(str(engine_dir)), "venv TEMP should stay inside engine dir")
+        _assert(venv_env["TMP"].startswith(str(engine_dir)), "venv TMP should stay inside engine dir")
+        worker_env = temp_manager._worker_env()
+        _assert(str(temp_paths.app_packages_dir) in worker_env.get("PYTHONPATH", ""), "worker PYTHONPATH should include app packages")
+    finally:
+        _cleanup_tree(temp_app_dir)
+    messages.append("engine removal: OK")
+
+    temp_cli_dir = app_dir / "_self_test_cli_remove"
+    temp_cli_paths = build_paths(temp_cli_dir)
+    temp_cli_manager = EngineManager(temp_cli_paths)
+    temp_cli_engine_dir = temp_cli_paths.engine_dir("chatterbox")
+    try:
+        code, message = remove_engine_command(temp_cli_manager, "edge", False)
+        _assert(code == 2 and "wbudowany" in message, "built-in CLI remove should be blocked")
+        code, message = remove_engine_command(temp_cli_manager, "nieistnieje", False)
+        _assert(code == 2 and "Nieznany" in message, "unknown CLI remove should fail")
+        code, message = remove_engine_command(temp_cli_manager, "chatterbox", True)
+        _assert(code == 0 and "nie ma lokalnego runtime" in message, "missing runtime CLI remove mismatch")
+        temp_cli_manager.ensure_engine_config("chatterbox")
+        temp_cli_manager.ensure_engine_dictionary("chatterbox")
+        (temp_cli_engine_dir / "cache").mkdir(parents=True, exist_ok=True)
+        code, message = remove_engine_command(temp_cli_manager, "chatterbox", True)
+        _assert(code == 0 and "ustawienia zachowane" in message, "cache-only keep settings CLI remove mismatch")
+        remaining = sorted(path.name for path in temp_cli_engine_dir.iterdir())
+        _assert(remaining == ["config.json", "dictionary.json"], f"CLI cache-only keep remove mismatch: {remaining}")
+        venv_python = temp_cli_manager._venv_python(temp_cli_engine_dir)
+        venv_python.parent.mkdir(parents=True, exist_ok=True)
+        venv_python.write_text("", encoding="utf-8")
+        (temp_cli_engine_dir / "cache").mkdir(parents=True, exist_ok=True)
+        code, message = remove_engine_command(temp_cli_manager, "chatterbox", True)
+        _assert(code == 0 and "ustawienia zachowane" in message, "keep settings CLI remove mismatch")
+        remaining = sorted(path.name for path in temp_cli_engine_dir.iterdir())
+        _assert(remaining == ["config.json", "dictionary.json"], f"CLI keep remove mismatch: {remaining}")
+        code, message = remove_engine_command(temp_cli_manager, "chatterbox", True)
+        _assert(
+            code == 0 and "nie ma lokalnego runtime" in message and "ustawienia" in message,
+            "config-only keep remove CLI message mismatch",
+        )
+        remaining = sorted(path.name for path in temp_cli_engine_dir.iterdir())
+        _assert(remaining == ["config.json", "dictionary.json"], f"CLI config-only keep remove mismatch: {remaining}")
+        code, message = remove_engine_command(temp_cli_manager, "chatterbox", False)
+        _assert(code == 0 and "calkowicie" in message, "complete CLI remove mismatch")
+        _assert(not temp_cli_engine_dir.exists(), "CLI complete remove should delete engine dir")
+    finally:
+        _cleanup_tree(temp_cli_dir)
+    messages.append("CLI engine remove: OK")
+
+    sample = "{\\an8}<i>Batman</i>\\N" + chr(0x266A)
+    cleaned = clean_subtitle_text(sample)
+    _assert(cleaned == "Batman", f"subtitle clean mismatch: {cleaned!r}")
+    dialog_cleaned = clean_subtitle_text("<i>- Czas?</i>\n- Nie teraz.")
+    _assert(dialog_cleaned == "Czas? Nie teraz.", f"subtitle dialog dash clean mismatch: {dialog_cleaned!r}")
+    compact_dialog_cleaned = clean_subtitle_text("-Czas?\n–Nie teraz.")
+    _assert(
+        compact_dialog_cleaned == "Czas? Nie teraz.",
+        f"subtitle compact dialog dash clean mismatch: {compact_dialog_cleaned!r}",
+    )
+    hyphen_cleaned = clean_subtitle_text("biało-czerwony")
+    _assert(hyphen_cleaned == "biało-czerwony", f"subtitle internal hyphen should stay: {hyphen_cleaned!r}")
+    replaced = apply_dictionary(sample, {"batman": "bat man"})
+    _assert(replaced == "bat man", f"dictionary apply mismatch: {replaced!r}")
+    literal_replaced = apply_dictionary("Batman", {"batman": r"bat\man"})
+    _assert(literal_replaced == r"bat\man", f"dictionary replacement should be literal: {literal_replaced!r}")
+    messages.append("subtitle cleanup/dictionary: OK")
+
+    sanitized, skipped = sanitize_dictionary(
+        {
+            " batman ": "bat man",
+            "Batman": "duplicate",
+            "joker": "",
+            "x": "skip",
+        }
+    )
+    _assert(sanitized == {"batman": "bat man"} and skipped == 3, "dictionary sanitize mismatch")
+    dictionary_save_path = app_dir / "_self_test_dictionary_save" / "dictionary.json"
+    try:
+        count, skipped_save = save_dictionary(dictionary_save_path, {"alfa": "al fa", "batman": "bat man"})
+        saved_dictionary_text = dictionary_save_path.read_text(encoding="utf-8")
+        _assert(count == 2 and skipped_save == 0, "dictionary save count mismatch")
+        _assert(saved_dictionary_text.endswith("\n"), "dictionary save should end with newline")
+        _assert(saved_dictionary_text.index('"alfa"') < saved_dictionary_text.index('"batman"'), "dictionary save sort mismatch")
+    finally:
+        _cleanup_tree(dictionary_save_path.parent)
+    messages.append("dictionary sanitize: OK")
+
+    edge_errors = validate_engine_config("edge", {"voice": "", "rate": "fast", "pitch": "low"})
+    _assert(any("glos" in error for error in edge_errors), "edge voice validation missing")
+    _assert(any("predkosc" in error for error in edge_errors), "edge rate validation missing")
+    edge_range_errors = validate_engine_config("edge", {"voice": "pl-PL-MarekNeural", "rate": "+150%", "pitch": "-150Hz"})
+    _assert(any("predkosc" in error for error in edge_range_errors), "edge rate range validation missing")
+    _assert(any("barwa" in error for error in edge_range_errors), "edge pitch range validation missing")
+    bool_number_errors = validate_engine_config("chatterbox", {"cfg_weight": True})
+    _assert(any("Stabilnosc tekstu" in error for error in bool_number_errors), "float bool validation missing")
+    openai_bool_number_errors = validate_engine_config("openai", {"audio_qc_retry_attempts": True})
+    _assert(any("Liczba prob kontroli audio" in error for error in openai_bool_number_errors), "int bool validation missing")
+    fractional_int_errors = validate_engine_config("chatterbox", {"cfg_weight": 1.25, "whisper_qc_retry_attempts": 1.5})
+    _assert(
+        any("Liczba prob" in error for error in fractional_int_errors),
+        "fractional int validation missing",
+    )
+    nonfinite_errors = validate_engine_config("chatterbox", {"cfg_weight": "nan"})
+    _assert(any("skonczona" in error for error in nonfinite_errors), "non-finite float validation missing")
+    device_errors = validate_engine_config("chatterbox", {"device": "gpu0"})
+    _assert(any("Urzadzenie" in error for error in device_errors), "device validation label should be user friendly")
+    omnivoice_range_errors = validate_engine_config("omnivoice", {"num_step": 2, "guidance_scale": 5.0, "speed": 2.0})
+    _assert(any("Kroki inferencji" in error for error in omnivoice_range_errors), "omnivoice num_step range validation missing")
+    _assert(any("CFG" in error for error in omnivoice_range_errors), "omnivoice CFG range validation missing")
+    _assert(any("Predkosc" in error for error in omnivoice_range_errors), "omnivoice speed range validation missing")
+    whisper_missing_errors = validate_whisper_qc_dependency({"whisper_qc_enabled": True}, lambda _name: False)
+    _assert(any("faster-whisper" in error for error in whisper_missing_errors), "Whisper QC dependency validation missing")
+    _assert(
+        any("wylacz" in error.lower() or "requirements" in error.lower() for error in whisper_missing_errors),
+        "Whisper QC dependency validation should suggest a fix",
+    )
+    whisper_disabled_errors = validate_whisper_qc_dependency({"whisper_qc_enabled": False}, lambda _name: False)
+    _assert(whisper_disabled_errors == [], "disabled Whisper QC should not require dependency")
+    local_whisper_errors = validate_engine_config("chatterbox", {"whisper_qc_enabled": True})
+    _assert(
+        not any("faster-whisper" in error for error in local_whisper_errors),
+        "local TTS Whisper QC should be validated through its venv status, not the main app env",
+    )
+    optional_audio_probe = app_dir / "_self_test_optional_audio.txt"
+    optional_mp3_probe = app_dir / "_self_test_optional_audio.mp3"
+    optional_flac_probe = app_dir / "_self_test_optional_audio.flac"
+    try:
+        optional_audio_probe.write_text("not wav\n", encoding="utf-8")
+        optional_audio_errors = validate_engine_config("chatterbox", {"audio_prompt_path": str(optional_audio_probe)})
+        _assert(any("WAV/MP3/FLAC" in error for error in optional_audio_errors), "optional voice sample extension validation missing")
+        optional_mp3_probe.write_text("fake mp3 placeholder\n", encoding="utf-8")
+        optional_flac_probe.write_text("fake flac placeholder\n", encoding="utf-8")
+        chatterbox_mp3_errors = validate_engine_config("chatterbox", {"audio_prompt_path": str(optional_mp3_probe)})
+        _assert(not chatterbox_mp3_errors, "chatterbox should accept MP3 voice samples")
+        chatterbox_flac_errors = validate_engine_config("chatterbox", {"audio_prompt_path": str(optional_flac_probe)})
+        _assert(not chatterbox_flac_errors, "chatterbox should accept FLAC voice samples for automatic preparation")
+        omnivoice_mp3_errors = validate_engine_config("omnivoice", {"reference_audio_path": str(optional_mp3_probe)})
+        _assert(not omnivoice_mp3_errors, "omnivoice should accept MP3 voice samples")
+    finally:
+        for probe in (optional_audio_probe, optional_mp3_probe, optional_flac_probe):
+            try:
+                probe.unlink()
+            except OSError:
+                pass
+    _assert(fields_for("tada") == (), "removed TADA should not have active config schema")
+    defaults = {definition.engine_id: definition.default_config for definition in get_engine_definitions()}
+    edge_fields = {field.key: field for field in fields_for("edge")}
+    edge_field_keys = set(edge_fields)
+    _assert("edge_apply_segment_fade" in edge_field_keys, "edge fade option should be visible in settings schema")
+    _assert(edge_fields["edge_apply_segment_fade"].label == "Przytnij i wygladz brzegi", "edge tuning label mismatch")
+    _assert("edge_trim_mode" not in edge_field_keys, "edge automatic trim mode should not be exposed")
+    _assert(edge_fields["edge_trim_start_ms"].minimum == 0 and edge_fields["edge_trim_start_ms"].maximum == 1000, "edge trim start range mismatch")
+    _assert(edge_fields["edge_trim_end_ms"].minimum == 0 and edge_fields["edge_trim_end_ms"].maximum == 2000, "edge trim end range mismatch")
+    _assert(defaults["edge"].get("voice") == "pl-PL-MarekNeural", "edge default voice should be Marek")
+    _assert(defaults["edge"].get("rate") == "+0%" and defaults["edge"].get("pitch") == "+0Hz", "edge default sliders should be neutral")
+    _assert(defaults["edge"].get("edge_apply_segment_fade") is True, "edge trim should be enabled by default")
+    _assert(defaults["edge"].get("edge_trim_start_ms") == 180 and defaults["edge"].get("edge_trim_end_ms") == 800, "edge default trim values mismatch")
+    _assert(defaults["edge"].get("whisper_qc_enabled") is False, "edge Whisper QC should be disabled by default")
+    _assert(defaults["edge"].get("whisper_qc_retry_attempts") == 2, "edge default Whisper retry attempts mismatch")
+    _assert(defaults["edge"].get("whisper_qc_model") == "small", "edge default Whisper model mismatch")
+    _assert(defaults["edge"].get("whisper_qc_min_similarity") == 0.75, "edge default Whisper similarity mismatch")
+    _assert("edge_trim_fade_ms" not in edge_field_keys, "edge trim fade should stay hidden/internal")
+    _assert(edge_fields["voice"].field_type == "choice", "edge voice should be a dropdown")
+    _assert(edge_fields["voice"].show_help is False, "edge voice should not show a help button")
+    _assert(edge_fields["voice"].option_labels == ("Marek", "Zofia"), "edge voice dropdown should use simple labels")
+    _assert(edge_fields["rate"].field_type == "percent_slider", "edge rate should be a percent slider")
+    _assert(edge_fields["pitch"].field_type == "hz_slider", "edge pitch should be a Hz slider")
+    _assert(edge_fields["rate"].minimum == -100 and edge_fields["rate"].maximum == 100, "edge rate slider range mismatch")
+    _assert(edge_fields["pitch"].minimum == -50 and edge_fields["pitch"].maximum == 50, "edge pitch slider range mismatch")
+    _assert(edge_fields["rate"].step == 1 and edge_fields["pitch"].step == 1, "edge sliders should use precise step 1")
+    edge_builtin_text = (app_dir / "app" / "engines" / "builtin" / "edge.py").read_text(encoding="utf-8")
+    _assert("max_attempts = 3" in edge_builtin_text and "await asyncio.sleep" in edge_builtin_text, "edge builtin should retry transient online TTS failures")
+    _assert(DEFAULT_WORKER_TIMEOUT_S >= 8 * 60 * 60, "local worker timeout should allow long quality runs")
+    _assert(
+        local_worker_timeout_seconds() == DEFAULT_WORKER_TIMEOUT_S,
+        "pipeline should use the central local worker timeout",
+    )
+    _assert(supported_voice_sample_extensions() == (".wav", ".mp3", ".flac"), "voice sample supported extensions mismatch")
+    _assert(voice_sample_sample_rate("chatterbox") == 24000, "chatterbox prepared sample rate mismatch")
+    _assert(voice_sample_sample_rate("omnivoice") == 24000, "omnivoice prepared sample rate mismatch")
+    voice_prepare_command = prepare_voice_sample_command(
+        Path("ffmpeg.exe"),
+        Path("input.flac"),
+        Path("prepared.wav"),
+        sample_rate=24000,
+        enhance=True,
+    )
+    voice_prepare_text = " ".join(str(part) for part in voice_prepare_command)
+    _assert("-ac 1" in voice_prepare_text, "voice sample preparation should force mono")
+    _assert("-ar 24000" in voice_prepare_text, "voice sample preparation should force engine sample rate")
+    _assert("afftdn" in voice_prepare_text and "loudnorm" in voice_prepare_text, "voice sample preparation should clean and normalize")
+    _assert("highpass" in voice_prepare_text and "lowpass" in voice_prepare_text, "voice sample preparation should use gentle filters")
+    voice_convert_only_command = prepare_voice_sample_command(
+        Path("ffmpeg.exe"),
+        Path("input.mp3"),
+        Path("prepared.wav"),
+        sample_rate=24000,
+        enhance=False,
+    )
+    voice_convert_only_text = " ".join(str(part) for part in voice_convert_only_command)
+    _assert("loudnorm" in voice_convert_only_text, "voice sample preparation without enhancers should still normalize")
+    _assert("afftdn" not in voice_convert_only_text, "voice sample preparation without enhancers should skip denoise")
+    _assert("highpass" not in voice_convert_only_text and "lowpass" not in voice_convert_only_text, "voice sample preparation without enhancers should skip band filters")
+    lektor_normalize_command = normalize_lektor_wav_command(Path("ffmpeg.exe"), Path("lektor_przed_normalizacja.wav"), Path("lektor_po_normalizacji.wav"))
+    lektor_normalize_text = " ".join(str(part) for part in lektor_normalize_command)
+    _assert("loudnorm=I=-14" in lektor_normalize_text, "lektor track normalization command mismatch")
+    _assert("linear=true" in lektor_normalize_text and "dual_mono=true" in lektor_normalize_text, "lektor loudnorm should use linear dual-mono mode")
+    _assert(f"-ar {OUTPUT_AUDIO_SAMPLE_RATE}" in lektor_normalize_text, "lektor track normalization should force output sample rate")
+    _assert("-map_metadata -1" in lektor_normalize_text, "lektor track normalization should clear metadata")
+    custom_lektor_normalize_text = " ".join(str(part) for part in normalize_lektor_wav_command(Path("ffmpeg.exe"), Path("lektor.wav"), Path("out.wav"), -20))
+    _assert("loudnorm=I=-20" in custom_lektor_normalize_text, "lektor track normalization should accept selected LUFS")
+    sparse_norm_dir = app_dir / "_self_test_sparse_normalization"
+    try:
+        sparse_norm_dir.mkdir(parents=True, exist_ok=True)
+        sparse_input = sparse_norm_dir / "sparse.wav"
+        sparse_output = sparse_norm_dir / "sparse_norm.wav"
+        fade_len = int(48000 * 0.006)
+        sparse_samples = [0] * 48000 + [int(1000 * index / max(1, fade_len)) for index in range(fade_len)] + [1000] * 4800
+        _write_test_wav(sparse_input, sparse_samples, sample_rate=48000)
+        normalize_lektor_wav(Path("ffmpeg.exe"), sparse_input, sparse_output, -14)
+        _assert(abs(_wav_sample_at(sparse_output, 48000)) <= 24, "sparse lektor normalization should keep silent-to-speech boundary near silence")
+        _assert(_wav_max_delta_range(sparse_output, 48000, 48000 + fade_len) < 1000, "sparse lektor normalization should not create onset impulse")
+    finally:
+        _cleanup_tree(sparse_norm_dir)
+    _assert(sanitize_aac_bitrate("384k") == "384k", "AAC bitrate sanitizer should accept 384k")
+    _assert(sanitize_aac_bitrate("640") == "640k", "AAC bitrate sanitizer should add k suffix")
+    _assert(sanitize_aac_bitrate("bad") == "256k", "AAC bitrate sanitizer should fallback to default")
+    _assert(sanitize_lektor_delay_ms(123) == 100, "lektor delay should snap to configured step")
+    _assert(sanitize_lektor_delay_ms(-5000) == 0, "lektor delay should clamp negative values to zero")
+    _assert(sanitize_lektor_delay_ms(5000) == MAX_LEKTOR_DELAY_MS, "lektor delay should clamp to maximum")
+    extract_audio_text = " ".join(str(part) for part in extract_primary_audio_command(Path("ffmpeg.exe"), Path("film.mkv"), Path("source_audio.wav")))
+    _assert("-map 0:a:0" in extract_audio_text and "-c:a pcm_s16le" in extract_audio_text, "primary audio extraction should decode the selected background stream to PCM")
+    _assert("asetpts=PTS-STARTPTS" in extract_audio_text and "first_pts=0" not in extract_audio_text, "primary audio extraction should normalize timestamps without async padding")
+    _assert(
+        audio_stream_summary({"codec_name": "eac3", "channels": 6, "channel_layout": "5.1", "sample_rate": "48000"})
+        == "EAC3, 5.1, 48 kHz",
+        "audio stream summary should be compact and diagnostic-friendly",
+    )
+    _assert(audio_stream_summary({}) == "brak danych audio", "empty audio stream summary should be explicit")
+    wav_diag_dir = app_dir / "_self_test_wav_diagnostics"
+    try:
+        wav_diag_dir.mkdir(parents=True, exist_ok=True)
+        wav_diag_path = wav_diag_dir / "diag.wav"
+        _write_test_wav(wav_diag_path, [0, 16384, -32768, 0], sample_rate=48000)
+        wav_diag = wav_audio_diagnostics(wav_diag_path)
+        _assert(wav_diag["channels"] == 1, "wav diagnostics should report channel count")
+        _assert(wav_diag["sample_rate"] == 48000, "wav diagnostics should report sample rate")
+        _assert(0.0 < float(wav_diag["duration_s"]) < 0.001, "wav diagnostics should report short duration")
+        _assert(float(wav_diag["peak_dbfs"]) == 0.0, "wav diagnostics should report full-scale peak")
+    finally:
+        _cleanup_tree(wav_diag_dir)
+    aac_command_text = " ".join(str(part) for part in encode_wav_to_aac_command(Path("ffmpeg.exe"), Path("lektor.wav"), Path("lektor.m4a"), "384k"))
+    _assert("-b:a 384k" in aac_command_text, "AAC encode command should use selected bitrate")
+    _assert(f"-ar {OUTPUT_AUDIO_SAMPLE_RATE}" in aac_command_text, "AAC encode command should force output sample rate")
+    progress_command_text = " ".join(str(part) for part in ffmpeg_command_with_progress(["ffmpeg.exe", "-hide_banner", "-y", "-i", "in.wav", "out.m4a"]))
+    _assert("-progress pipe:1" in progress_command_text and "-nostats" in progress_command_text, "ffmpeg progress command should enable machine progress")
+    stereo_stage_text = " ".join(
+        str(part)
+        for part in mix_lektor_stereo_audio_command(
+            Path("ffmpeg.exe"),
+            Path("source_audio.wav"),
+            Path("lektor.m4a"),
+            Path("pl_2_0.m4a"),
+            lektor_weight=2.0,
+            background_lufs=-18,
+            background_weight=1.0,
+            bitrate="384k",
+        )
+    )
+    surround_stage_text = " ".join(
+        str(part)
+        for part in mix_lektor_surround_audio_command(
+            Path("ffmpeg.exe"),
+            Path("source_audio.wav"),
+            Path("lektor.m4a"),
+            Path("pl_5_1.m4a"),
+            lektor_weight=2.0,
+            background_lufs=-18,
+            background_weight=1.0,
+            bitrate="384k",
+        )
+    )
+    _assert("aformat=channel_layouts=stereo" in stereo_stage_text, "stereo mix stage should downmix background before adding lektor")
+    _assert("volume=1" in stereo_stage_text and "volume=0.6667" in stereo_stage_text, "stereo mix stage should scale background and lektor predictably")
+    _assert(stereo_stage_text.count("asetpts=PTS-STARTPTS") >= 2, "stereo mix stage should reset audio PTS")
+    _assert("async=1:first_pts=0" not in stereo_stage_text, "stereo mix stage should not use async first_pts padding")
+    _assert("normalize=0" in stereo_stage_text and "alimiter=limit=0.9:level=false:latency=1" in stereo_stage_text, "stereo mix stage should keep limiter protection")
+    _assert("duration=longest" in stereo_stage_text, "stereo mix stage should keep PL audio alive for the longest input")
+    _assert("-c:a aac" in stereo_stage_text and "-b:a 384k" in stereo_stage_text, "stereo mix stage should encode prepared PL audio")
+    _assert("pan=5.1|FL=0*c0|FR=0*c0|FC=c0" in surround_stage_text, "surround mix should place lektor only in center channel")
+    _assert("FL=0.70*c0" not in surround_stage_text and "FR=0.70*c0" not in surround_stage_text, "surround mix should not spread lektor to front left/right")
+    mkvmerge_remux_text = " ".join(
+        str(part)
+        for part in remux_with_prepared_lektor_audio_mkvmerge_command(
+            Path("mkvmerge.exe"),
+            Path("film.mkv"),
+            (Path("pl_2_0.m4a"), Path("pl_5_1.m4a")),
+            Path("out.mkv"),
+            f"{APP_NAME} edge",
+            track_labels=("2.0", "5.1"),
+            source_audio_streams=({"index": 1},),
+        )
+    )
+    _assert("--no-audio" in mkvmerge_remux_text and "film.mkv" in mkvmerge_remux_text, "mkvmerge remux should copy source video/subtitles without original audio first")
+    _assert("--language 0:pol" in mkvmerge_remux_text and f"0:{APP_NAME} edge 2.0" in mkvmerge_remux_text, "mkvmerge remux should tag prepared PL tracks")
+    _assert("--default-track-flag 0:yes" in mkvmerge_remux_text and "--default-track-flag 1:no" in mkvmerge_remux_text, "mkvmerge remux should set default flags for PL and original audio")
+    _assert(validate_engine_config("edge", defaults["edge"]) == [], "edge default config should be valid")
+    _assert(validate_engine_config("chatterbox", defaults["chatterbox"]) == [], "chatterbox default config should be valid")
+    _assert(validate_engine_config("omnivoice", defaults["omnivoice"]) == [], "omnivoice default config should be valid")
+    openai_config = dict(defaults["openai"])
+    openai_config["api_key"] = "test-key"
+    _assert(validate_engine_config("openai", openai_config) == [], "openai configured default should be valid")
+    for engine_id in ("edge", "openai", "chatterbox", "omnivoice"):
+        field_labels = {field.key: field.label for field in fields_for(engine_id)}
+        if engine_id in {"edge", "chatterbox", "omnivoice"}:
+            _assert("audio_qc_enabled" not in field_labels, f"{engine_id} Audio QC should not be exposed in TTS settings")
+            _assert("audio_qc_retry_attempts" not in field_labels, f"{engine_id} Audio QC retry should not be exposed in TTS settings")
+        else:
+            _assert(
+                field_labels.get("audio_qc_enabled") == "Wlacz kontrole audio",
+                f"{engine_id} Audio QC toggle label should be user friendly",
+            )
+            _assert(
+                field_labels.get("audio_qc_retry_attempts") == "Liczba prob kontroli audio",
+                f"{engine_id} Audio QC retry label should be user friendly",
+            )
+        _assert(
+            field_labels.get("whisper_qc_enabled") == "Wlacz kontrole mowy",
+            f"{engine_id} Whisper QC label should be user friendly",
+        )
+        _assert(
+            field_labels.get("whisper_qc_retry_attempts") == "Liczba prob",
+            f"{engine_id} Whisper QC retry label should be user friendly",
+        )
+        _assert(
+            field_labels.get("whisper_qc_model") == "Model",
+            f"{engine_id} Whisper model label should be user friendly",
+        )
+        _assert(
+            field_labels.get("whisper_qc_min_similarity") == "Zgodnosc tekstu",
+            f"{engine_id} Whisper similarity label should be user friendly",
+        )
+        _assert(field_labels.get("save_processed_subtitles") == "Napisy po obrobce", f"{engine_id} processed subtitle save label mismatch")
+        _assert(field_labels.get("save_run_reports") == "Raporty techniczne", f"{engine_id} run report save label mismatch")
+        _assert(field_labels.get("save_lektor_segments") == "Segmenty lektora", f"{engine_id} segment save label mismatch")
+        _assert(field_labels.get("save_lektor_track_before_normalization") == "Sciezka przed normalizacja", f"{engine_id} pre-normalization save label mismatch")
+        _assert(field_labels.get("save_lektor_track_after_normalization") == "Sciezka po normalizacji", f"{engine_id} post-normalization save label mismatch")
+        _assert(field_labels.get("save_audio_mix_steps") == "Etapy miksowania audio", f"{engine_id} mix stage save label mismatch")
+        _assert("save_lektor_assets" not in field_labels, f"{engine_id} vague lektor assets option should not be visible")
+        _assert(defaults[engine_id].get("save_processed_subtitles") is False, f"{engine_id} should not save processed subtitles by default")
+        _assert(defaults[engine_id].get("save_run_reports") is False, f"{engine_id} should not save run reports by default")
+        _assert(defaults[engine_id].get("save_lektor_segments") is False, f"{engine_id} should not save segments by default")
+        _assert(defaults[engine_id].get("save_lektor_track_before_normalization") is False, f"{engine_id} should not save pre-normalization track by default")
+        _assert(defaults[engine_id].get("save_lektor_track_after_normalization") is False, f"{engine_id} should not save post-normalization track by default")
+        _assert(defaults[engine_id].get("save_audio_mix_steps") is False, f"{engine_id} should not save audio mix steps by default")
+        if engine_id not in {"chatterbox", "omnivoice"}:
+            _assert(defaults[engine_id].get("audio_qc_enabled") is False, f"{engine_id} Audio QC should be disabled by default")
+        _assert(defaults[engine_id].get("whisper_qc_enabled") is False, f"{engine_id} Whisper QC should be disabled by default")
+        _assert(int(defaults[engine_id].get("whisper_qc_retry_attempts", 0)) >= 1, f"{engine_id} Whisper QC retry attempts should have a default")
+    for engine_id in ("chatterbox",):
+        _assert("seed" in {field.key for field in fields_for(engine_id)}, f"{engine_id} seed should stay in config schema")
+        _assert("seed" not in {field.key for field in visible_fields_for(engine_id)}, f"{engine_id} seed should be hidden from UI")
+    chatterbox_visible_keys = {field.key for field in visible_fields_for("chatterbox")}
+    _assert("language_id" not in chatterbox_visible_keys, "chatterbox language should be fixed to Polish and hidden from UI")
+    _assert("save_prepared_voice_sample" not in chatterbox_visible_keys, "chatterbox prepared voice sample debug option should be removed")
+    _assert("disable_voice_sample_enhancement" not in chatterbox_visible_keys, "chatterbox voice sample enhancement option should be removed")
+    _assert("language_id" not in defaults["chatterbox"], "chatterbox language should not be user config")
+    _assert("save_prepared_voice_sample" not in defaults["chatterbox"], "chatterbox prepared voice sample debug default should be removed")
+    _assert("disable_voice_sample_enhancement" not in defaults["chatterbox"], "chatterbox voice sample enhancement default should be removed")
+    _assert("audio_qc_enabled" not in defaults["chatterbox"], "chatterbox Audio QC default should be removed")
+    _assert("audio_qc_retry_attempts" not in defaults["chatterbox"], "chatterbox Audio QC retry default should be removed")
+    _assert(chatterbox_visible_keys == {field.key for field in visible_fields_for("chatterbox")}, "chatterbox visible key cache mismatch")
+    _assert("trim_leading_silence" in chatterbox_visible_keys, "chatterbox leading silence trim should be visible")
+    _assert(defaults["chatterbox"].get("trim_leading_silence") is True, "chatterbox leading silence trim should be enabled by default")
+    _assert(defaults["chatterbox"].get("t3_model") == "v3", "chatterbox should default to v3")
+    _assert(defaults["chatterbox"].get("cfg_weight") == 1.2, "chatterbox CFG default mismatch")
+    _assert(defaults["chatterbox"].get("exaggeration") == 0.4, "chatterbox exaggeration default mismatch")
+    chatterbox_field_labels = {field.key: field.label for field in fields_for("chatterbox")}
+    _assert(chatterbox_field_labels.get("t3_model") == "Wersja modelu Chatterbox", "chatterbox T3 model label should be user friendly")
+    _assert(chatterbox_field_labels.get("trim_leading_silence") == "Wycinanie poczatkowej ciszy", "chatterbox leading trim label should be user friendly")
+    _assert(chatterbox_field_labels.get("cfg_weight") == "Stabilnosc tekstu (CFG)", "chatterbox CFG label should be user friendly")
+    _assert(chatterbox_field_labels.get("exaggeration") == "Ekspresja glosu", "chatterbox exaggeration label should be user friendly")
+    omnivoice_visible_keys = {field.key for field in visible_fields_for("omnivoice")}
+    _assert("language" not in omnivoice_visible_keys and "language_id" not in omnivoice_visible_keys, "omnivoice language should be fixed to Polish and hidden from UI")
+    _assert("audio_qc_enabled" not in defaults["omnivoice"], "omnivoice Audio QC default should be removed")
+    _assert("audio_qc_retry_attempts" not in defaults["omnivoice"], "omnivoice Audio QC retry default should be removed")
+    _assert(defaults["omnivoice"].get("num_step") == 32, "omnivoice num_step default mismatch")
+    _assert(defaults["omnivoice"].get("guidance_scale") == 2.0, "omnivoice CFG default mismatch")
+    _assert(defaults["omnivoice"].get("speed") == 1.0, "omnivoice speed default mismatch")
+    _assert(defaults["omnivoice"].get("denoise") is True, "omnivoice denoise default mismatch")
+    _assert(defaults["omnivoice"].get("preprocess_prompt") is False, "omnivoice preprocess prompt should be disabled by default")
+    _assert(defaults["omnivoice"].get("postprocess_output") is False, "omnivoice factory postprocess should be disabled by default")
+    _assert(defaults["omnivoice"].get("omnivoice_trim_edges") is True, "omnivoice silence edge trim should be enabled by default")
+    omnivoice_fields = {field.key: field for field in fields_for("omnivoice")}
+    _assert(omnivoice_fields["num_step"].minimum == 4 and omnivoice_fields["num_step"].maximum == 64, "omnivoice step range mismatch")
+    _assert(omnivoice_fields["guidance_scale"].minimum == 0.0 and omnivoice_fields["guidance_scale"].maximum == 4.0, "omnivoice CFG range mismatch")
+    _assert(omnivoice_fields["speed"].minimum == 0.5 and omnivoice_fields["speed"].maximum == 1.5, "omnivoice speed range mismatch")
+    _assert("Zakres 4-64" in omnivoice_fields["num_step"].tooltip, "omnivoice step tooltip should describe min/max")
+    _assert("Zakres 0.0-4.0" in omnivoice_fields["guidance_scale"].tooltip, "omnivoice CFG tooltip should describe min/max")
+    _assert("Zakres 0.5-1.5" in omnivoice_fields["speed"].tooltip, "omnivoice speed tooltip should describe min/max")
+    _assert("preprocess_prompt" not in omnivoice_visible_keys, "omnivoice factory preprocess should be hidden from UI")
+    _assert("postprocess_output" not in omnivoice_visible_keys, "omnivoice factory postprocess should be hidden from UI")
+    _assert("omnivoice_trim_edges" in omnivoice_visible_keys, "omnivoice silence edge trim should be visible")
+    _assert("omnivoice_trim_start_ms" not in omnivoice_visible_keys, "omnivoice manual trim start should not be visible")
+    _assert("omnivoice_trim_end_ms" not in omnivoice_visible_keys, "omnivoice manual trim end should not be visible")
+    _assert("tada" not in defaults, "removed TADA should not have active defaults")
+    messages.append("config validation: OK")
+
+    for engine_id in ("edge", "openai"):
+        field_keys = {field.key for field in fields_for(engine_id)}
+        _assert("whisper_qc_enabled" in field_keys, f"{engine_id} missing Whisper QC toggle")
+        _assert("whisper_qc_model" in field_keys, f"{engine_id} missing Whisper QC model")
+        whisper_field = next(field for field in fields_for(engine_id) if field.key == "whisper_qc_model")
+        _assert(whisper_field.field_type == "choice", f"{engine_id} Whisper QC model should be a dropdown")
+        _assert("small" in whisper_field.options and "large-v3" in whisper_field.options and "turbo" in whisper_field.options, f"{engine_id} Whisper QC model options missing")
+        _assert(not any(option.endswith(".en") or option.startswith("distil-") for option in whisper_field.options), f"{engine_id} Whisper QC should only list multilingual Polish-capable models")
+        _assert(whisper_field.label == "Model", f"{engine_id} Whisper QC model label should be concise")
+        _assert(whisper_field.tooltip == "Do wyboru rozne modele dla kontroli mowy.", f"{engine_id} Whisper QC tooltip should be concise")
+    for engine_id in ("chatterbox", "omnivoice"):
+        field_keys = {field.key for field in fields_for(engine_id)}
+        _assert("whisper_qc_enabled" in field_keys, f"{engine_id} missing Whisper QC toggle")
+        _assert("whisper_qc_model" in field_keys, f"{engine_id} missing Whisper QC model")
+        whisper_field = next(field for field in fields_for(engine_id) if field.key == "whisper_qc_model")
+        _assert(whisper_field.field_type == "choice", f"{engine_id} Whisper QC model should be a dropdown")
+        _assert("small" in whisper_field.options and "large-v3" in whisper_field.options and "turbo" in whisper_field.options, f"{engine_id} Whisper QC model options missing")
+        _assert(not any(option.endswith(".en") or option.startswith("distil-") for option in whisper_field.options), f"{engine_id} Whisper QC should only list multilingual Polish-capable models")
+        _assert(whisper_field.label == "Model", f"{engine_id} Whisper QC model label should be concise")
+        _assert(whisper_field.tooltip == "Do wyboru rozne modele dla kontroli mowy.", f"{engine_id} Whisper QC tooltip should be concise")
+    for engine_id in ("chatterbox", "omnivoice"):
+        device_field = next(field for field in fields_for(engine_id) if field.key == "device")
+        _assert(device_field.field_type == "choice", f"{engine_id} device should be a dropdown")
+        _assert(device_field.options == ("auto", "cpu", "cuda", "cuda:0", "cuda:1"), f"{engine_id} device options mismatch")
+    messages.append("Whisper QC config fields: OK")
+
+    _assert(normalize_for_whisper_qc("No już, silos!") == "no juz silos", "Whisper QC normalize mismatch")
+    _assert(text_similarity("mechanicy naprzod", "mechanicy naprzod") == 1.0, "Whisper QC exact similarity mismatch")
+    good_whisper = score_whisper_transcript("mechanicy naprzod", "mechanicy naprzod", 0.70)
+    bad_whisper = score_whisper_transcript("mechanicy naprzod", "mekanaci nabrzut", 0.70)
+    _assert(good_whisper.score == 0 and not good_whisper.warnings, "Whisper QC exact match should not warn")
+    _assert(bad_whisper.score > good_whisper.score and "whisper niezgodny" in bad_whisper.warnings, "Whisper QC mismatch should warn")
+    _assert("faster-whisper" in faster_whisper_missing_message(), "Whisper QC missing dependency message mismatch")
+    quality_summary = _quality_controls_summary(
+        "edge",
+        {"audio_qc_enabled": True, "audio_qc_retry_attempts": "3", "whisper_qc_enabled": True, "whisper_qc_retry_attempts": "2", "whisper_qc_model": "small"},
+        ffmpeg_present=True,
+    )
+    _assert(quality_summary["audio_qc_retry_attempts"] == 3, "quality summary retry attempts mismatch")
+    _assert(quality_summary["whisper_qc_enabled"] is True, "quality summary Whisper toggle mismatch")
+    _assert(quality_summary["whisper_qc_retry_attempts"] == 2, "quality summary Whisper retry attempts mismatch")
+    _assert(quality_summary["whisper_qc_model"] == "small", "quality summary Whisper model mismatch")
+    _assert(
+        _quality_chain_label(quality_summary) == "TTS -> Przytnij i wygladz brzegi -> Audio QC x3 -> Whisper QC x2 -> final",
+        "quality chain label mismatch",
+    )
+    no_qc_summary = _quality_controls_summary("edge", {"audio_qc_enabled": False, "whisper_qc_enabled": False}, ffmpeg_present=True)
+    _assert(
+        _quality_chain_label(no_qc_summary) == "TTS -> Przytnij i wygladz brzegi -> final",
+        "edge tuning should stay in chain when QC is disabled",
+    )
+    raw_edge_summary = _quality_controls_summary("edge", {"audio_qc_enabled": False, "whisper_qc_enabled": False, "edge_apply_segment_fade": False}, ffmpeg_present=True)
+    _assert(_quality_chain_label(raw_edge_summary) == "TTS -> final", "disabled edge tuning chain label mismatch")
+    omnivoice_summary = _quality_controls_summary("omnivoice", {"omnivoice_trim_edges": True, "whisper_qc_enabled": True, "whisper_qc_retry_attempts": "2"}, ffmpeg_present=True)
+    _assert(_quality_chain_label(omnivoice_summary) == "TTS -> Wycinanie ciszy na brzegach -> Whisper QC x2 -> final", "omnivoice quality chain label mismatch")
+    builtin_retry_message = _format_builtin_qc_retry_message(
+        "Edge",
+        3,
+        10,
+        2,
+        4,
+        35,
+        ("glosny koniec", "whisper niezgodny"),
+    )
+    _assert(
+        builtin_retry_message == "Edge QC: segment 3/10, odrzucono probe 1/4, kara QC 35, glosny koniec, whisper niezgodny; ponawiam 2/4",
+        f"built-in QC retry message mismatch: {builtin_retry_message}",
+    )
+    builtin_whisper_retry_message = _format_builtin_qc_retry_message(
+        "Edge Whisper QC",
+        3,
+        10,
+        3,
+        4,
+        49,
+        ("whisper niezgodny",),
+    )
+    _assert(
+        builtin_whisper_retry_message == "Edge Whisper QC: segment 3/10, odrzucono probe 2/4, kara QC 49, whisper niezgodny; ponawiam 3/4",
+        f"built-in Whisper QC retry message mismatch: {builtin_whisper_retry_message}",
+    )
+    builtin_selected_message = _format_builtin_qc_selected_message(
+        "Edge",
+        3,
+        10,
+        2,
+        4,
+        12,
+        ("lekko za dlugi",),
+    )
+    _assert(
+        builtin_selected_message == "Edge QC: segment 3/10, wybrano probe 2/4, kara QC 12, lekko za dlugi",
+        f"built-in QC selected message mismatch: {builtin_selected_message}",
+    )
+    dot_retry_variants = _edge_retry_text_variants("Test.", 4)
+    plain_retry_variants = _edge_retry_text_variants("Test", 4)
+    question_retry_variants = _edge_retry_text_variants("Test?", 3)
+    _assert(dot_retry_variants == ["Test.", "Test", "Test,"], f"Edge dot retry variants should be unique and neutral: {dot_retry_variants}")
+    _assert(plain_retry_variants == ["Test", "Test.", "Test,"], f"Edge plain retry variants should be unique and neutral: {plain_retry_variants}")
+    _assert(question_retry_variants == ["Test?", "Test", "Test,"], f"Edge question retry variants should include comma and avoid duplicates: {question_retry_variants}")
+    _assert(_edge_retry_text("Test.", 2) != _edge_retry_text("Test.", 3), "Edge retry text should not duplicate attempt 2 and 3")
+    _assert("Test!" not in _edge_retry_text_variants("Test", 5), "Edge retry should not add exclamation mark to neutral text")
+    messages.append("Whisper QC scoring: OK")
+
+    srt_path = app_dir / "_self_test_sample.srt"
+    srt_path.write_text(
+        "34\n00:00:01,000 --> 00:00:02,000\n<i>Test</i>\n\n"
+        "40\n00:00:03,999 --> 00:00:04,250\nDrugi\n\n",
+        encoding="utf-8",
+    )
+    try:
+        segments = load_srt(srt_path)
+        _assert(len(segments) == 2, "SRT parser count mismatch")
+        _assert([segment.index for segment in segments] == [34, 40], "SRT parser should preserve original indexes")
+        _assert(segments[0].start_ms == 1000 and segments[0].end_ms == 2000, "SRT parser time mismatch")
+        _assert(segments[1].start_ms == 3999 and segments[1].end_ms == 4250, "SRT parser millisecond mismatch")
+        save_srt(saved_srt_path, segments)
+        _assert(saved_srt_path.read_text(encoding="utf-8").endswith("\n"), "saved SRT should end with newline")
+    finally:
+        try:
+            srt_path.unlink()
+        except OSError:
+            pass
+        try:
+            saved_srt_path.unlink()
+        except OSError:
+            pass
+    messages.append("SRT parser: OK")
+
+    manifest_probe_dir = app_dir / "_self_test_manifest"
+    manifest_path = manifest_probe_dir / "segmenty.csv"
+    try:
+        duplicate_start_segments = [
+            SubtitleSegment(1, 1000, 1500, "Pierwszy"),
+            SubtitleSegment(2, 1000, 1800, "Drugi"),
+        ]
+        generated_audio = [
+            (1000, manifest_probe_dir / "audio_1.wav"),
+            (1000, manifest_probe_dir / "audio_2.wav"),
+        ]
+        write_segments_manifest(manifest_path, duplicate_start_segments, generated_audio)
+        manifest_lines = manifest_path.read_text(encoding="utf-8").splitlines()
+        _assert("audio_1.wav" in manifest_lines[1], "manifest first duplicate start audio mismatch")
+        _assert("audio_2.wav" in manifest_lines[2], "manifest second duplicate start audio mismatch")
+    finally:
+        _cleanup_tree(manifest_probe_dir)
+    messages.append("segments manifest: OK")
+
+    worker_result_dir = app_dir / "_self_test_worker_result"
+    try:
+        worker_result_dir.mkdir(parents=True, exist_ok=True)
+        missing_audio_path = worker_result_dir / "001.wav"
+        requested_segments = [
+            SegmentRequest(
+                segment_id=1,
+                text="Test",
+                start_ms=1000,
+                end_ms=2000,
+                output_path=str(missing_audio_path),
+            )
+        ]
+        input_segments = [SubtitleSegment(1, 1000, 2000, "Test")]
+        worker_result = EngineResult(
+            engine_id="chatterbox",
+            job_id="self-test",
+            ok=True,
+            segments=[SegmentResult(segment_id=1, ok=True, output_path=str(missing_audio_path))],
+        )
+        try:
+            _generated_audio_from_worker_result("chatterbox", requested_segments, input_segments, worker_result)
+            raise AssertionError("worker result without audio file should fail")
+        except RuntimeError as exc:
+            _assert("nie utworzyl pliku audio" in str(exc), "worker missing audio error mismatch")
+        duplicate_result = EngineResult(
+            engine_id="chatterbox",
+            job_id="self-test",
+            ok=True,
+            segments=[
+                SegmentResult(segment_id=1, ok=True, output_path=str(missing_audio_path)),
+                SegmentResult(segment_id=1, ok=True, output_path=str(missing_audio_path)),
+            ],
+        )
+        try:
+            _generated_audio_from_worker_result("chatterbox", requested_segments, input_segments, duplicate_result)
+            raise AssertionError("worker duplicate segment result should fail")
+        except RuntimeError as exc:
+            _assert("zduplikowany segment" in str(exc), "worker duplicate segment error mismatch")
+        extra_result = EngineResult(
+            engine_id="chatterbox",
+            job_id="self-test",
+            ok=True,
+            segments=[
+                SegmentResult(segment_id=1, ok=True, output_path=str(missing_audio_path)),
+                SegmentResult(segment_id=99, ok=True, output_path=str(missing_audio_path)),
+            ],
+        )
+        try:
+            _generated_audio_from_worker_result("chatterbox", requested_segments, input_segments, extra_result)
+            raise AssertionError("worker extra segment result should fail")
+        except RuntimeError as exc:
+            _assert("niezamowiony segment" in str(exc), "worker extra segment error mismatch")
+        wrong_audio_path = worker_result_dir / "999.wav"
+        wrong_audio_path.write_text("fake wav", encoding="utf-8")
+        wrong_path_result = EngineResult(
+            engine_id="chatterbox",
+            job_id="self-test",
+            ok=True,
+            segments=[SegmentResult(segment_id=1, ok=True, output_path=str(wrong_audio_path))],
+        )
+        try:
+            _generated_audio_from_worker_result("chatterbox", requested_segments, input_segments, wrong_path_result)
+            raise AssertionError("worker wrong output path should fail")
+        except RuntimeError as exc:
+            _assert("inna sciezke audio" in str(exc), "worker wrong output path error mismatch")
+        invalid_diagnostics_result = EngineResult(
+            engine_id="chatterbox",
+            job_id="self-test",
+            ok=True,
+            segments=[
+                SegmentResult(
+                    segment_id=1,
+                    ok=True,
+                    output_path=str(missing_audio_path),
+                    attempts=2,
+                    selected_attempt=5,
+                    retries=1,
+                )
+            ],
+        )
+        try:
+            _generated_audio_from_worker_result("chatterbox", requested_segments, input_segments, invalid_diagnostics_result)
+            raise AssertionError("worker invalid retry diagnostics should fail")
+        except RuntimeError as exc:
+            _assert("diagnostyka retry" in str(exc), "worker invalid retry diagnostics error mismatch")
+        warning_summary = _local_worker_qc_warning_summary(
+            EngineResult(
+                engine_id="chatterbox",
+                job_id="self-test",
+                ok=True,
+                segments=[
+                    SegmentResult(segment_id=1, ok=True, qc_warnings=("glosny koniec", "clipping")),
+                    SegmentResult(segment_id=2, ok=True, qc_warnings=("glosny koniec",)),
+                ],
+            )
+        )
+        _assert(warning_summary == "glosny koniec: 2, clipping: 1", f"worker QC warning summary mismatch: {warning_summary}")
+        _assert(
+            _model_activity_message_for_worker_line("chatterbox", "Fetching 6 files") is None,
+            "worker progress should not classify generic Hugging Face fetch lines as downloads",
+        )
+        _assert(
+            _model_activity_message_for_worker_line("chatterbox", "chatterbox: pobieranie modelu t3=v3 na cuda") == "chatterbox: pobieranie modelu - prosze czekac",
+            "worker progress should classify explicit TTS model download",
+        )
+        _assert(
+            _model_activity_message_for_worker_line("chatterbox", "chatterbox: ladowanie modelu t3=v3 na cuda") == "chatterbox: ladowanie modelu - prosze czekac",
+            "worker progress should classify model loading",
+        )
+        _assert(
+            _model_activity_message_for_worker_line("chatterbox", "whisper qc: pobieranie modelu large-v3-turbo na cuda") == "Whisper QC: pobieranie modelu - prosze czekac",
+            "worker progress should classify Whisper QC model download separately",
+        )
+        _assert(
+            _model_activity_message_for_worker_line("chatterbox", "segment 1 OK") is None,
+            "worker progress should ignore normal segment logs for model activity",
+        )
+        temp_dir = worker_result_dir / "temp"
+        temp_dir.mkdir()
+        (temp_dir / "request.json").write_text("{}\n", encoding="utf-8")
+        try:
+            _validated_worker_generated_audio("chatterbox", requested_segments, input_segments, worker_result, temp_dir)
+            raise AssertionError("validated worker result without audio file should fail")
+        except RuntimeError:
+            _assert(temp_dir.exists(), "failed worker validation should keep temp diagnostics")
+        missing_audio_path.write_text("fake wav", encoding="utf-8")
+        generated = _validated_worker_generated_audio("chatterbox", requested_segments, input_segments, worker_result, temp_dir)
+        _assert(generated == [(1000, missing_audio_path)], "validated worker generated audio mismatch")
+        _assert(not temp_dir.exists(), "successful worker validation should cleanup temp diagnostics")
+    finally:
+        _cleanup_tree(worker_result_dir)
+    messages.append("worker result validation: OK")
+
+    protocol_json_dir = app_dir / "_self_test_protocol_json"
+    try:
+        request_path = protocol_json_dir / "request.json"
+        result_path = protocol_json_dir / "result.json"
+        write_request(
+            request_path,
+            EngineRequest(
+                engine_id="chatterbox",
+                source_name="Film.mkv",
+                job_id="self-test",
+                segments=[SegmentRequest(1, "Test", 1000, 2000, str(protocol_json_dir / "001.wav"))],
+            ),
+        )
+        write_result(
+            result_path,
+            EngineResult(
+                "chatterbox",
+                "self-test",
+                True,
+                [SegmentResult(segment_id=1, ok=True, attempts=2, selected_attempt=2, qc_warnings=("glosny koniec",))],
+            ),
+        )
+        _assert(request_path.read_text(encoding="utf-8").endswith("\n"), "request JSON should end with newline")
+        _assert(result_path.read_text(encoding="utf-8").endswith("\n"), "result JSON should end with newline")
+        diagnostic_result = read_result(result_path)
+        _assert(diagnostic_result.segments[0].attempts == 2, "worker result attempts JSON mismatch")
+        _assert(diagnostic_result.segments[0].selected_attempt == 2, "worker result selected attempt JSON mismatch")
+        _assert(diagnostic_result.segments[0].qc_warnings == ("glosny koniec",), "worker result QC warnings JSON mismatch")
+        result_path.write_text(
+            json.dumps(
+                {
+                    "engine_id": "chatterbox",
+                    "job_id": "whisper",
+                    "ok": True,
+                    "segments": [
+                        {
+                            "segment_id": 1,
+                            "ok": True,
+                            "whisper_text": "mechanicy naprzod",
+                            "whisper_similarity": 0.91,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        whisper_result = read_result(result_path)
+        _assert(whisper_result.segments[0].whisper_text == "mechanicy naprzod", "worker Whisper text JSON mismatch")
+        _assert(whisper_result.segments[0].whisper_similarity == 0.91, "worker Whisper similarity JSON mismatch")
+        result_path.write_text(
+            json.dumps({"engine_id": "chatterbox", "job_id": "self-test", "ok": True, "segments": {"bad": "shape"}}),
+            encoding="utf-8",
+        )
+        malformed_result = read_result(result_path)
+        _assert(malformed_result.segments == [], "malformed result segments should be ignored")
+        result_path.write_text(
+            json.dumps(
+                {
+                    "engine_id": "chatterbox",
+                    "job_id": "future",
+                    "ok": True,
+                    "segments": [
+                        {
+                            "segment_id": 1,
+                            "ok": True,
+                            "output_path": str(protocol_json_dir / "001.wav"),
+                            "future_qc_field": "ignored",
+                        }
+                    ],
+                    "future_engine_field": "ignored",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        future_result = read_result(result_path)
+        _assert(future_result.segments[0].segment_id == 1, "worker result should ignore unknown segment fields")
+        request_with_dictionary = EngineRequest(
+            engine_id="chatterbox",
+            source_name="Film.mkv",
+            job_id="self-test",
+            segments=[],
+            dictionary={"batman": "bat man"},
+        )
+        write_request(request_path, request_with_dictionary)
+        request_data = json.loads(request_path.read_text(encoding="utf-8"))
+        _assert(request_data.get("dictionary") == {"batman": "bat man"}, "worker request dictionary should persist")
+        built_request = _build_local_engine_request(
+            engine_id="chatterbox",
+            source_name="Film.mkv",
+            job_id="self-test",
+            segments=[SubtitleSegment(1, 1000, 2000, "woks")],
+            segments_dir=protocol_json_dir,
+            config={"seed": 12345},
+            dictionary={"batman": "bat man"},
+        )
+        _assert(built_request.dictionary == {"batman": "bat man"}, "local worker request should include dictionary")
+    finally:
+        _cleanup_tree(protocol_json_dir)
+    messages.append("worker protocol JSON: OK")
+
+    worker_template_dir = app_dir / "_self_test_worker_template"
+    try:
+        worker_template_dir.mkdir(parents=True, exist_ok=True)
+        worker_template = app_dir / "app" / "engines" / "worker_templates" / "local_tts_worker.py"
+        worker_module = _load_module(worker_template, "_lektorai_worker_template_self_test")
+        _assert(
+            worker_module.normalize_for_whisper_qc("No już, silos!") == "no juz silos",
+            "worker Whisper QC normalize mismatch",
+        )
+        _assert(
+            worker_module.text_similarity("mechanicy naprzod", "mechanicy naprzod") == 1.0,
+            "worker Whisper QC exact similarity mismatch",
+        )
+        _assert(
+            worker_module.whisper_similarity_penalty(0.40, 0.70) > worker_module.whisper_similarity_penalty(0.68, 0.70),
+            "worker Whisper QC penalty should punish larger mismatch",
+        )
+        old_env = {name: os.environ.get(name) for name in ("HF_HOME", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE")}
+        try:
+            os.environ["HF_HOME"] = str(app_dir / "_outside_hf_cache")
+            os.environ["HUGGINGFACE_HUB_CACHE"] = str(app_dir / "_outside_hub_cache")
+            os.environ["TRANSFORMERS_CACHE"] = str(app_dir / "_outside_transformers_cache")
+            original_cwd = Path.cwd()
+            os.chdir(worker_template_dir)
+            worker_module.setup_cache("chatterbox")
+            _assert(
+                os.environ.get("HF_HOME") == str(app_dir / "_outside_hf_cache"),
+                "worker should preserve global HF_HOME so auth tokens remain visible",
+            )
+            _assert(
+                os.environ.get("HUGGINGFACE_HUB_CACHE") == str(worker_template_dir / "cache" / "hf"),
+                "worker should force per-engine Hugging Face cache",
+            )
+            _assert(
+                os.environ.get("TRANSFORMERS_CACHE") == str(worker_template_dir / "cache" / "transformers"),
+                "worker should force per-engine Transformers cache",
+            )
+        finally:
+            os.chdir(original_cwd)
+            for name, value in old_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        worker_request = worker_template_dir / "request.json"
+        worker_result = worker_template_dir / "result.json"
+        worker_request.write_text(
+            json.dumps({"engine_id": "chatterbox", "job_id": "empty", "settings": {}, "segments": []}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            [sys.executable, "-B", str(worker_template), str(worker_request), str(worker_result)],
+            cwd=str(worker_template_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+        _assert(completed.returncode == 0, "worker template empty request failed")
+        result_text = worker_result.read_text(encoding="utf-8")
+        _assert(result_text.endswith("\n"), "worker template result should end with newline")
+        result_data = json.loads(result_text)
+        _assert(result_data.get("ok") is True and result_data.get("segments") == [], "worker template empty result mismatch")
+        worker_error_request = worker_template_dir / "request_error.json"
+        worker_error_result = worker_template_dir / "result_error.json"
+        worker_error_request.write_text(
+            json.dumps(
+                {
+                    "engine_id": "unsupported",
+                    "job_id": "error",
+                    "settings": {},
+                    "segments": [
+                        {
+                            "segment_id": 7,
+                            "text": "Test",
+                            "start_ms": 0,
+                            "end_ms": 1000,
+                            "output_path": str(worker_template_dir / "missing.wav"),
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        error_completed = subprocess.run(
+            [sys.executable, "-B", str(worker_template), str(worker_error_request), str(worker_error_result)],
+            cwd=str(worker_template_dir),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+        )
+        _assert(error_completed.returncode == 1, "worker template error run should exit with 1")
+        error_data = json.loads(worker_error_result.read_text(encoding="utf-8"))
+        error_segment = error_data["segments"][0]
+        _assert(error_segment.get("segment_id") == 7 and error_segment.get("ok") is False, "worker template error segment mismatch")
+        _assert("attempts" in error_segment and "selected_attempt" in error_segment, "worker template error diagnostics missing")
+        _assert(isinstance(error_segment.get("qc_warnings"), list), "worker template error QC warnings should be a list")
+        worker_bad_request = worker_template_dir / "request_bad.json"
+        worker_bad_result = worker_template_dir / "result_bad.json"
+        worker_bad_request.write_text(
+            json.dumps({"engine_id": "chatterbox", "job_id": "bad", "settings": 1, "segments": []}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        bad_completed = subprocess.run(
+            [sys.executable, "-B", str(worker_template), str(worker_bad_request), str(worker_bad_result)],
+            cwd=str(worker_template_dir),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+        )
+        _assert(bad_completed.returncode == 1, "worker template bad request should exit with 1")
+        bad_data = json.loads(worker_bad_result.read_text(encoding="utf-8"))
+        _assert(bad_data.get("engine_id") == "chatterbox" and bad_data.get("job_id") == "bad", "worker top-level error should preserve ids")
+        worker_template_text = worker_template.read_text(encoding="utf-8")
+        _assert("_patch_chatterbox_watermarker" in worker_template_text, "worker template should patch broken Perth watermarker before Chatterbox init")
+        _assert("PerthImplicitWatermarker" in worker_template_text, "worker template should mention Chatterbox watermarker patch")
+        _assert("t3_model=t3_model" in worker_template_text, "worker template should pass Chatterbox multilingual T3 model")
+        _assert("_CHATTERBOX_MODEL_KEY" in worker_template_text, "worker template should reload Chatterbox when T3 model changes")
+        _assert('language_id="pl"' in worker_template_text, "worker template should hardcode Polish Chatterbox language")
+        _assert("trim_leading_silence" in worker_template_text, "worker template should support Chatterbox leading silence trim")
+        _assert("pre_roll_ms=50" in worker_template_text, "worker template should keep 50 ms before Chatterbox speech")
+        _assert("consecutive_frames=3" in worker_template_text, "worker template should avoid trimming on a single noisy frame")
+        _assert("synthesize_omnivoice" in worker_template_text, "worker template should support OmniVoice")
+        _assert('language="pl"' in worker_template_text, "worker template should hardcode Polish OmniVoice language")
+        _assert("reference_audio_path" in worker_template_text, "worker template should use OmniVoice reference audio")
+        _assert("guidance_scale" in worker_template_text and "num_step" in worker_template_text, "worker template should pass OmniVoice generation controls")
+        _assert("trim_omnivoice_silence_edges_np" in worker_template_text, "worker template should support automatic OmniVoice edge trimming")
+        _assert("pobieranie/ladowanie" not in worker_template_text, "worker template should not use ambiguous model activity logs")
+        _assert("has_local_model_cache" in worker_template_text, "worker template should distinguish model download from loading")
+        _assert("_AUTO_DEVICE" in worker_template_text and "return _AUTO_DEVICE" in worker_template_text, "worker template should keep auto device stable for whole worker run")
+    finally:
+        _cleanup_tree(worker_template_dir)
+    messages.append("worker template protocol: OK")
+
+    audio_qc_mismatch_dir = app_dir / "_self_test_audio_qc_mismatch"
+    try:
+        audio_qc_mismatch_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            analyze_generated_segments(
+                app_dir / "ffmpeg.exe",
+                [],
+                [SubtitleSegment(1, 1000, 2000, "Test")],
+                audio_qc_mismatch_dir / "audio_qc.csv",
+                audio_qc_mismatch_dir / "temp",
+            )
+            raise AssertionError("Audio QC segment count mismatch should fail")
+        except RuntimeError as exc:
+            _assert("liczba segmentow" in str(exc), "Audio QC segment count mismatch error mismatch")
+    finally:
+        _cleanup_tree(audio_qc_mismatch_dir)
+    messages.append("audio QC validation: OK")
+
+    edge_trim_dir = app_dir / "_self_test_edge_trim"
+    try:
+        edge_trim_dir.mkdir(parents=True, exist_ok=True)
+        edge_input = edge_trim_dir / "input.wav"
+        edge_manual_output = edge_trim_dir / "manual.wav"
+        _write_test_wav(edge_input, [0] * 44100 + [8000] * 4410 + [0] * 88200)
+        trim_fixed_and_fade_wav_edges(edge_input, edge_manual_output, trim_start_ms=200, trim_end_ms=900, fade_ms=12)
+        input_frames = _wav_frame_count(edge_input)
+        manual_frames = _wav_frame_count(edge_manual_output)
+        expected_manual_frames = input_frames - int(44100 * 200 / 1000) - int(44100 * 900 / 1000)
+        _assert(manual_frames == expected_manual_frames, "manual edge trim should remove fixed start/end")
+        _assert(_wav_first_sample(edge_manual_output) == 0, "manual edge trim should not fade in or alter the first kept sample")
+    finally:
+        _cleanup_tree(edge_trim_dir)
+    messages.append("edge tuning: OK")
+
+    timeline_dir = app_dir / "_self_test_audio_timeline"
+    try:
+        timeline_dir.mkdir(parents=True, exist_ok=True)
+        first_segment = timeline_dir / "first.wav"
+        second_segment = timeline_dir / "second.wav"
+        queued_track = timeline_dir / "queued.wav"
+        _write_test_wav(first_segment, [1000] * SAMPLE_RATE, sample_rate=SAMPLE_RATE)
+        _write_test_wav(second_segment, [2000] * (SAMPLE_RATE // 2), sample_rate=SAMPLE_RATE)
+        stats = build_lektor_wav(
+            app_dir / "ffmpeg.exe",
+            [(0, first_segment), (500, second_segment)],
+            queued_track,
+            timeline_dir / "temp",
+            minimum_duration_s=2.0,
+        )
+        _assert(stats.shifted_count == 1, "overlapping timeline segment should be queued")
+        _assert(490 <= stats.max_shift_ms <= 510, f"timeline queue shift mismatch: {stats.max_shift_ms}")
+        _assert(_wav_sample_rate(queued_track) == SAMPLE_RATE, "queued timeline should be built at 48 kHz")
+        _assert(_wav_frame_count(queued_track) == SAMPLE_RATE * 2, "queued timeline should not trim segments and should pad to requested duration")
+        _assert(_wav_first_sample(queued_track) == 0, "queued timeline should fade in segment edge to avoid clicks")
+        _assert(SEGMENT_EDGE_FADE_MS <= 10, "timeline edge fade should stay short enough to preserve speech")
+        shifted_segments = apply_lektor_delay_to_segments([(1000, first_segment), (25, second_segment)], 125)
+        _assert(shifted_segments[0][0] == 1100 and shifted_segments[1][0] == 125, "lektor delay should shift timestamps by sanitized step")
+        early_segments = apply_lektor_delay_to_segments([(100, first_segment)], -250)
+        _assert(early_segments[0][0] == 100, "negative lektor delay should be sanitized to zero")
+        try:
+            build_lektor_wav(
+                app_dir / "ffmpeg.exe",
+                [(0, first_segment)],
+                timeline_dir / "cancelled.wav",
+                timeline_dir / "temp_cancelled",
+                cancel_requested=lambda: True,
+            )
+            raise AssertionError("timeline build should stop when cancellation is requested")
+        except RuntimeError as exc:
+            _assert("Przerwano" in str(exc), "timeline cancellation error mismatch")
+        _assert(not (timeline_dir / "temp_cancelled").exists(), "cancelled timeline should clean temp dir")
+    finally:
+        _cleanup_tree(timeline_dir)
+    messages.append("audio timeline queue: OK")
+
+    debug_cleanup_dir = app_dir / "_self_test_debug_cleanup"
+    try:
+        segments_cleanup_dir = debug_cleanup_dir / "segments"
+        segments_cleanup_dir.mkdir(parents=True, exist_ok=True)
+        (segments_cleanup_dir / "001.wav").write_text("segment", encoding="utf-8")
+        before_cleanup = debug_cleanup_dir / "lektor_przed_normalizacja.wav"
+        after_cleanup = debug_cleanup_dir / "lektor_po_normalizacji.wav"
+        before_cleanup.write_text("before", encoding="utf-8")
+        after_cleanup.write_text("after", encoding="utf-8")
+        _cleanup_lektor_debug_files(
+            {
+                "save_lektor_segments": False,
+                "save_lektor_track_before_normalization": False,
+                "save_lektor_track_after_normalization": True,
+            },
+            debug_cleanup_dir,
+            segments_cleanup_dir,
+            before_cleanup,
+            after_cleanup,
+        )
+        _assert(not segments_cleanup_dir.exists(), "disabled segment saving should remove segment dir")
+        _assert(not before_cleanup.exists(), "disabled pre-normalization saving should remove track")
+        _assert(after_cleanup.exists(), "enabled post-normalization saving should keep track")
+    finally:
+        _cleanup_tree(debug_cleanup_dir)
+
+    source_path = app_dir / "Film.mkv"
+    workspace = lektorai_workspace_for(source_path)
+    _assert(safe_name("Zażółć gęślą jaźń") == "Zazolc_gesla_jazn", "safe name Polish transliteration mismatch")
+    _assert(len(safe_name("a" * 200)) == 80, "safe name length limit mismatch")
+    stem = next_output_stem(workspace, source_path, "edge")
+    _assert(stem == "Film_edge", f"output stem mismatch: {stem}")
+    _assert(lektor_assets_dir(workspace, stem).name == "Film_edge_lektor", "lektor dir mismatch")
+    collision_workspace = app_dir / "_self_test_workspace_collision"
+    try:
+        collision_workspace.mkdir(parents=True, exist_ok=True)
+        (collision_workspace / "Film_edge.mp4").write_text("", encoding="utf-8")
+        collision_stem = next_output_stem(collision_workspace, source_path, "edge")
+        _assert(collision_stem == "Film_edge_2", f"mp4 collision stem mismatch: {collision_stem}")
+        (collision_workspace / "Film_edge.mp4").unlink()
+        (collision_workspace / "Film_edge.mkv").write_text("", encoding="utf-8")
+        collision_stem = next_output_stem(collision_workspace, source_path, "edge")
+        _assert(collision_stem == "Film_edge_2", f"mkv collision stem mismatch: {collision_stem}")
+        (collision_workspace / "Film_edge_2.srt").write_text("", encoding="utf-8")
+        collision_stem = next_output_stem(collision_workspace, source_path, "edge")
+        _assert(collision_stem == "Film_edge_3", f"srt collision stem mismatch: {collision_stem}")
+        (collision_workspace / "Film_edge_3_lektor").mkdir()
+        collision_stem = next_output_stem(collision_workspace, source_path, "edge")
+        _assert(collision_stem == "Film_edge_4", f"lektor dir collision stem mismatch: {collision_stem}")
+    finally:
+        _cleanup_tree(collision_workspace)
+    messages.append("workspace naming: OK")
+
+    failure_app_dir = app_dir / "_self_test_run_error_app"
+    failure_source_dir = app_dir / "_self_test_run_error_media"
+    failure_source = failure_source_dir / "Pusty.srt"
+    try:
+        failure_source_dir.mkdir(parents=True, exist_ok=True)
+        failure_source.write_text("", encoding="utf-8")
+        failure_paths = build_paths(failure_app_dir)
+        try:
+            run_tts_job(failure_source, "edge", failure_paths, EngineManager(failure_paths), lambda _msg: None)
+            raise AssertionError("empty subtitle run should fail")
+        except RuntimeError as exc:
+            _assert("Brak tekstu do syntezy" in str(exc), "unexpected run error message")
+        failure_engine_dir = failure_paths.engine_dir("edge")
+        _assert((failure_engine_dir / "config.json").is_file(), "run should create engine config on first use")
+        _assert((failure_engine_dir / "dictionary.json").is_file(), "run should create engine dictionary on first use")
+        error_path = failure_source_dir / "LektorAI" / "Pusty_edge_lektor" / "run_error.json"
+        _assert(error_path.is_file(), "run_error.json missing after failed run")
+        error_data = json.loads(error_path.read_text(encoding="utf-8"))
+        _assert(error_data.get("status") == "failed", "run_error.json status mismatch")
+        _assert(error_data.get("engine_id") == "edge", "run_error.json engine mismatch")
+        _assert(error_data.get("error_type") == "RuntimeError", "run_error.json error type mismatch")
+        _assert(error_data.get("source_name") == "Pusty.srt", "run_error.json source mismatch")
+        _assert("traceback" in error_data and "RuntimeError" in str(error_data.get("traceback")), "run_error.json should include traceback diagnostics")
+    finally:
+        _cleanup_tree(failure_app_dir)
+        _cleanup_tree(failure_source_dir)
+    messages.append("run error summary: OK")
+
+    video_sidecar_source = app_dir / "_self_test_video.mkv"
+    sidecar_path = app_dir / "_self_test_video.polish.srt"
+    uppercase_sidecar_path = app_dir / "_self_test_video2.PL.SRT"
+    generic_sidecar_video = app_dir / "_self_test_video3.mkv"
+    generic_sidecar_path = app_dir / "_self_test_video3.srt"
+    polish_sidecar_path = app_dir / "_self_test_video3.pl.srt"
+    forced_sidecar_video = app_dir / "_self_test_video4.mkv"
+    forced_sidecar_path = app_dir / "_self_test_video4.forced.pl.srt"
+    full_polish_sidecar_path = app_dir / "_self_test_video4.pl.srt"
+    video_sidecar_source.write_text("", encoding="utf-8")
+    sidecar_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nTest\n", encoding="utf-8")
+    uppercase_video_sidecar_source = app_dir / "_self_test_video2.mkv"
+    uppercase_video_sidecar_source.write_text("", encoding="utf-8")
+    uppercase_sidecar_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nTest\n", encoding="utf-8")
+    generic_sidecar_video.write_text("", encoding="utf-8")
+    generic_sidecar_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nGeneric\n", encoding="utf-8")
+    polish_sidecar_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nPolski\n", encoding="utf-8")
+    forced_sidecar_video.write_text("", encoding="utf-8")
+    forced_sidecar_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nForced\n", encoding="utf-8")
+    full_polish_sidecar_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nFull\n", encoding="utf-8")
+    try:
+        _assert(_find_sidecar_subtitles(video_sidecar_source) == sidecar_path, "sidecar lookup mismatch")
+        _assert(_find_sidecar_subtitles(uppercase_video_sidecar_source) == uppercase_sidecar_path, "uppercase sidecar lookup mismatch")
+        _assert(_find_sidecar_subtitles(generic_sidecar_video) == polish_sidecar_path, "polish sidecar should beat generic sidecar")
+        _assert(
+            _find_sidecar_subtitles(forced_sidecar_video) == full_polish_sidecar_path,
+            "full polish sidecar should beat forced sidecar",
+        )
+    finally:
+        for path in (
+            video_sidecar_source,
+            sidecar_path,
+            uppercase_video_sidecar_source,
+            uppercase_sidecar_path,
+            generic_sidecar_video,
+            generic_sidecar_path,
+            polish_sidecar_path,
+            forced_sidecar_video,
+            forced_sidecar_path,
+            full_polish_sidecar_path,
+        ):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    messages.append("sidecar lookup: OK")
+
+    _assert(format_duration(8) == "8s", "short duration format mismatch")
+    _assert(format_duration(65) == "1min 05s", "minute duration format mismatch")
+    _assert(format_duration(3661) == "1h 01min 01s", "hour duration format mismatch")
+    _assert(FILE_PROGRESS_TOTAL == 1000, "file progress total mismatch")
+    _assert(progress_value_for_stage("prepare") == 25, "prepare progress value mismatch")
+    _assert(progress_value_for_stage("tts", 0.5) == 400, "TTS weighted progress midpoint mismatch")
+    _assert(progress_value_for_stage("mux", 0.5) == 970, "mux weighted progress midpoint mismatch")
+    _assert(progress_value_for_stage("done") == 1000, "done progress value mismatch")
+    _assert(safe_unit_eta_seconds(3, 100, 30.0) is None, "ETA should wait for enough units")
+    _assert(safe_unit_eta_seconds(10, 100, 50.0) == 450.0, "ETA by units mismatch")
+    _assert(ffmpeg_progress_ratio("out_time_us=5000000", 10.0) == 0.5, "ffmpeg out_time_us ratio mismatch")
+    _assert(ffmpeg_progress_ratio("out_time_ms=5000000", 10.0) == 0.5, "ffmpeg out_time_ms ratio mismatch")
+    _assert(ffmpeg_progress_ratio("out_time=00:00:05.000000", 10.0) == 0.5, "ffmpeg out_time ratio mismatch")
+    _assert(format_progress_status("TTS", "10/100", 50.0, 450.0) == "TTS: 10/100 | czas 50s | ETA 7min 30s", "progress status format mismatch")
+    marker = encode_progress_marker("mux", 0.25, "Dodawanie do MKV")
+    _assert(decode_progress_marker(marker) == ("mux", 0.25, "Dodawanie do MKV"), "progress marker roundtrip mismatch")
+    _assert(decode_progress_marker("normalny log") is None, "normal log should not decode as progress marker")
+    progress_style = progress_bar_style()
+    _assert("color: #111111" in progress_style, "progress text color should stay dark")
+    _assert("background-color: #12d979" in progress_style, "progress chunk color mismatch")
+    compacted_log = compact_app_log_message("ImportError: " + ("x" * 500), limit=80)
+    _assert(len(compacted_log) <= 80 and compacted_log.endswith("..."), "long app log messages should be compacted")
+    _assert(aac_quality_options() == ("192k", "256k", "320k", "384k", "448k", "640k"), "AAC quality options mismatch")
+    _assert(aac_quality_label("384k") == "384 kb/s", "AAC quality label mismatch")
+    _assert(aac_quality_label("bad") == "256 kb/s", "AAC quality invalid label fallback mismatch")
+    _assert(audio_defaults_summary()["lektor_lufs"] == -14, "audio defaults lektor LUFS mismatch")
+    _assert(audio_defaults_summary()["aac_bitrate"] == "256k", "audio defaults AAC bitrate mismatch")
+    _assert(audio_defaults_summary()["lektor_delay_ms"] == DEFAULT_LEKTOR_DELAY_MS, "audio defaults lektor delay mismatch")
+    _assert(audio_defaults_summary()["create_stereo_for_surround"] is True, "audio defaults should create additional stereo for 5.1 sources")
+    _assert(format_lektor_delay_label(100) == "+100 ms", "positive lektor delay label mismatch")
+    _assert(format_lektor_delay_label(-100) == "0 ms", "negative lektor delay label mismatch")
+    _assert(format_lektor_delay_label(0) == "0 ms", "zero lektor delay label mismatch")
+    internet_state = next(state for state in manager.list_states() if state.definition.engine_id == "edge")
+    _assert(engine_combo_label("Internetowe", internet_state) == "Internetowe: Edge TTS", "internet combo label should stay compact")
+    _assert(
+        main_window_refresh_keeps_engine_signals_blocked(),
+        "engine refresh should keep combo signals blocked while restoring last engine",
+    )
+    _assert(main_window_minimum_size() == (980, 620), "main window minimum size mismatch")
+    _assert(slider_value_to_weight(20) == 2.0, "audio weight slider conversion mismatch")
+    _assert(weight_to_slider_value(1.5) == 15, "audio weight reverse slider conversion mismatch")
+    confirm = build_start_confirmation_text("Edge TTS", 2, 1, True, "384k", 100, True, True, True)
+    _assert("Silnik TTS: Edge TTS" in confirm and "Pliki wideo: 1" in confirm, "preflight text mismatch")
+    _assert("Jakosc sciezki lektora AAC: 384 kb/s" in confirm, "preflight should show AAC quality")
+    _assert("Przesuniecie lektora: +100 ms" in confirm, "preflight should show lektor delay")
+    _assert(BINARY_LOOKUP_HINT not in confirm, "preflight should not show binary hint when tools are present")
+    confirm_missing_tools = build_start_confirmation_text("Edge TTS", 2, 1, True, "256k", 0, False, False, False)
+    _assert(BINARY_LOOKUP_HINT in confirm_missing_tools, "preflight should show binary hint when tools are missing")
+    _assert(BINARY_LOOKUP_HINT in missing_ffmpeg_message(), "ffmpeg validation message should show lookup hint")
+    _assert(BINARY_LOOKUP_HINT in missing_ffprobe_message(), "ffprobe validation message should show lookup hint")
+    _assert(BINARY_LOOKUP_HINT in missing_mkvmerge_message(), "mkvmerge validation message should show lookup hint")
+    _assert(not should_enable_start_button("", True), "start button should be disabled without selected engine")
+    _assert(not should_enable_start_button("edge", False), "start button should be disabled while controls are locked")
+    _assert(not should_enable_start_button("chatterbox", True, False), "start button should be disabled for unavailable engine")
+    _assert(should_enable_start_button("edge", True), "start button should be enabled for selected engine")
+    _assert(not should_enable_engine_actions("", True, True), "engine actions should be disabled without selected engine")
+    _assert(not should_enable_engine_actions("chatterbox", False, True), "engine actions should be disabled for unavailable engine")
+    _assert(not should_enable_engine_actions("edge", True, False), "engine actions should be disabled while controls are locked")
+    _assert(should_enable_engine_actions("edge", True, True), "engine actions should be enabled for selectable engine")
+    _assert(stored_engine_after_selection("edge", True) == "edge", "selected engine should be stored")
+    _assert(stored_engine_after_selection("", False) == "", "empty engine selection should clear stored engine")
+    _assert(stored_engine_after_selection("chatterbox", False) == "", "unavailable engine selection should clear stored engine")
+    sorted_names = sorted(["Odcinek 10.mkv", "Odcinek 2.mkv", "Odcinek 1.mkv"], key=natural_path_key)
+    _assert(sorted_names == ["Odcinek 1.mkv", "Odcinek 2.mkv", "Odcinek 10.mkv"], "natural sort mismatch")
+    mixed_sorted_names = sorted(["10.mkv", "Odcinek 2.mkv", "2.mkv"], key=natural_path_key)
+    _assert(mixed_sorted_names == ["2.mkv", "10.mkv", "Odcinek 2.mkv"], "natural sort mixed prefix mismatch")
+    same_name_paths = sorted(
+        [str(app_dir / "B" / "Odcinek 1.mkv"), str(app_dir / "A" / "Odcinek 1.mkv")],
+        key=natural_path_key,
+    )
+    _assert(Path(same_name_paths[0]).parent.name == "A", "natural sort tie-breaker mismatch")
+    sidecar_video = app_dir / "_self_test_queue_sidecar.mkv"
+    sidecar_same_dir = app_dir / "_self_test_queue_sidecar.pl.srt"
+    sidecar_numbered_neighbor = app_dir / "_self_test_queue_sidecar2.srt"
+    sidecar_other_dir = app_dir / "_self_test_queue_other" / "_self_test_queue_sidecar.pl.srt"
+    sidecar_video.write_text("", encoding="utf-8")
+    sidecar_same_dir.write_text("", encoding="utf-8")
+    sidecar_numbered_neighbor.write_text("", encoding="utf-8")
+    sidecar_other_dir.parent.mkdir(exist_ok=True)
+    sidecar_other_dir.write_text("", encoding="utf-8")
+    try:
+        _assert(
+            is_sidecar_for_existing_video(sidecar_same_dir, [sidecar_video]),
+            "queue sidecar detection mismatch",
+        )
+        _assert(
+            not is_sidecar_for_existing_video(sidecar_other_dir, [sidecar_video]),
+            "queue sidecar should not match a different folder",
+        )
+        _assert(
+            not is_sidecar_for_existing_video(sidecar_numbered_neighbor, [sidecar_video]),
+            "queue sidecar should not match numbered neighbor",
+        )
+        _assert(
+            not is_sidecar_for_existing_video(sidecar_same_dir, []),
+            "standalone subtitle should stay selectable",
+        )
+    finally:
+        for path in (sidecar_video, sidecar_same_dir, sidecar_numbered_neighbor, sidecar_other_dir):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        try:
+            sidecar_other_dir.parent.rmdir()
+        except OSError:
+            pass
+    messages.append("UI helpers: OK")
+
+    _assert(coerce_bool_for_widget("false") is False, "settings dialog bool string false mismatch")
+    _assert(coerce_bool_for_widget("true") is True, "settings dialog bool string true mismatch")
+    _assert(coerce_bool_for_widget("tekst") is False, "settings dialog unknown bool string mismatch")
+    _assert(coerce_int_for_widget("7", 1, 10) == 7, "settings dialog int string mismatch")
+    _assert(coerce_int_for_widget("7.5", 1, 10) == 1, "settings dialog fractional int should fallback")
+    _assert(coerce_int_for_widget(99, 1, 10) == 10, "settings dialog int clamp mismatch")
+    _assert(coerce_float_for_widget("nan", 0.1, 2.0) == 0.1, "settings dialog nan float should fallback")
+    _assert(settings_help_button_label() == "?", "settings dialog help button label mismatch")
+    _assert(is_diagnostic_field("save_processed_subtitles"), "processed subtitles should be diagnostic")
+    _assert(is_diagnostic_field("save_run_reports"), "run reports should be diagnostic")
+    _assert(is_diagnostic_field("save_lektor_segments"), "save lektor segments should be diagnostic")
+    _assert(is_diagnostic_field("save_lektor_track_before_normalization"), "pre-normalization track should be diagnostic")
+    _assert(is_diagnostic_field("save_lektor_track_after_normalization"), "post-normalization track should be diagnostic")
+    _assert(is_diagnostic_field("save_audio_mix_steps"), "audio mix steps should be diagnostic")
+    _assert(not is_diagnostic_field("save_lektor_assets"), "vague lektor assets option should be removed")
+    _assert(not is_diagnostic_field("save_prepared_voice_sample"), "prepared voice sample option should be removed")
+    _assert(not is_diagnostic_field("voice"), "normal voice setting should not be diagnostic")
+    _assert(is_audio_qc_field("audio_qc_enabled"), "Audio QC toggle should be in audio section")
+    _assert(is_audio_qc_field("audio_qc_retry_attempts"), "Audio QC retry should be in audio section")
+    _assert(is_speech_qc_field("whisper_qc_enabled"), "Whisper QC toggle should be in speech section")
+    _assert(is_speech_qc_field("whisper_qc_retry_attempts"), "Whisper QC retry should be in speech section")
+    _assert(is_speech_qc_field("whisper_qc_model"), "Whisper QC model should be in speech section")
+    _assert(not is_audio_qc_field("voice") and not is_speech_qc_field("voice"), "normal voice should stay in model settings section")
+    _assert(choice_value_for_widget("medium", ("small", "medium"), "small") == "medium", "settings dialog choice value mismatch")
+    _assert(choice_value_for_widget("bogus", ("small", "medium"), "small") == "small", "settings dialog invalid choice fallback mismatch")
+    class _ChoiceDataProbe:
+        def currentData(self) -> str:
+            return "pl-PL-MarekNeural"
+
+        def currentText(self) -> str:
+            return "Marek"
+
+    test_combo = _ChoiceDataProbe()
+    _assert(choice_data_for_widget(test_combo) == "pl-PL-MarekNeural", "settings dialog should save choice data")
+    _assert(edge_slider_value_for_widget("+15%", "%", -100, 100, 5) == 15, "edge slider percent parse mismatch")
+    _assert(edge_slider_value_for_widget("-17Hz", "Hz", -100, 100, 5) == -15, "edge slider should snap to step")
+    _assert(edge_slider_value_for_widget("+150%", "%", -100, 100, 5) == 100, "edge slider should clamp high values")
+    _assert(format_edge_slider_value(0, "%") == "+0%", "edge slider percent format mismatch")
+    _assert(format_edge_slider_value(-10, "Hz") == "-10Hz", "edge slider Hz format mismatch")
+    merged_visible_settings = merge_engine_settings_values({"seed": 12345, "cfg_value": 2.0}, {"cfg_value": 1.5})
+    _assert(merged_visible_settings == {"seed": 12345, "cfg_value": 1.5}, "settings merge should preserve hidden seed")
+    _assert(initial_install_button_label() == "Zainstaluj", "TTS manager initial install label mismatch")
+    _assert(should_show_dictionary_row("Batman", "bat"), "dictionary search should match prefix")
+    _assert(not should_show_dictionary_row("Alfa", "bat"), "dictionary search should hide non-prefix")
+    _assert(should_show_dictionary_row("", "bat"), "dictionary search should keep empty editable rows visible")
+    dictionary_export_path = app_dir / "_self_test_dictionary_export.json"
+    dictionary_import_path = app_dir / "_self_test_dictionary_import.json"
+    try:
+        count, skipped = save_dictionary_external_file(dictionary_export_path, {"Vox": "woks", " Batman ": "batman"})
+        _assert(count == 2 and skipped == 0, "dictionary external save count mismatch")
+        exported_dictionary = json.loads(dictionary_export_path.read_text(encoding="utf-8"))
+        _assert(list(exported_dictionary.keys()) == ["Batman", "Vox"], "dictionary external save should sanitize and sort")
+        dictionary_import_path.write_text(
+            json.dumps({"": "puste", "Silos": "sajlos", "vox": "woks"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        imported_dictionary, import_count = load_dictionary_external_file(dictionary_import_path)
+        _assert(import_count == 2, "dictionary external load count mismatch")
+        _assert(imported_dictionary == {"Silos": "sajlos", "vox": "woks"}, "dictionary external load sanitize mismatch")
+    finally:
+        for path in (dictionary_export_path, dictionary_import_path):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    long_diagnostic_text = "brak importu | " + ("C:\\bardzo\\dluga\\sciezka\\" * 10)
+    _assert(
+        diagnostic_table_text(long_diagnostic_text, limit=80).endswith("..."),
+        "diagnostics table should compact long details",
+    )
+    _assert(
+        scrollable_details_line_wrap_mode() == "WidgetWidth",
+        "scrollable details should wrap long lines",
+    )
+    _assert(SUPPORTED_SUBTITLE_EXTENSIONS == (".srt", ".txt"), "supported subtitle extension constant mismatch")
+    _assert(
+        apply_dictionary("Mam 2 kg.", {"2 kg": "dwa kilo"}) == "Mam dwa kilo.",
+        "dictionary should apply user-defined subtitle replacements without automatic text normalization",
+    )
+    _assert(coerce_float_for_widget(9.0, 0.1, 2.0) == 2.0, "settings dialog float clamp mismatch")
+    _assert(not should_enable_keep_settings_remove(False, True, False), "keep remove should be disabled for internet engines")
+    _assert(not should_enable_keep_settings_remove(True, False, False), "keep remove should be disabled without runtime")
+    _assert(not should_enable_keep_settings_remove(True, True, True), "keep remove should be disabled while busy")
+    _assert(should_enable_keep_settings_remove(True, True, False), "keep remove should be enabled for local runtime")
+    messages.append("settings dialog helpers: OK")
+
+    config_store = AppConfigStore(app_dir / "_self_test_config.json")
+    try:
+        config_store.load()
+        _assert((app_dir / "_self_test_config.json").read_text(encoding="utf-8").endswith("\n"), "app config save should end with newline")
+        config_store.set_last_file_dir(f"  {app_dir}  ")
+        _assert(config_store.last_file_dir() == str(app_dir), "last file dir config mismatch")
+        config_store.set_last_engine("  edge  ")
+        _assert(config_store.last_engine() == "edge", "last engine should be stripped before saving")
+        config_store.data["ui"]["last_file_dir"] = f"  {app_dir}  "
+        config_store.data["tts"]["last_engine"] = "  edge  "
+        _assert(config_store.last_file_dir() == str(app_dir), "last file dir getter should strip manual spaces")
+        _assert(config_store.last_engine() == "edge", "last engine getter should strip manual spaces")
+        config_store.set_aac_bitrate("384k")
+        _assert(config_store.aac_bitrate() == "384k", "AAC bitrate setter mismatch")
+        config_store.set_aac_bitrate("not-valid")
+        _assert(config_store.aac_bitrate() == "256k", "AAC bitrate setter should sanitize invalid values")
+        config_store.set_lektor_delay_ms(123)
+        _assert(config_store.lektor_delay_ms() == 100, "lektor delay setter should sanitize values")
+        config_store.set_create_stereo_for_surround(False)
+        _assert(config_store.create_stereo_for_surround() is False, "surround stereo option setter mismatch")
+        config_store.set_create_stereo_for_surround(True)
+        _assert(config_store.create_stereo_for_surround() is True, "surround stereo option should accept true")
+    finally:
+        try:
+            (app_dir / "_self_test_config.json").unlink()
+        except OSError:
+            pass
+    messages.append("config helpers: OK")
+
+    config_merge_path = app_dir / "_self_test_config_merge.json"
+    try:
+        config_merge_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "ui": {
+                        "theme": "dark",
+                        "last_file_dir": "D:/Filmy",
+                        "custom_ui_flag": "keep-ui",
+                    },
+                    "tts": {
+                        "last_engine": "edge",
+                    },
+                    "custom_root_flag": "keep-root",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        merged_store = AppConfigStore(config_merge_path)
+        merged_store.load()
+        merged_data = json.loads(config_merge_path.read_text(encoding="utf-8"))
+        _assert(merged_data["ui"]["last_file_dir"] == "D:/Filmy", "app config merge overwrote last dir")
+        _assert(merged_data["tts"]["last_engine"] == "edge", "app config merge overwrote last engine")
+        _assert(merged_data["ui"]["custom_ui_flag"] == "keep-ui", "app config merge removed nested custom key")
+        _assert(merged_data["custom_root_flag"] == "keep-root", "app config merge removed root custom key")
+        _assert(merged_data["ui"]["window"]["width"] == 1280, "app config merge did not persist window width default")
+        _assert(merged_data["ui"]["window"]["height"] == 780, "app config merge did not persist window height default")
+        _assert(merged_data["ui"]["window"]["mode"] == "normal", "app config merge did not persist window mode default")
+        _assert(merged_data["output"]["aac_bitrate"] == "256k", "app config merge did not persist AAC bitrate default")
+        _assert(merged_data["output"]["lektor_lufs"] == -14, "app config merge did not persist lektor LUFS default")
+        _assert(merged_data["output"]["lektor_weight"] == 2.0, "app config merge did not persist lektor weight default")
+        _assert(merged_data["output"]["background_lufs"] == -18, "app config merge did not persist background LUFS default")
+        _assert(merged_data["output"]["background_weight"] == 1.0, "app config merge did not persist background weight default")
+        _assert(merged_data["output"]["lektor_delay_ms"] == DEFAULT_LEKTOR_DELAY_MS, "app config merge did not persist lektor delay default")
+        merged_store.set_window_state(1440, 900, "maximized")
+        window_state = merged_store.window_state()
+        _assert(window_state["width"] == 1440 and window_state["height"] == 900, "window state dimensions did not persist")
+        _assert(window_state["mode"] == "maximized", "window state mode did not persist")
+    finally:
+        try:
+            config_merge_path.unlink()
+        except OSError:
+            pass
+    messages.append("app config merge: OK")
+
+    config_normalize_path = app_dir / "_self_test_config_normalize.json"
+    try:
+        config_normalize_path.write_text(
+            json.dumps(
+                {
+                    "version": "bad-version",
+                    "ui": {
+                        "theme": 123,
+                        "last_file_dir": 456,
+                        "window": {
+                            "width": "tiny",
+                            "height": 99999,
+                            "mode": "bad",
+                        },
+                        "custom_ui_flag": "keep-ui",
+                    },
+                    "tts": {
+                        "last_engine": 789,
+                        "custom_tts_flag": "keep-tts",
+                    },
+                    "output": {
+                        "aac_bitrate": "640",
+                        "lektor_lufs": "-99",
+                        "lektor_weight": "9.9",
+                        "background_lufs": "bad",
+                        "background_weight": "0",
+                        "lektor_delay_ms": "9999",
+                        "custom_output_flag": "keep-output",
+                    },
+                    "custom_root_flag": "keep-root",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        normalize_store = AppConfigStore(config_normalize_path)
+        normalize_store.load()
+        normalized_data = json.loads(config_normalize_path.read_text(encoding="utf-8"))
+        _assert(normalized_data["version"] == 1, "app config normalize should restore bad version")
+        _assert(normalized_data["ui"]["theme"] == "dark", "app config normalize should restore bad theme")
+        _assert(normalized_data["ui"]["last_file_dir"] == "", "app config normalize should restore bad last dir")
+        _assert(normalized_data["ui"]["window"]["width"] == 1280, "app config normalize should restore bad window width")
+        _assert(normalized_data["ui"]["window"]["height"] == 4000, "app config normalize should clamp bad window height")
+        _assert(normalized_data["ui"]["window"]["mode"] == "normal", "app config normalize should restore bad window mode")
+        _assert(normalized_data["tts"]["last_engine"] == "", "app config normalize should restore bad last engine")
+        _assert(normalized_data["output"]["aac_bitrate"] == "640k", "app config normalize should sanitize AAC bitrate")
+        _assert(normalized_data["output"]["lektor_lufs"] == -30, "app config normalize should clamp lektor LUFS")
+        _assert(normalized_data["output"]["lektor_weight"] == 3.0, "app config normalize should clamp lektor weight")
+        _assert(normalized_data["output"]["background_lufs"] == -18, "app config normalize should restore background LUFS")
+        _assert(normalized_data["output"]["background_weight"] == 0.1, "app config normalize should clamp background weight")
+        _assert(normalized_data["output"]["lektor_delay_ms"] == MAX_LEKTOR_DELAY_MS, "app config normalize should clamp lektor delay")
+        _assert(normalized_data["ui"]["custom_ui_flag"] == "keep-ui", "app config normalize removed nested ui custom key")
+        _assert(normalized_data["tts"]["custom_tts_flag"] == "keep-tts", "app config normalize removed nested tts custom key")
+        _assert(normalized_data["output"]["custom_output_flag"] == "keep-output", "app config normalize removed nested output custom key")
+        _assert(normalized_data["custom_root_flag"] == "keep-root", "app config normalize removed root custom key")
+    finally:
+        try:
+            config_normalize_path.unlink()
+        except OSError:
+            pass
+    messages.append("app config normalize: OK")
+
+    config_bad_sections_path = app_dir / "_self_test_config_bad_sections.json"
+    try:
+        config_bad_sections_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "ui": "bad-ui-section",
+                    "tts": 123,
+                    "output": False,
+                    "custom_root_flag": "keep-root",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        bad_sections_store = AppConfigStore(config_bad_sections_path)
+        bad_sections_store.load()
+        bad_sections_data = json.loads(config_bad_sections_path.read_text(encoding="utf-8"))
+        _assert(isinstance(bad_sections_data.get("ui"), dict), "bad ui section should be restored")
+        _assert(isinstance(bad_sections_data.get("tts"), dict), "bad tts section should be restored")
+        _assert(isinstance(bad_sections_data.get("output"), dict), "bad output section should be restored")
+        _assert(bad_sections_data["ui"]["last_file_dir"] == "", "bad ui section default mismatch")
+        _assert(bad_sections_data["tts"]["last_engine"] == "", "bad tts section default mismatch")
+        _assert(bad_sections_data["output"]["aac_bitrate"] == "256k", "bad output section AAC bitrate default mismatch")
+        _assert(bad_sections_data["custom_root_flag"] == "keep-root", "custom root key should survive bad section repair")
+        bad_sections_store.set_last_file_dir(str(app_dir))
+        bad_sections_store.set_last_engine("edge")
+        _assert(bad_sections_store.last_file_dir() == str(app_dir), "repaired config last dir write mismatch")
+        _assert(bad_sections_store.last_engine() == "edge", "repaired config last engine write mismatch")
+    finally:
+        try:
+            config_bad_sections_path.unlink()
+        except OSError:
+            pass
+    messages.append("app config bad sections: OK")
+
+    config_store = AppConfigStore(app_dir / "_self_test_config_filter.json")
+    unsupported_path = app_dir / "_self_test_unsupported.bin"
+    supported_path = app_dir / "_self_test_supported.srt"
+    try:
+        config_store.load()
+        unsupported_path.write_text("", encoding="utf-8")
+        supported_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nTest\n", encoding="utf-8")
+        candidate_files = [str(unsupported_path), str(supported_path)]
+        first_supported_dir = ""
+        for file_path in candidate_files:
+            path = Path(file_path)
+            if path.is_file() and path.suffix.lower() in {*SUPPORTED_SUBTITLE_EXTENSIONS, ".mkv"}:
+                first_supported_dir = str(path.resolve().parent)
+                break
+        if first_supported_dir:
+            config_store.set_last_file_dir(first_supported_dir)
+        _assert(config_store.last_file_dir() == str(app_dir.resolve()), "last file dir should use first supported file")
+    finally:
+        for path in (unsupported_path, supported_path, app_dir / "_self_test_config_filter.json"):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    messages.append("config last dir filter: OK")
+
+    return messages
+
+
+def _assert(condition: bool, message: str) -> None:
+    if not condition:
+        raise AssertionError(message)
+
+
+def _load_start_module(path: Path):
+    return _load_module(path, "_lektorai_start_self_test")
+
+
+def _load_module(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"cannot load module for self test: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _requirement_names(path: Path) -> set[str]:
+    names: set[str] = set()
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith("-"):
+            continue
+        for separator in ("==", ">=", "<=", "~=", "!=", ">", "<", "[", ";"):
+            if separator in line:
+                line = line.split(separator, 1)[0].strip()
+        if line:
+            names.add(line.lower().replace("_", "-"))
+    return names
+
+
+def _write_test_wav(path: Path, samples: list[int], sample_rate: int = 44100) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(b"".join(int(max(-32768, min(32767, sample))).to_bytes(2, "little", signed=True) for sample in samples))
+
+
+def _wav_frame_count(path: Path) -> int:
+    with wave.open(str(path), "rb") as wav:
+        return int(wav.getnframes())
+
+
+def _wav_sample_rate(path: Path) -> int:
+    with wave.open(str(path), "rb") as wav:
+        return int(wav.getframerate())
+
+
+def _wav_first_sample(path: Path) -> int:
+    with wave.open(str(path), "rb") as wav:
+        data = wav.readframes(1)
+    return int.from_bytes(data[:2], "little", signed=True) if data else 0
+
+
+def _wav_sample_at(path: Path, frame_index: int) -> int:
+    with wave.open(str(path), "rb") as wav:
+        frame = max(0, min(int(frame_index), int(wav.getnframes()) - 1))
+        wav.setpos(frame)
+        data = wav.readframes(1)
+    return int.from_bytes(data[:2], "little", signed=True) if data else 0
+
+
+def _wav_max_abs_range(path: Path, start_frame: int, end_frame: int) -> int:
+    with wave.open(str(path), "rb") as wav:
+        start = max(0, min(int(start_frame), int(wav.getnframes())))
+        end = max(start, min(int(end_frame), int(wav.getnframes())))
+        wav.setpos(start)
+        data = wav.readframes(end - start)
+    values = array("h")
+    values.frombytes(data)
+    return max((abs(int(value)) for value in values), default=0)
+
+
+def _wav_max_delta_range(path: Path, start_frame: int, end_frame: int) -> int:
+    with wave.open(str(path), "rb") as wav:
+        start = max(0, min(int(start_frame), int(wav.getnframes())))
+        end = max(start, min(int(end_frame), int(wav.getnframes())))
+        wav.setpos(start)
+        data = wav.readframes(end - start)
+    values = array("h")
+    values.frombytes(data)
+    return max((abs(int(values[index]) - int(values[index - 1])) for index in range(1, len(values))), default=0)
+
+
+def _relative_app_files(root: Path) -> set[Path]:
+    if not root.exists():
+        return set()
+    return {
+        path.relative_to(root)
+        for path in root.rglob("*")
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and path.suffix not in {".pyc", ".pyo"}
+    }
+
+
+def _portable_scan_files(app_dir: Path) -> list[Path]:
+    files = [app_dir / "START.py"]
+    files.extend((app_dir / "app" / rel) for rel in sorted(_relative_app_files(app_dir / "app")))
+    return [path for path in files if path.is_file()]
+
+
+def _cleanup_tree(path: Path) -> None:
+    if not path.exists():
+        return
+    for child in path.iterdir():
+        if child.is_dir():
+            _cleanup_tree(child)
+        else:
+            try:
+                child.unlink()
+            except OSError:
+                pass
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+
