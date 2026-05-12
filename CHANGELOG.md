@@ -8,6 +8,7 @@ W tym pliku beda zapisywane publiczne zmiany miedzy kolejnymi wersjami LektorAI 
 - Poprawiono logi aplikacji.
 - Dodano opcję diagnostyczną `Raport jakości`.
 - Dodano menu `Czyszczenie logów`.
+- Zdefiniowano limity długości próbki głosu dla poszczególnych TTS.
 - Przeniesiono fundament `Whisper QC` pod przyszłą strukturę STT.
 
 ## v1.0
