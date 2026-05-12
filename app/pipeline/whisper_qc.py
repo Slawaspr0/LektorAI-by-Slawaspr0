@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from app.stt.faster_whisper_runtime import (
+    faster_whisper_missing_message,
+    import_faster_whisper_for_cache,
+)
+
 
 @dataclass(frozen=True)
 class WhisperQCResult:
@@ -41,7 +46,8 @@ def score_whisper_transcript(expected_text: str, transcript: str, threshold: flo
 
 def transcribe_audio_with_faster_whisper(audio_path: Path, settings: dict, cache_dir: Path) -> str:
     try:
-        from faster_whisper import WhisperModel
+        faster_whisper = import_faster_whisper_for_cache(cache_dir)
+        WhisperModel = faster_whisper.WhisperModel
     except ModuleNotFoundError as exc:
         if exc.name == "faster_whisper":
             raise RuntimeError(faster_whisper_missing_message()) from exc
@@ -92,11 +98,6 @@ def normalize_for_whisper_qc(text: str) -> str:
     normalized = unicodedata.normalize("NFKD", str(text or "").casefold())
     without_marks = "".join(char for char in normalized if not unicodedata.combining(char))
     return re.sub(r"\s+", " ", re.sub(r"[^0-9a-z]+", " ", without_marks)).strip()
-
-
-def faster_whisper_missing_message() -> str:
-    return "Whisper QC: brak biblioteki faster-whisper. Zainstaluj requirements aplikacji albo wylacz Whisper QC."
-
 
 def _bounded_float(value, minimum: float, maximum: float) -> float:
     try:

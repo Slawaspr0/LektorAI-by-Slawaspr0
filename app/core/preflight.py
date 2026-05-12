@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import importlib.util
-
 from app.core.media_tools import find_ffmpeg, find_ffprobe, find_mkvmerge
 from app.core.paths import AppPaths
 from app.core.version import APP_NAME
 from app.engines.manager import EngineManager
 from app.engines.schemas import EngineKind
+from app.stt.faster_whisper_runtime import faster_whisper_import_problem
 
 
 def build_preflight_report(paths: AppPaths, manager: EngineManager) -> tuple[bool, list[str]]:
@@ -24,8 +23,9 @@ def build_preflight_report(paths: AppPaths, manager: EngineManager) -> tuple[boo
         blockers.append("Brak mkvmerge.")
     if not selectable:
         blockers.append("Brak gotowego silnika TTS.")
-    if importlib.util.find_spec("faster_whisper") is None:
-        warnings.append(f"Brak faster-whisper dla Whisper QC. Instalacja: python -m pip install -r {paths.app_dir / 'requirements.txt'}")
+    whisper_missing = faster_whisper_import_problem(paths)
+    if whisper_missing:
+        warnings.append(f"Whisper QC: modul kontroli mowy nie jest jeszcze przygotowany ({whisper_missing}). Program zainstaluje go przy pierwszym uzyciu kontroli mowy")
     if local_missing:
         warnings.append("Lokalne TTS niezainstalowane: " + ", ".join(local_missing))
 

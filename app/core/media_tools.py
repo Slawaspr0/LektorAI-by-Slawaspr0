@@ -27,6 +27,7 @@ VOICE_SAMPLE_EXTENSIONS = (".wav", ".mp3", ".flac")
 VOICE_SAMPLE_RATE_BY_ENGINE = {
     "chatterbox": 24000,
     "omnivoice": 24000,
+    "coqui_xtts": 24000,
 }
 AAC_BITRATE_OPTIONS = ("192k", "256k", "320k", "384k", "448k", "640k")
 DEFAULT_AAC_BITRATE = "384k"

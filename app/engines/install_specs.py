@@ -47,6 +47,32 @@ INSTALL_SPECS: dict[str, EngineInstallSpec] = {
         import_checks=("omnivoice", "soundfile"),
         torch_index_url=TORCH_CU128_INDEX,
     ),
+    "piper": EngineInstallSpec(
+        engine_id="piper",
+        torch_requirements=(),
+        requirements=(
+            "piper-tts==1.4.2",
+            "soundfile",
+        ),
+        constraints=(),
+        import_checks=("piper", "soundfile"),
+    ),
+    "coqui_xtts": EngineInstallSpec(
+        engine_id="coqui_xtts",
+        torch_requirements=("torch==2.8.0+cu126", "torchaudio==2.8.0+cu126"),
+        requirements=(
+            "coqui-tts @ git+https://github.com/idiap/coqui-ai-TTS.git",
+            "soundfile",
+        ),
+        constraints=(
+            "torch==2.8.0+cu126",
+            "torchaudio==2.8.0+cu126",
+            "transformers>=4.57.6,<5",
+            "huggingface-hub>=0.36.0,<1",
+        ),
+        import_checks=("TTS", "soundfile"),
+        torch_index_url=TORCH_CU126_INDEX,
+    ),
 }
 
 

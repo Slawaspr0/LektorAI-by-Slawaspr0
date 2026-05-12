@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import sys
 
 from app.core.media_tools import BINARY_LOOKUP_HINT, find_ffmpeg, find_ffprobe, find_mkvmerge
@@ -8,6 +7,7 @@ from app.core.paths import AppPaths
 from app.core.version import APP_NAME, APP_VERSION
 from app.engines.manager import EngineManager
 from app.engines.schemas import EngineStatus
+from app.stt.faster_whisper_runtime import faster_whisper_import_problem
 
 
 def collect_diagnostics(paths: AppPaths, manager: EngineManager) -> list[tuple[str, str, str]]:
@@ -18,7 +18,8 @@ def collect_diagnostics(paths: AppPaths, manager: EngineManager) -> list[tuple[s
     rows.append(_path_row("Config", paths.config_path))
     rows.append(_path_row("Logi", paths.logs_dir))
     rows.append(_runtime_engines_row(paths))
-    rows.extend(_app_package_rows(("edge_tts", "openai", "faster_whisper"), paths))
+    rows.extend(_app_package_rows(("edge_tts", "openai"), paths))
+    rows.append(_stt_faster_whisper_row(paths))
     rows.append(_binary_row("ffmpeg", find_ffmpeg(paths)))
     rows.append(_binary_row("ffprobe", find_ffprobe(paths)))
     rows.append(_binary_row("mkvmerge", find_mkvmerge(paths)))
@@ -67,7 +68,15 @@ def _binary_row(name, path, optional: bool = False) -> tuple[str, str, str]:
 def _app_package_rows(package_names: tuple[str, ...], paths: AppPaths) -> list[tuple[str, str, str]]:
     rows: list[tuple[str, str, str]] = []
     for name in package_names:
+        import importlib.util
         found = importlib.util.find_spec(name) is not None
         detail = "import OK" if found else f"brak importu | {sys.executable} -m pip install -r {paths.app_dir / 'requirements.txt'}"
         rows.append((f"Pakiet: {name}", "OK" if found else "brak", detail))
     return rows
+
+
+def _stt_faster_whisper_row(paths: AppPaths) -> tuple[str, str, str]:
+    problem = faster_whisper_import_problem(paths)
+    if not problem:
+        return ("STT: faster-whisper", "OK", str(paths.faster_whisper_stt_dir))
+    return ("STT: faster-whisper", "brak", f"{problem} | program przygotuje modul przy pierwszym uzyciu kontroli mowy")

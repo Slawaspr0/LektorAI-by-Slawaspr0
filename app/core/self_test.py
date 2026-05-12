@@ -7,12 +7,14 @@ import subprocess
 import sys
 import wave
 from array import array
+from datetime import datetime
 from pathlib import Path
 
 from app.core.dictionary import sanitize_dictionary, save_dictionary
 from app.core.config import AppConfigStore
 from app.core.diagnostics import collect_diagnostics
 from app.core.logging import app_log_path, broken_json_backup_path, engine_log_path, safe_name, setup_app_logger
+from app.core.log_cleanup import cleanup_logs, preview_log_cleanup
 from app.core.media_tools import (
     BINARY_LOOKUP_HINT,
     DEFAULT_LEKTOR_DELAY_MS,
@@ -49,7 +51,12 @@ from app.core.version import APP_NAME, APP_VERSION
 from app.cli.engine_commands import remove_engine_command
 from app.engines.config_schema import fields_for, is_audio_qc_field, is_diagnostic_field, is_speech_qc_field, visible_fields_for
 from app.engines.config_validation import validate_engine_config, validate_whisper_qc_dependency
-from app.engines.install_specs import TORCH_CU126_INDEX, TORCH_CU128_INDEX, get_install_spec
+from app.engines.voice_sample_rules import (
+    validate_voice_sample_duration,
+    voice_sample_duration_help,
+    voice_sample_rule,
+)
+from app.engines.install_specs import INSTALL_SPECS, TORCH_CU126_INDEX, TORCH_CU128_INDEX, get_install_spec
 from app.engines.manager import EngineManager
 from app.engines.protocol import (
     EngineRequest,
@@ -88,6 +95,10 @@ from app.pipeline.whisper_qc import (
     score_whisper_transcript,
     text_similarity,
 )
+from app.stt.faster_whisper_runtime import (
+    faster_whisper_package_dirs,
+    faster_whisper_worker_env,
+)
 from app.pipeline.tts_job import (
     _build_local_engine_request,
     _find_sidecar_subtitles,
@@ -95,10 +106,18 @@ from app.pipeline.tts_job import (
     _format_builtin_qc_selected_message,
     _edge_retry_text,
     _edge_retry_text_variants,
+    _aggregate_segment_analysis,
+    _build_run_analysis,
+    _sanitize_settings_snapshot,
     _generated_audio_from_worker_result,
     _cleanup_lektor_debug_files,
+    _cleanup_successful_video_run,
+    _ensure_common_whisper_cache,
     apply_lektor_delay_to_segments,
     _local_worker_qc_warning_summary,
+    _local_worker_segment_analysis,
+    _local_worker_progress,
+    _local_worker_retry_progress_message,
     _model_activity_message_for_worker_line,
     _quality_chain_label,
     _quality_controls_summary,
@@ -107,7 +126,7 @@ from app.pipeline.tts_job import (
     run_tts_job,
 )
 from app.pipeline.audio_timeline import SAMPLE_RATE, SEGMENT_EDGE_FADE_MS, build_lektor_wav
-from app.pipeline.workspace import lektor_assets_dir, lektorai_workspace_for, next_output_stem
+from app.pipeline.workspace import engine_short_code, lektor_assets_dir, lektorai_workspace_for, next_output_stem
 from app.ui.main_window import (
     audio_defaults_summary,
     build_start_confirmation_text,
@@ -141,6 +160,7 @@ from app.ui.dialogs.settings_dialog import (
     edge_slider_value_for_widget,
     format_edge_slider_value,
     merge_engine_settings_values,
+    diagnostic_field_groups,
     settings_help_button_label,
 )
 from app.ui.dialogs.dictionary_dialog import should_show_dictionary_row
@@ -155,6 +175,13 @@ def run_self_test(app_dir: Path) -> list[str]:
     paths = build_paths(app_dir)
     _assert(paths.app_dir == app_dir.resolve(), "portable app_dir mismatch")
     _assert(paths.app_packages_dir == app_dir.resolve() / "packages", "portable app packages dir mismatch")
+    _assert(paths.cache_dir == app_dir.resolve() / "cache", "portable app cache dir mismatch")
+    _assert(paths.runtime_stt_dir == app_dir.resolve() / "stt", "portable STT runtime dir mismatch")
+    _assert(paths.stt_dir("faster_whisper") == app_dir.resolve() / "stt" / "faster_whisper", "portable faster-whisper STT dir mismatch")
+    _assert(paths.faster_whisper_packages_dir == app_dir.resolve() / "stt" / "faster_whisper" / "packages", "portable faster-whisper packages dir mismatch")
+    _assert(paths.faster_whisper_cache_dir == app_dir.resolve() / "stt" / "faster_whisper" / "cache", "portable faster-whisper cache dir mismatch")
+    _assert(paths.whisper_cache_dir == paths.faster_whisper_cache_dir, "legacy Whisper cache alias mismatch")
+    _assert(faster_whisper_package_dirs(paths)[0] == paths.faster_whisper_packages_dir, "faster-whisper should prefer STT packages")
     messages.append("paths: OK")
 
     start_module = _load_start_module(app_dir / "START.py")
@@ -216,7 +243,7 @@ def run_self_test(app_dir: Path) -> list[str]:
             ),
             (
                 ["--list-engines"],
-                ("Edge TTS", "Chatterbox", "OmniVoice"),
+                ("Edge TTS", "Chatterbox", "OmniVoice", "Piper TTS", "Coqui XTTS-v2"),
                 "START.py --list-engines",
             ),
             (
@@ -259,6 +286,58 @@ def run_self_test(app_dir: Path) -> list[str]:
     finally:
         _cleanup_tree(cli_probe_dir)
     messages.append("launcher readonly CLI: OK")
+
+    log_cleanup_probe_dir = app_dir / "_self_test_log_cleanup"
+    try:
+        cleanup_paths = build_paths(log_cleanup_probe_dir)
+        (cleanup_paths.logs_dir).mkdir(parents=True, exist_ok=True)
+        engine_dir = cleanup_paths.runtime_engines_dir / "piper"
+        engine_logs_dir = engine_dir / "logs"
+        engine_cache_dir = engine_dir / "cache"
+        engine_temp_dir = engine_dir / "temp"
+        engine_logs_dir.mkdir(parents=True, exist_ok=True)
+        engine_cache_dir.mkdir(parents=True, exist_ok=True)
+        engine_temp_dir.mkdir(parents=True, exist_ok=True)
+        old_app_log_path = cleanup_paths.logs_dir / "app_2026.05.12.10.00.00.log"
+        current_app_log_path = cleanup_paths.logs_dir / "app_2026.05.12.10.05.00.log"
+        old_app_log_path.write_text("old app log", encoding="utf-8")
+        current_app_log_path.write_text("current app log", encoding="utf-8")
+        (cleanup_paths.logs_dir / "keep.txt").write_text("keep", encoding="utf-8")
+        (engine_logs_dir / "piper_2026.05.12.10.00.00.Film.log").write_text("engine log", encoding="utf-8")
+        (engine_logs_dir / "piper_2026.05.12.10.00.00.Film.analysis.json").write_text("{}", encoding="utf-8")
+        (engine_logs_dir / "keep.json").write_text("{}", encoding="utf-8")
+        (engine_dir / "install.log").write_text("install", encoding="utf-8")
+        (engine_dir / "config.json").write_text("{}", encoding="utf-8")
+        (engine_dir / "dictionary.json").write_text("{}", encoding="utf-8")
+        (engine_cache_dir / "model.bin").write_text("model", encoding="utf-8")
+        (engine_temp_dir / "request.json").write_text("{}", encoding="utf-8")
+        preview = preview_log_cleanup(cleanup_paths, active_app_log_path=current_app_log_path)
+        _assert(preview["app_logs"] == 1, "log cleanup app log preview mismatch")
+        _assert(preview["engine_logs"] == 2, "log cleanup engine log preview mismatch")
+        _assert(preview["install_logs"] == 1, "log cleanup install log preview mismatch")
+        _assert(preview["engine_temp"] == 1, "log cleanup temp preview mismatch")
+        result = cleanup_logs(
+            cleanup_paths,
+            {"app_logs", "engine_logs", "install_logs", "engine_temp"},
+            active_app_log_path=current_app_log_path,
+        )
+        _assert(not result.errors, "log cleanup should not report errors: " + "; ".join(result.errors))
+        _assert(result.files_removed == 4, "log cleanup removed file count mismatch")
+        _assert(result.dirs_removed == 1, "log cleanup removed dir count mismatch")
+        _assert(not old_app_log_path.exists(), "old app log should be removed")
+        _assert(current_app_log_path.is_file(), "current app log should stay")
+        _assert((cleanup_paths.logs_dir / "keep.txt").is_file(), "non-log app file should stay")
+        _assert(not (engine_logs_dir / "piper_2026.05.12.10.00.00.Film.log").exists(), "engine log should be removed")
+        _assert(not (engine_logs_dir / "piper_2026.05.12.10.00.00.Film.analysis.json").exists(), "old analysis copy should be removed")
+        _assert((engine_logs_dir / "keep.json").is_file(), "generic engine json should stay")
+        _assert(not (engine_dir / "install.log").exists(), "install log should be removed")
+        _assert((engine_dir / "config.json").is_file(), "engine config should stay")
+        _assert((engine_dir / "dictionary.json").is_file(), "engine dictionary should stay")
+        _assert((engine_cache_dir / "model.bin").is_file(), "engine cache should stay")
+        _assert(not engine_temp_dir.exists(), "engine temp should be removed")
+    finally:
+        _cleanup_tree(log_cleanup_probe_dir)
+    messages.append("log cleanup: OK")
 
     _assert(not (app_dir / "app" / "app").exists(), "nested app/app directory should not exist")
     forbidden_path_fragments = tuple(
@@ -404,7 +483,7 @@ def run_self_test(app_dir: Path) -> list[str]:
     requirements_path = app_dir / "requirements.txt"
     _assert(requirements_path.is_file(), "requirements.txt missing")
     app_requirements = _requirement_names(requirements_path)
-    expected_app_requirements = {"pyqt6", "edge-tts", "faster-whisper", "openai"}
+    expected_app_requirements = {"pyqt6", "edge-tts", "openai"}
     _assert(expected_app_requirements.issubset(app_requirements), "app requirements missing expected packages")
     forbidden_app_requirements = {
         "torch",
@@ -427,9 +506,15 @@ def run_self_test(app_dir: Path) -> list[str]:
         allowed_final_items = {
             "START.py",
             "requirements.txt",
+            "README.md",
+            "LICENSE",
+            "CHANGELOG.md",
+            "lektorAI_screen.jpg",
             "config.json",
             "app",
+            "cache",
             "logs",
+            "stt",
             "ffmpeg.exe",
             "ffprobe.exe",
             "mkvmerge.exe",
@@ -468,15 +553,17 @@ def run_self_test(app_dir: Path) -> list[str]:
             not present_final_items,
             "FINAL package contains runtime/heavy items: " + ", ".join(present_final_items),
         )
-        messages.append("final minimal package: OK")
+        messages.append("final release package: OK")
     elif app_dir.name.upper() == "TEST":
         allowed_test_items = {
             "START.py",
             "requirements.txt",
             "config.json",
             "app",
+            "cache",
             "logs",
             "engines",
+            "stt",
             "ffmpeg.exe",
             "ffprobe.exe",
             "mkvmerge.exe",
@@ -498,28 +585,33 @@ def run_self_test(app_dir: Path) -> list[str]:
         )
         messages.append("test package layout: OK")
 
-    local_specs = {engine_id: get_install_spec(engine_id) for engine_id in ("chatterbox", "omnivoice")}
+    _assert("chatterbox_onnx_pl" not in INSTALL_SPECS, "archived Chatterbox ONNX PL should not be installable")
+    local_specs = {engine_id: get_install_spec(engine_id) for engine_id in ("chatterbox", "omnivoice", "piper", "coqui_xtts")}
     for engine_id, spec in local_specs.items():
         _assert(spec.engine_id == engine_id, f"{engine_id} install spec id mismatch")
-        _assert(spec.torch_requirements, f"{engine_id} torch install spec has no torch requirements")
         _assert(spec.requirements, f"{engine_id} install spec has no requirements")
         _assert(spec.import_checks, f"{engine_id} install spec has no import checks")
         _assert(
-            any(requirement.startswith("torch") for requirement in spec.torch_requirements),
-            f"{engine_id} install spec missing torch package",
-        )
-        _assert(
-            any(requirement.startswith("torch") for requirement in spec.constraints),
-            f"{engine_id} install spec missing torch constraint",
-        )
-        _assert(
             not any("faster-whisper" in requirement for requirement in spec.requirements),
-            f"{engine_id} should use app-level faster-whisper instead of installing it into venv",
+            f"{engine_id} should use shared STT faster-whisper instead of installing it into venv",
         )
         _assert(
             "faster_whisper" not in spec.import_checks,
             f"{engine_id} install import checks should not validate app-level faster_whisper",
         )
+        if engine_id not in {"piper"}:
+            _assert(spec.torch_requirements, f"{engine_id} torch install spec has no torch requirements")
+            _assert(
+                any(requirement.startswith("torch") for requirement in spec.torch_requirements),
+                f"{engine_id} install spec missing torch package",
+            )
+            _assert(
+                any(requirement.startswith("torch") for requirement in spec.constraints),
+                f"{engine_id} install spec missing torch constraint",
+            )
+        else:
+            _assert(not spec.torch_requirements, f"{engine_id} should not install PyTorch")
+            _assert(not spec.constraints, f"{engine_id} should not write torch constraints")
     _assert(local_specs["chatterbox"].torch_requirements == ("torch==2.6.0", "torchaudio==2.6.0"), "chatterbox should use original torch pair")
     _assert(local_specs["chatterbox"].torch_index_url == TORCH_CU126_INDEX, "chatterbox torch index mismatch")
     _assert(
@@ -531,6 +623,13 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(local_specs["omnivoice"].torch_requirements == ("torch==2.8.0+cu128", "torchaudio==2.8.0+cu128"), "omnivoice should use its upstream torch pair")
     _assert(local_specs["omnivoice"].torch_index_url == TORCH_CU128_INDEX, "omnivoice torch index mismatch")
     _assert("omnivoice==0.1.5" in local_specs["omnivoice"].requirements, "omnivoice should install pinned PyPI release")
+    _assert("piper-tts==1.4.2" in local_specs["piper"].requirements, "piper should install pinned upstream PyPI release")
+    _assert(local_specs["coqui_xtts"].torch_requirements == ("torch==2.8.0+cu126", "torchaudio==2.8.0+cu126"), "coqui XTTS should use a CUDA 12.6 torch pair")
+    _assert(local_specs["coqui_xtts"].torch_index_url == TORCH_CU126_INDEX, "coqui XTTS torch index mismatch")
+    _assert(
+        any("coqui-tts" in requirement and "github.com/idiap/coqui-ai-TTS" in requirement for requirement in local_specs["coqui_xtts"].requirements),
+        "coqui XTTS should install current upstream repo",
+    )
     messages.append("local install specs: OK")
 
     manager = EngineManager(paths)
@@ -538,17 +637,21 @@ def run_self_test(app_dir: Path) -> list[str]:
     clear_engine_status_cache(manager)
     _assert(not manager._package_check_cache, "engine package cache should be clearable before explicit refresh")
     states = manager.list_states()
+    engine_ids = {state.definition.engine_id for state in states}
     _assert(any(state.definition.engine_id == "edge" for state in states), "missing edge definition")
     _assert(any(state.definition.engine_id == "openai" for state in states), "missing openai definition")
     _assert(any(state.definition.engine_id == "chatterbox" for state in states), "missing chatterbox definition")
+    _assert("chatterbox_onnx_pl" not in engine_ids, "archived Chatterbox ONNX PL should not be listed as active engine")
     _assert(any(state.definition.engine_id == "omnivoice" for state in states), "missing omnivoice definition")
+    _assert(any(state.definition.engine_id == "piper" for state in states), "missing piper definition")
+    _assert(any(state.definition.engine_id == "coqui_xtts" for state in states), "missing coqui XTTS definition")
     for state in states:
-        if state.definition.engine_id in {"chatterbox", "omnivoice"}:
+        if state.definition.engine_id in {"chatterbox", "omnivoice", "piper", "coqui_xtts"}:
             install_checks = set(get_install_spec(state.definition.engine_id).import_checks)
             if state.definition.engine_id == "chatterbox":
                 _assert(
-                    "faster_whisper" in state.definition.import_checks,
-                    f"{state.definition.engine_id} runtime status should still see app-level faster_whisper",
+                    "faster_whisper" not in state.definition.import_checks,
+                    f"{state.definition.engine_id} runtime status should not validate shared STT faster_whisper",
                 )
             _assert(install_checks.issubset(set(state.definition.import_checks)), f"{state.definition.engine_id} registry import checks should cover install import checks")
     missing_runtime_manager = EngineManager(build_paths(app_dir / "_self_test_missing_runtime"))
@@ -578,11 +681,11 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(not readonly_probe_dir.exists(), "preflight should not create app runtime dirs")
     readonly_ffmpeg_row = next(row for row in readonly_rows if row[0] == "ffmpeg")
     readonly_mkvmerge_row = next(row for row in readonly_rows if row[0] == "mkvmerge")
-    readonly_fw_row = next(row for row in readonly_rows if row[0] == "Pakiet: faster_whisper")
-    _assert(readonly_fw_row[1] in {"OK", "brak"}, "faster_whisper diagnostic row status mismatch")
+    readonly_fw_row = next(row for row in readonly_rows if row[0] == "STT: faster-whisper")
+    _assert(readonly_fw_row[1] in {"OK", "brak"}, "faster-whisper STT diagnostic row status mismatch")
     _assert(
-        readonly_fw_row[1] == "OK" or "pip install -r" in readonly_fw_row[2],
-        "missing app package diagnostic should include install hint",
+        readonly_fw_row[1] == "OK" or "pierwszym uzyciu" in readonly_fw_row[2],
+        "missing STT diagnostic should explain lazy first-use setup",
     )
     _assert(
         readonly_ffmpeg_row[2] == BINARY_LOOKUP_HINT or readonly_ffmpeg_row[1] == "OK",
@@ -600,7 +703,7 @@ def run_self_test(app_dir: Path) -> list[str]:
     install_preview_manager = EngineManager(install_preview_paths)
     try:
         _assert(not install_preview_dir.exists(), "install preview dir should start missing")
-        for engine_id in ("chatterbox", "omnivoice"):
+        for engine_id in ("chatterbox", "omnivoice", "coqui_xtts"):
             lines = install_preview_manager.local_install_preview(engine_id)
             joined = "\n".join(lines)
             _assert("PyTorch CUDA:" in joined, f"install preview missing torch section for {engine_id}")
@@ -622,6 +725,10 @@ def run_self_test(app_dir: Path) -> list[str]:
                 engine_dir / "constraints.txt",
             )
             _assert("-c" in torch_command and str(engine_dir / "constraints.txt") in torch_command, f"torch install command missing constraints for {engine_id}")
+        piper_preview = "\n".join(install_preview_manager.local_install_preview("piper"))
+        _assert("PyTorch CUDA:" not in piper_preview, "piper install preview should not show torch section")
+        _assert("PyTorch: nie wymagany" in piper_preview, "piper install preview should explain missing torch section")
+        _assert("piper-tts==1.4.2" in piper_preview, "piper install preview missing piper package")
         build_tools_command = install_preview_manager._build_tools_install_command(Path("python.exe"))
         _assert("--upgrade" not in build_tools_command, "build tools install should not upgrade pip on every retry")
         _assert("wheel" in build_tools_command and "setuptools" in build_tools_command, "build tools command missing expected packages")
@@ -922,7 +1029,35 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(venv_env["TEMP"].startswith(str(engine_dir)), "venv TEMP should stay inside engine dir")
         _assert(venv_env["TMP"].startswith(str(engine_dir)), "venv TMP should stay inside engine dir")
         worker_env = temp_manager._worker_env()
-        _assert(str(temp_paths.app_packages_dir) in worker_env.get("PYTHONPATH", ""), "worker PYTHONPATH should include app packages")
+        stt_env = faster_whisper_worker_env(temp_paths)
+        _assert(
+            str(temp_paths.faster_whisper_packages_dir) in stt_env.get("LEKTORAI_STT_FASTER_WHISPER_PACKAGES_DIRS", ""),
+            "STT env should expose faster-whisper packages",
+        )
+        _assert(
+            worker_env.get("LEKTORAI_STT_FASTER_WHISPER_PACKAGES_DIRS") == stt_env.get("LEKTORAI_STT_FASTER_WHISPER_PACKAGES_DIRS"),
+            "worker env should expose STT faster-whisper packages",
+        )
+        _assert(str(temp_paths.app_packages_dir) not in worker_env.get("PYTHONPATH", ""), "worker PYTHONPATH should not shadow venv packages")
+        _assert(
+            worker_env.get("LEKTORAI_STT_FASTER_WHISPER_CACHE_DIR") == str(temp_paths.faster_whisper_cache_dir),
+            "worker env should point to STT faster-whisper cache",
+        )
+        legacy_app_whisper_payload = temp_paths.cache_dir / "whisper" / "models--app" / "file.bin"
+        legacy_app_whisper_payload.parent.mkdir(parents=True, exist_ok=True)
+        legacy_app_whisper_payload.write_text("model\n", encoding="utf-8")
+        legacy_whisper_payload = temp_paths.engine_dir("edge") / "cache" / "whisper" / "models--test" / "file.bin"
+        legacy_whisper_payload.parent.mkdir(parents=True, exist_ok=True)
+        legacy_whisper_payload.write_text("model\n", encoding="utf-8")
+        _ensure_common_whisper_cache(temp_paths)
+        _assert(
+            (temp_paths.whisper_cache_dir / "models--test" / "file.bin").is_file(),
+            "legacy per-engine Whisper cache should migrate to shared cache",
+        )
+        _assert(
+            (temp_paths.faster_whisper_cache_dir / "models--app" / "file.bin").is_file(),
+            "legacy app Whisper cache should migrate to STT faster-whisper cache",
+        )
     finally:
         _cleanup_tree(temp_app_dir)
     messages.append("engine removal: OK")
@@ -1041,6 +1176,15 @@ def run_self_test(app_dir: Path) -> list[str]:
         not any("faster-whisper" in error for error in local_whisper_errors),
         "local TTS Whisper QC should be validated through its venv status, not the main app env",
     )
+    _assert(voice_sample_rule("edge") is None, "edge should not have voice sample duration rules")
+    _assert(voice_sample_rule("chatterbox").max_seconds == 30.0, "chatterbox voice sample max should be 30s")
+    _assert(voice_sample_rule("omnivoice").max_seconds == 10.0, "omnivoice voice sample max should be 10s")
+    _assert(voice_sample_rule("coqui_xtts").max_seconds == 10.0, "coqui XTTS voice sample max should be 10s")
+    _assert(validate_voice_sample_duration("piper", 999.0) == [], "piper should not validate reference voice duration")
+    _assert(validate_voice_sample_duration("omnivoice", 0.4), "very short OmniVoice sample should be rejected")
+    _assert(any("za dluga" in error for error in validate_voice_sample_duration("omnivoice", 11.0)), "long OmniVoice sample should be rejected")
+    _assert(any("30s" in error for error in validate_voice_sample_duration("chatterbox", 31.0)), "long Chatterbox sample should mention 30s max")
+    _assert("3-10s" in voice_sample_duration_help("coqui_xtts"), "voice sample tooltip should include recommended duration")
     optional_audio_probe = app_dir / "_self_test_optional_audio.txt"
     optional_mp3_probe = app_dir / "_self_test_optional_audio.mp3"
     optional_flac_probe = app_dir / "_self_test_optional_audio.flac"
@@ -1056,6 +1200,8 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(not chatterbox_flac_errors, "chatterbox should accept FLAC voice samples for automatic preparation")
         omnivoice_mp3_errors = validate_engine_config("omnivoice", {"reference_audio_path": str(optional_mp3_probe)})
         _assert(not omnivoice_mp3_errors, "omnivoice should accept MP3 voice samples")
+        coqui_mp3_errors = validate_engine_config("coqui_xtts", {"speaker_wav_path": str(optional_mp3_probe)})
+        _assert(not coqui_mp3_errors, "coqui XTTS should accept MP3 voice samples")
     finally:
         for probe in (optional_audio_probe, optional_mp3_probe, optional_flac_probe):
             try:
@@ -1098,6 +1244,7 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(supported_voice_sample_extensions() == (".wav", ".mp3", ".flac"), "voice sample supported extensions mismatch")
     _assert(voice_sample_sample_rate("chatterbox") == 24000, "chatterbox prepared sample rate mismatch")
     _assert(voice_sample_sample_rate("omnivoice") == 24000, "omnivoice prepared sample rate mismatch")
+    _assert(voice_sample_sample_rate("coqui_xtts") == 24000, "coqui XTTS prepared sample rate mismatch")
     voice_prepare_command = prepare_voice_sample_command(
         Path("ffmpeg.exe"),
         Path("input.flac"),
@@ -1224,18 +1371,21 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert("--no-audio" in mkvmerge_remux_text and "film.mkv" in mkvmerge_remux_text, "mkvmerge remux should copy source video/subtitles without original audio first")
     _assert("--language 0:pol" in mkvmerge_remux_text and f"0:{APP_NAME} edge 2.0" in mkvmerge_remux_text, "mkvmerge remux should tag prepared PL tracks")
     _assert("--default-track-flag 0:yes" in mkvmerge_remux_text and "--default-track-flag 1:no" in mkvmerge_remux_text, "mkvmerge remux should set default flags for PL and original audio")
-    edge_default_errors = [
-        error for error in validate_engine_config("edge", defaults["edge"]) if "faster-whisper" not in error
-    ]
-    _assert(edge_default_errors == [], "edge default config should be valid")
+    _assert(validate_engine_config("edge", defaults["edge"]) == [], "edge default config should be valid")
     _assert(validate_engine_config("chatterbox", defaults["chatterbox"]) == [], "chatterbox default config should be valid")
     _assert(validate_engine_config("omnivoice", defaults["omnivoice"]) == [], "omnivoice default config should be valid")
+    _assert(validate_engine_config("piper", defaults["piper"]) == [], "piper default config should be valid")
+    _assert(validate_engine_config("coqui_xtts", defaults["coqui_xtts"]) == [], "coqui XTTS default config should be valid")
     openai_config = dict(defaults["openai"])
     openai_config["api_key"] = "test-key"
     _assert(validate_engine_config("openai", openai_config) == [], "openai configured default should be valid")
-    for engine_id in ("edge", "openai", "chatterbox", "omnivoice"):
+    _assert("chatterbox_onnx_pl" not in defaults, "archived Chatterbox ONNX PL should not have active defaults")
+    _assert(fields_for("chatterbox_onnx_pl") == (), "archived Chatterbox ONNX PL should not expose config fields")
+    _assert(visible_fields_for("chatterbox_onnx_pl") == (), "archived Chatterbox ONNX PL should not expose visible config fields")
+    for engine_id in ("edge", "openai", "chatterbox", "omnivoice", "piper", "coqui_xtts"):
+        field_map = {field.key: field for field in fields_for(engine_id)}
         field_labels = {field.key: field.label for field in fields_for(engine_id)}
-        if engine_id in {"edge", "chatterbox", "omnivoice"}:
+        if engine_id in {"edge", "chatterbox", "omnivoice", "piper", "coqui_xtts"}:
             _assert("audio_qc_enabled" not in field_labels, f"{engine_id} Audio QC should not be exposed in TTS settings")
             _assert("audio_qc_retry_attempts" not in field_labels, f"{engine_id} Audio QC retry should not be exposed in TTS settings")
         else:
@@ -1255,6 +1405,10 @@ def run_self_test(app_dir: Path) -> list[str]:
             field_labels.get("whisper_qc_retry_attempts") == "Liczba prob",
             f"{engine_id} Whisper QC retry label should be user friendly",
         )
+        whisper_retry_field = field_map.get("whisper_qc_retry_attempts")
+        _assert(whisper_retry_field is not None, f"{engine_id} Whisper QC retry field missing")
+        _assert(whisper_retry_field.maximum == 5, f"{engine_id} Whisper QC retry should be locked to original plus 4 retries")
+        _assert("4 ponowienia" in whisper_retry_field.tooltip, f"{engine_id} Whisper QC retry tooltip should explain retry cap")
         _assert(
             field_labels.get("whisper_qc_model") == "Model",
             f"{engine_id} Whisper model label should be user friendly",
@@ -1264,6 +1418,7 @@ def run_self_test(app_dir: Path) -> list[str]:
             f"{engine_id} Whisper similarity label should be user friendly",
         )
         _assert(field_labels.get("save_processed_subtitles") == "Napisy po obrobce", f"{engine_id} processed subtitle save label mismatch")
+        _assert(field_labels.get("save_quality_report") == "Raport jakosci", f"{engine_id} quality report save label mismatch")
         _assert(field_labels.get("save_run_reports") == "Raporty techniczne", f"{engine_id} run report save label mismatch")
         _assert(field_labels.get("save_lektor_segments") == "Segmenty lektora", f"{engine_id} segment save label mismatch")
         _assert(field_labels.get("save_lektor_track_before_normalization") == "Sciezka przed normalizacja", f"{engine_id} pre-normalization save label mismatch")
@@ -1271,14 +1426,15 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(field_labels.get("save_audio_mix_steps") == "Etapy miksowania audio", f"{engine_id} mix stage save label mismatch")
         _assert("save_lektor_assets" not in field_labels, f"{engine_id} vague lektor assets option should not be visible")
         _assert(defaults[engine_id].get("save_processed_subtitles") is False, f"{engine_id} should not save processed subtitles by default")
+        _assert(defaults[engine_id].get("save_quality_report") is False, f"{engine_id} should not save quality report by default")
         _assert(defaults[engine_id].get("save_run_reports") is False, f"{engine_id} should not save run reports by default")
         _assert(defaults[engine_id].get("save_lektor_segments") is False, f"{engine_id} should not save segments by default")
         _assert(defaults[engine_id].get("save_lektor_track_before_normalization") is False, f"{engine_id} should not save pre-normalization track by default")
         _assert(defaults[engine_id].get("save_lektor_track_after_normalization") is False, f"{engine_id} should not save post-normalization track by default")
         _assert(defaults[engine_id].get("save_audio_mix_steps") is False, f"{engine_id} should not save audio mix steps by default")
-        if engine_id not in {"chatterbox", "omnivoice"}:
+        if "audio_qc_enabled" in defaults[engine_id]:
             _assert(defaults[engine_id].get("audio_qc_enabled") is False, f"{engine_id} Audio QC should be disabled by default")
-        expected_whisper_enabled = engine_id in {"edge", "chatterbox", "omnivoice"}
+        expected_whisper_enabled = engine_id in {"edge", "chatterbox", "omnivoice", "piper", "coqui_xtts"}
         _assert(
             defaults[engine_id].get("whisper_qc_enabled") is expected_whisper_enabled,
             f"{engine_id} Whisper QC default mismatch",
@@ -1331,6 +1487,45 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert("omnivoice_trim_start_ms" not in omnivoice_visible_keys, "omnivoice manual trim start should not be visible")
     _assert("omnivoice_trim_end_ms" not in omnivoice_visible_keys, "omnivoice manual trim end should not be visible")
     _assert("tada" not in defaults, "removed TADA should not have active defaults")
+    piper_fields = {field.key: field for field in fields_for("piper")}
+    _assert(defaults["piper"].get("voice") == "pl_PL-mc_speech-medium", "piper default voice mismatch")
+    _assert(defaults["piper"].get("length_scale") == 1.1, "piper default length scale mismatch")
+    _assert(defaults["piper"].get("noise_scale") == 0.05, "piper default noise scale mismatch")
+    _assert(defaults["piper"].get("noise_w_scale") == 0.05, "piper default noise width scale mismatch")
+    _assert(piper_fields["voice"].field_type == "choice", "piper voice should be a dropdown")
+    _assert("pl_PL-darkman-medium" in piper_fields["voice"].options and "pl_PL-gosia-medium" in piper_fields["voice"].options, "piper Polish voices missing")
+    _assert(piper_fields["length_scale"].minimum == 0.5 and piper_fields["length_scale"].maximum == 2.0, "piper length scale range mismatch")
+    _assert(piper_fields["noise_scale"].minimum == 0.0 and piper_fields["noise_scale"].maximum == 1.5, "piper noise range mismatch")
+    _assert(defaults["piper"].get("whisper_qc_enabled") is True, "piper Whisper QC should be enabled by default")
+    _assert(defaults["piper"].get("whisper_qc_retry_attempts") == 5, "piper Whisper QC retry default mismatch")
+    _assert(defaults["piper"].get("whisper_qc_model") == "small", "piper Whisper QC model default mismatch")
+    _assert(defaults["piper"].get("whisper_qc_min_similarity") == 0.93, "piper Whisper QC similarity default mismatch")
+    coqui_visible_keys = {field.key for field in visible_fields_for("coqui_xtts")}
+    coqui_fields = {field.key: field for field in fields_for("coqui_xtts")}
+    _assert("device" in coqui_visible_keys, "coqui XTTS device should be visible")
+    _assert("language" not in coqui_visible_keys and "model_name" not in coqui_visible_keys, "coqui XTTS model/language should be fixed and hidden")
+    _assert(defaults["coqui_xtts"].get("device") == "auto", "coqui XTTS default device mismatch")
+    _assert(defaults["coqui_xtts"].get("speaker_wav_path") == "", "coqui XTTS default sample should be empty")
+    _assert(defaults["coqui_xtts"].get("speaker") == "Anna", "coqui XTTS default builtin speaker mismatch")
+    _assert("Anna" in coqui_fields["speaker"].options, "coqui XTTS Anna speaker should be selectable")
+    _assert(defaults["coqui_xtts"].get("temperature") == 0.1, "coqui XTTS default temperature mismatch")
+    _assert(defaults["coqui_xtts"].get("length_penalty") == 1.0, "coqui XTTS default length penalty mismatch")
+    _assert(defaults["coqui_xtts"].get("repetition_penalty") == 9.0, "coqui XTTS default repetition penalty mismatch")
+    _assert(defaults["coqui_xtts"].get("top_k") == 100, "coqui XTTS default top_k mismatch")
+    _assert(defaults["coqui_xtts"].get("top_p") == 1.0, "coqui XTTS default top_p mismatch")
+    _assert(defaults["coqui_xtts"].get("builtin_voice_speed") == 1.6, "coqui XTTS builtin speed default mismatch")
+    _assert(defaults["coqui_xtts"].get("voice_sample_speed") == 1.3, "coqui XTTS sample speed default mismatch")
+    _assert("speed" not in coqui_visible_keys, "coqui XTTS legacy speed should not be visible")
+    _assert(defaults["coqui_xtts"].get("xtts_trim_trailing_silence") is True, "coqui XTTS trailing silence trim should be enabled by default")
+    _assert("xtts_trim_trailing_silence" in coqui_visible_keys, "coqui XTTS trailing silence trim should be visible")
+    _assert(coqui_fields["builtin_voice_speed"].minimum == 0.5 and coqui_fields["builtin_voice_speed"].maximum == 2.0, "coqui XTTS builtin speed range mismatch")
+    _assert(coqui_fields["voice_sample_speed"].minimum == 0.5 and coqui_fields["voice_sample_speed"].maximum == 2.0, "coqui XTTS sample speed range mismatch")
+    _assert(coqui_fields["temperature"].minimum == 0.05 and coqui_fields["temperature"].maximum == 1.5, "coqui XTTS temperature range mismatch")
+    _assert(coqui_fields["top_p"].minimum == 0.05 and coqui_fields["top_p"].maximum == 1.0, "coqui XTTS top_p range mismatch")
+    _assert(defaults["coqui_xtts"].get("whisper_qc_enabled") is True, "coqui XTTS Whisper QC should be enabled by default")
+    _assert(defaults["coqui_xtts"].get("whisper_qc_retry_attempts") == 4, "coqui XTTS Whisper QC retry default mismatch")
+    _assert(defaults["coqui_xtts"].get("whisper_qc_model") == "small", "coqui XTTS Whisper QC model default mismatch")
+    _assert(defaults["coqui_xtts"].get("whisper_qc_min_similarity") == 0.93, "coqui XTTS Whisper QC similarity default mismatch")
     messages.append("config validation: OK")
 
     for engine_id in ("edge", "openai"):
@@ -1343,7 +1538,7 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(not any(option.endswith(".en") or option.startswith("distil-") for option in whisper_field.options), f"{engine_id} Whisper QC should only list multilingual Polish-capable models")
         _assert(whisper_field.label == "Model", f"{engine_id} Whisper QC model label should be concise")
         _assert(whisper_field.tooltip == "Do wyboru rozne modele dla kontroli mowy.", f"{engine_id} Whisper QC tooltip should be concise")
-    for engine_id in ("chatterbox", "omnivoice"):
+    for engine_id in ("chatterbox", "omnivoice", "piper", "coqui_xtts"):
         field_keys = {field.key for field in fields_for(engine_id)}
         _assert("whisper_qc_enabled" in field_keys, f"{engine_id} missing Whisper QC toggle")
         _assert("whisper_qc_model" in field_keys, f"{engine_id} missing Whisper QC model")
@@ -1353,7 +1548,7 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(not any(option.endswith(".en") or option.startswith("distil-") for option in whisper_field.options), f"{engine_id} Whisper QC should only list multilingual Polish-capable models")
         _assert(whisper_field.label == "Model", f"{engine_id} Whisper QC model label should be concise")
         _assert(whisper_field.tooltip == "Do wyboru rozne modele dla kontroli mowy.", f"{engine_id} Whisper QC tooltip should be concise")
-    for engine_id in ("chatterbox", "omnivoice"):
+    for engine_id in ("chatterbox", "omnivoice", "coqui_xtts"):
         device_field = next(field for field in fields_for(engine_id) if field.key == "device")
         _assert(device_field.field_type == "choice", f"{engine_id} device should be a dropdown")
         _assert(device_field.options == ("auto", "cpu", "cuda", "cuda:0", "cuda:1"), f"{engine_id} device options mismatch")
@@ -1388,6 +1583,15 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(_quality_chain_label(raw_edge_summary) == "TTS -> final", "disabled edge tuning chain label mismatch")
     omnivoice_summary = _quality_controls_summary("omnivoice", {"omnivoice_trim_edges": True, "whisper_qc_enabled": True, "whisper_qc_retry_attempts": "2"}, ffmpeg_present=True)
     _assert(_quality_chain_label(omnivoice_summary) == "TTS -> Wycinanie ciszy na brzegach -> Whisper QC x2 -> final", "omnivoice quality chain label mismatch")
+    piper_summary = _quality_controls_summary("piper", {"whisper_qc_enabled": False}, ffmpeg_present=True)
+    _assert(_quality_chain_label(piper_summary) == "TTS -> final", "piper quality chain label mismatch")
+    piper_whisper_summary = _quality_controls_summary("piper", {"whisper_qc_enabled": True, "whisper_qc_retry_attempts": "4"}, ffmpeg_present=True)
+    _assert(_quality_chain_label(piper_whisper_summary) == "TTS -> Whisper QC x4 -> final", "piper punctuation Whisper QC chain label mismatch")
+    _assert(piper_whisper_summary["whisper_qc_retry_attempts"] == 4, "piper punctuation Whisper QC should advertise retry attempts")
+    coqui_summary = _quality_controls_summary("coqui_xtts", {"whisper_qc_enabled": True, "whisper_qc_retry_attempts": "3"}, ffmpeg_present=True)
+    _assert(_quality_chain_label(coqui_summary) == "TTS -> Wycinanie koncowej ciszy -> Whisper QC x3 -> final", "coqui XTTS quality chain label mismatch")
+    raw_coqui_summary = _quality_controls_summary("coqui_xtts", {"xtts_trim_trailing_silence": False, "whisper_qc_enabled": False}, ffmpeg_present=True)
+    _assert(_quality_chain_label(raw_coqui_summary) == "TTS -> final", "disabled coqui XTTS tuning chain label mismatch")
     builtin_retry_message = _format_builtin_qc_retry_message(
         "Edge",
         3,
@@ -1414,6 +1618,15 @@ def run_self_test(app_dir: Path) -> list[str]:
         builtin_whisper_retry_message == "Edge Whisper QC: segment 3/10, odrzucono probe 2/4, kara QC 49, whisper niezgodny; ponawiam 3/4",
         f"built-in Whisper QC retry message mismatch: {builtin_whisper_retry_message}",
     )
+    local_piper_retry_message = _local_worker_retry_progress_message(
+        "piper",
+        216,
+        "piper: segment 12, mowa proba 2/5, wariant=kropka, qc=45, ostrzezenia=whisper niezgodny",
+    )
+    _assert(
+        local_piper_retry_message == "Whisper QC - segment 12/216, proba 2/5, score: 45",
+        f"local Piper retry UI message mismatch: {local_piper_retry_message}",
+    )
     builtin_selected_message = _format_builtin_qc_selected_message(
         "Edge",
         3,
@@ -1427,14 +1640,19 @@ def run_self_test(app_dir: Path) -> list[str]:
         builtin_selected_message == "Edge QC: segment 3/10, wybrano probe 2/4, kara QC 12, lekko za dlugi",
         f"built-in QC selected message mismatch: {builtin_selected_message}",
     )
-    dot_retry_variants = _edge_retry_text_variants("Test.", 4)
-    plain_retry_variants = _edge_retry_text_variants("Test", 4)
-    question_retry_variants = _edge_retry_text_variants("Test?", 3)
-    _assert(dot_retry_variants == ["Test.", "Test", "Test,"], f"Edge dot retry variants should be unique and neutral: {dot_retry_variants}")
-    _assert(plain_retry_variants == ["Test", "Test.", "Test,"], f"Edge plain retry variants should be unique and neutral: {plain_retry_variants}")
-    _assert(question_retry_variants == ["Test?", "Test", "Test,"], f"Edge question retry variants should include comma and avoid duplicates: {question_retry_variants}")
-    _assert(_edge_retry_text("Test.", 2) != _edge_retry_text("Test.", 3), "Edge retry text should not duplicate attempt 2 and 3")
-    _assert("Test!" not in _edge_retry_text_variants("Test", 5), "Edge retry should not add exclamation mark to neutral text")
+    dot_retry_variants = _edge_retry_text_variants("Test.", 5)
+    plain_retry_variants = _edge_retry_text_variants("Test", 5)
+    question_retry_variants = _edge_retry_text_variants("Test?", 5)
+    ellipsis_retry_variants = _edge_retry_text_variants("Test...", 5)
+    _assert(dot_retry_variants == ["Test.", "Test.", "Test,", "Test!", "Test?"], f"Edge dot retry variants should keep original and then controlled punctuation: {dot_retry_variants}")
+    _assert(plain_retry_variants == ["Test", "Test.", "Test,", "Test!", "Test?"], f"Edge plain retry variants should add controlled punctuation: {plain_retry_variants}")
+    _assert(question_retry_variants == ["Test?", "Test.", "Test,", "Test!", "Test?"], f"Edge question retry variants should strip punctuation before adding controlled suffixes: {question_retry_variants}")
+    _assert(ellipsis_retry_variants == ["Test...", "Test.", "Test,", "Test!", "Test?"], f"Edge ellipsis retry variants should normalize trailing punctuation for retries: {ellipsis_retry_variants}")
+    _assert(_edge_retry_text("Test?", 2) == "Test.", "Edge retry 1 should normalize existing punctuation to dot")
+    _assert(_edge_retry_text("Test?", 5) == "Test?", "Edge retry 4 should use question mark after normalized base")
+    worker_template = _load_module(app_dir / "app" / "engines" / "worker_templates" / "local_tts_worker.py", "_lektorai_worker_template_self_test")
+    piper_retry_variants = worker_template.retry_text_variants("piper", "Test?", 5)
+    _assert(piper_retry_variants == ["Test?", "Test.", "Test,", "Test!", "Test?"], f"Piper retry variants should match Edge punctuation strategy: {piper_retry_variants}")
     messages.append("Whisper QC scoring: OK")
 
     srt_path = app_dir / "_self_test_sample.srt"
@@ -1584,11 +1802,19 @@ def run_self_test(app_dir: Path) -> list[str]:
             "worker progress should not classify generic Hugging Face fetch lines as downloads",
         )
         _assert(
-            _model_activity_message_for_worker_line("chatterbox", "chatterbox: pobieranie modelu t3=v3 na cuda") == "chatterbox: pobieranie modelu - prosze czekac",
+            _model_activity_message_for_worker_line("chatterbox", "chatterbox: pobieranie modelu t3=v3 na cuda") == "Model TTS: pobieranie modelu - prosze czekac",
             "worker progress should classify explicit TTS model download",
         )
         _assert(
-            _model_activity_message_for_worker_line("chatterbox", "chatterbox: ladowanie modelu t3=v3 na cuda") == "chatterbox: ladowanie modelu - prosze czekac",
+            _model_activity_message_for_worker_line("chatterbox", "chatterbox: sprawdzanie modelu t3=v3 na cuda") == "Model TTS: sprawdzanie obecnosci modelu",
+            "worker progress should classify explicit TTS model check",
+        )
+        _assert(
+            _model_activity_message_for_worker_line("chatterbox", "chatterbox: model w cache t3=v3") == "Model TTS: model w cache",
+            "worker progress should classify explicit TTS model cache hit",
+        )
+        _assert(
+            _model_activity_message_for_worker_line("chatterbox", "chatterbox: ladowanie modelu t3=v3 na cuda") == "Model TTS: ladowanie modelu - prosze czekac",
             "worker progress should classify model loading",
         )
         _assert(
@@ -1596,8 +1822,33 @@ def run_self_test(app_dir: Path) -> list[str]:
             "worker progress should classify Whisper QC model download separately",
         )
         _assert(
+            _model_activity_message_for_worker_line("chatterbox", "whisper qc: model w cache large-v3-turbo") == "Whisper QC: model w cache",
+            "worker progress should classify Whisper QC model cache hit",
+        )
+        _assert(
             _model_activity_message_for_worker_line("chatterbox", "segment 1 OK") is None,
             "worker progress should ignore normal segment logs for model activity",
+        )
+        captured_progress: list[str] = []
+        duplicate_counter = {"done": 0, "model_activity": "", "model_activity_seen": set()}
+        for worker_line in (
+            "piper: sprawdzanie modelu pl_PL-gosia-medium",
+            "piper: model w cache pl_PL-gosia-medium",
+            "piper: segment 1 OK",
+            "piper: sprawdzanie modelu pl_PL-gosia-medium",
+            "piper: model w cache pl_PL-gosia-medium",
+            "piper: segment 2 OK",
+        ):
+            _local_worker_progress("piper", 2, duplicate_counter, captured_progress.append, worker_line)
+        _assert(
+            captured_progress
+            == [
+                "Model TTS: sprawdzanie obecnosci modelu",
+                "Model TTS: model w cache",
+                "Segment 1/2",
+                "Segment 2/2",
+            ],
+            f"worker progress should suppress repeated model activity logs: {captured_progress}",
         )
         temp_dir = worker_result_dir / "temp"
         temp_dir.mkdir()
@@ -1634,7 +1885,20 @@ def run_self_test(app_dir: Path) -> list[str]:
                 "chatterbox",
                 "self-test",
                 True,
-                [SegmentResult(segment_id=1, ok=True, attempts=2, selected_attempt=2, qc_warnings=("glosny koniec",))],
+                [
+                    SegmentResult(
+                        segment_id=1,
+                        ok=True,
+                        attempts=2,
+                        selected_attempt=2,
+                        qc_score=15,
+                        qc_warnings=("glosny koniec",),
+                        attempt_details=(
+                            {"attempt": 1, "final_score": 30, "selected": False},
+                            {"attempt": 2, "final_score": 15, "selected": True},
+                        ),
+                    )
+                ],
             ),
         )
         _assert(request_path.read_text(encoding="utf-8").endswith("\n"), "request JSON should end with newline")
@@ -1643,6 +1907,102 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(diagnostic_result.segments[0].attempts == 2, "worker result attempts JSON mismatch")
         _assert(diagnostic_result.segments[0].selected_attempt == 2, "worker result selected attempt JSON mismatch")
         _assert(diagnostic_result.segments[0].qc_warnings == ("glosny koniec",), "worker result QC warnings JSON mismatch")
+        _assert(diagnostic_result.segments[0].attempt_details[1]["selected"] is True, "worker result attempt details JSON mismatch")
+        generated_audio_path = protocol_json_dir / "001.wav"
+        generated_audio_path.write_text("fake wav", encoding="utf-8")
+        local_analysis = _local_worker_segment_analysis(
+            [SubtitleSegment(1, 1000, 2000, "Test")],
+            [(1000, generated_audio_path)],
+            diagnostic_result,
+        )
+        _assert(local_analysis[0]["final_score"] == 15, "local worker analysis score mismatch")
+        _assert(local_analysis[0]["attempt_details"][1]["final_score"] == 15, "local worker analysis attempt score mismatch")
+        settings_snapshot = _sanitize_settings_snapshot({"api_key": "secret", "voice": "marek", "token": ""})
+        _assert(settings_snapshot["api_key"] == "***" and settings_snapshot["token"] == "", "settings snapshot should mask secrets")
+        analysis_payload = _build_run_analysis(
+            source_path=Path("Film.mkv"),
+            input_subtitle_path=Path("Film.srt"),
+            engine_id="chatterbox",
+            output_stem="260512_144531_Film_CTB",
+            run_started_at=datetime(2026, 5, 12, 14, 45, 31),
+            segments=[SubtitleSegment(1, 1000, 2000, "Test")],
+            segment_analysis=local_analysis,
+            config={"api_key": "secret", "cfg_weight": 1.9},
+            dictionary={"vox": "woks"},
+            quality_controls={"chain_label": "TTS -> Whisper QC x2 -> final"},
+            generation_seconds=12.3,
+            pipeline_seconds=15.4,
+            aac_bitrate="384k",
+            lektor_lufs=-14,
+            lektor_weight=2.3,
+            background_lufs=-18,
+            background_weight=1.6,
+            lektor_delay_ms=500,
+            create_stereo_for_surround=True,
+            diagnostics={"save_run_reports": True},
+            source_duration=3600.0,
+            source_audio_streams=[],
+            lektor_before_diagnostics=None,
+            lektor_after_diagnostics=None,
+            lektor_encoded_duration=None,
+            lektor_encoded_audio_streams=[],
+        )
+        _assert(analysis_payload["schema"] == "lektorai.run_analysis.v1", "run analysis schema mismatch")
+        _assert(analysis_payload["report_type"] == "analysis", "run analysis report type mismatch")
+        _assert(analysis_payload["run_id"] == "260512_144531_Film_CTB", "run analysis id mismatch")
+        _assert(analysis_payload["run_timestamp"] == "2026-05-12T14:45:31", "run analysis timestamp mismatch")
+        _assert(analysis_payload["source_filename"] == "Film.mkv", "run analysis source filename mismatch")
+        _assert(analysis_payload["tts_engine_short"] == "CTB", "run analysis engine short mismatch")
+        _assert("Nizszy score" in analysis_payload["llm_analysis_hint"], "run analysis LLM hint mismatch")
+        _assert(analysis_payload["engine"]["settings"]["api_key"] == "***", "run analysis should mask api key")
+        _assert(analysis_payload["aggregates"]["segments_with_retry"] == 1, "run analysis retry aggregate mismatch")
+        _assert(analysis_payload["segments"][0]["attempt_details"][1]["selected"] is True, "run analysis attempts mismatch")
+        report_cleanup_dir = app_dir / "_self_test_report_cleanup"
+        try:
+            for keep_quality_report, keep_technical_reports in ((False, True), (True, False)):
+                _cleanup_tree(report_cleanup_dir)
+                lektor_dir = report_cleanup_dir / "run"
+                segments_dir = lektor_dir / "segments"
+                segments_dir.mkdir(parents=True, exist_ok=True)
+                subtitle = lektor_dir / "run.srt"
+                input_subtitle = lektor_dir / "input.srt"
+                manifest = lektor_dir / "segmenty.csv"
+                skipped = lektor_dir / "skipped_segments.csv"
+                audio_qc = lektor_dir / "audio_qc.csv"
+                analysis = lektor_dir / "run_analysis.json"
+                summary = lektor_dir / "run_summary.json"
+                for path in (subtitle, input_subtitle, manifest, skipped, audio_qc, analysis, summary):
+                    path.write_text("x", encoding="utf-8")
+                _cleanup_successful_video_run(
+                    diagnostics={
+                        "save_processed_subtitles": False,
+                        "save_run_reports": keep_technical_reports,
+                        "save_quality_report": keep_quality_report,
+                        "save_lektor_segments": False,
+                        "save_lektor_track_before_normalization": False,
+                        "save_lektor_track_after_normalization": False,
+                        "save_audio_mix_steps": False,
+                    },
+                    lektor_dir=lektor_dir,
+                    segments_dir=segments_dir,
+                    subtitle_path=subtitle,
+                    input_subtitle_path=input_subtitle,
+                    manifest_path=manifest,
+                    skipped_manifest_path=skipped,
+                    audio_qc_path=audio_qc,
+                    analysis_path=analysis,
+                    summary_path=summary,
+                    lektor_before_normalization_path=None,
+                    lektor_after_normalization_path=None,
+                    lektor_m4a_path=None,
+                    audio_mix_stage_files={},
+                )
+                _assert(analysis.exists() is keep_quality_report, "quality report should only follow its own diagnostic option")
+                _assert(summary.exists() is keep_technical_reports, "summary report should follow technical reports option")
+                _assert(manifest.exists() is keep_technical_reports, "manifest should follow technical reports option")
+                _assert(audio_qc.exists() is keep_technical_reports, "Audio QC report should follow technical reports option")
+        finally:
+            _cleanup_tree(report_cleanup_dir)
         result_path.write_text(
             json.dumps(
                 {
@@ -1735,6 +2095,50 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(
             worker_module.whisper_similarity_penalty(0.40, 0.70) > worker_module.whisper_similarity_penalty(0.68, 0.70),
             "worker Whisper QC penalty should punish larger mismatch",
+        )
+        _assert(
+            worker_module.effective_retry_limits(
+                "piper",
+                {"audio_qc_enabled": True, "audio_qc_retry_attempts": 5, "whisper_qc_enabled": True, "whisper_qc_retry_attempts": 4},
+            )
+            == (1, 4),
+            "deterministic Piper should keep Whisper QC attempts for punctuation variants",
+        )
+        _assert(
+            worker_module.effective_retry_settings(
+                "piper",
+                {"audio_qc_enabled": True, "audio_qc_retry_attempts": 5, "whisper_qc_enabled": True, "whisper_qc_retry_attempts": 4},
+            )
+            == (1, 4, True, True),
+            "deterministic Piper should keep Whisper QC enabled with punctuation variants",
+        )
+        _assert(
+            worker_module.retry_text_variants("piper", "Ty", 5) == ["Ty", "Ty.", "Ty,", "Ty!", "Ty?"],
+            "piper retry variants should add controlled punctuation",
+        )
+        _assert(
+            worker_module.retry_text_for_attempt("piper", "Ty?", 2) == "Ty.",
+            "piper retry variants should strip existing trailing punctuation before adding retry punctuation",
+        )
+        _assert(
+            worker_module.retry_variant_label("piper", "Ty.") == "kropka",
+            "piper retry variant label for dot mismatch",
+        )
+        _assert(
+            worker_module.effective_retry_limits(
+                "chatterbox",
+                {"audio_qc_enabled": True, "audio_qc_retry_attempts": 5, "whisper_qc_enabled": True, "whisper_qc_retry_attempts": 4},
+            )
+            == (5, 4),
+            "non-deterministic engines should keep configured QC retry limits",
+        )
+        _assert(
+            worker_module.effective_retry_settings(
+                "chatterbox",
+                {"audio_qc_enabled": True, "audio_qc_retry_attempts": 5, "whisper_qc_enabled": True, "whisper_qc_retry_attempts": 4},
+            )
+            == (5, 4, True, True),
+            "non-deterministic engines should keep QC flags enabled",
         )
         old_env = {name: os.environ.get(name) for name in ("HF_HOME", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE")}
         try:
@@ -1852,8 +2256,19 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert("reference_audio_path" in worker_template_text, "worker template should use OmniVoice reference audio")
         _assert("guidance_scale" in worker_template_text and "num_step" in worker_template_text, "worker template should pass OmniVoice generation controls")
         _assert("trim_omnivoice_silence_edges_np" in worker_template_text, "worker template should support automatic OmniVoice edge trimming")
+        _assert("synthesize_piper" in worker_template_text, "worker template should support Piper")
+        _assert("PiperVoice.load" in worker_template_text, "worker template should load Piper voices")
+        _assert("download_voice" in worker_template_text, "worker template should download Piper voices lazily")
+        _assert("synthesize_coqui_xtts" in worker_template_text, "worker template should support Coqui XTTS")
+        _assert("tts_models/multilingual/multi-dataset/xtts_v2" in worker_template_text, "worker template should use XTTS-v2 model")
+        _assert("COQUI_TOS_AGREED" in worker_template_text, "worker template should accept Coqui XTTS TOS non-interactively")
+        _assert("trim_xtts_trailing_silence_np" in worker_template_text, "worker template should trim Coqui XTTS trailing silence")
+        _assert('language="pl"' in worker_template_text, "worker template should hardcode Polish where model API supports it")
         _assert("pobieranie/ladowanie" not in worker_template_text, "worker template should not use ambiguous model activity logs")
         _assert("has_local_model_cache" in worker_template_text, "worker template should distinguish model download from loading")
+        _assert("LEKTORAI_STT_FASTER_WHISPER_CACHE_DIR" in worker_template_text, "worker template should use STT faster-whisper cache")
+        _assert("LEKTORAI_STT_FASTER_WHISPER_PACKAGES_DIRS" in worker_template_text, "worker template should load STT packages lazily for Whisper QC")
+        _assert("has_whisper_model_cache" in worker_template_text, "worker template should check cache for the selected Whisper model")
         _assert("_AUTO_DEVICE" in worker_template_text and "return _AUTO_DEVICE" in worker_template_text, "worker template should keep auto device stable for whole worker run")
     finally:
         _cleanup_tree(worker_template_dir)
@@ -1961,28 +2376,41 @@ def run_self_test(app_dir: Path) -> list[str]:
         _cleanup_tree(debug_cleanup_dir)
 
     source_path = app_dir / "Film.mkv"
+    run_time = datetime(2026, 5, 12, 14, 45, 31)
     workspace = lektorai_workspace_for(source_path)
     _assert(safe_name("Zażółć gęślą jaźń") == "Zazolc_gesla_jazn", "safe name Polish transliteration mismatch")
     _assert(len(safe_name("a" * 200)) == 80, "safe name length limit mismatch")
-    stem = next_output_stem(workspace, source_path, "edge")
-    _assert(stem == "Film_edge", f"output stem mismatch: {stem}")
-    _assert(lektor_assets_dir(workspace, stem).name == "Film_edge_lektor", "lektor dir mismatch")
+    _assert(engine_short_code("chatterbox") == "CTB", "chatterbox short code mismatch")
+    _assert(engine_short_code("omnivoice") == "OMV", "omnivoice short code mismatch")
+    _assert(engine_short_code("coqui_xtts") == "XTTS", "coqui short code mismatch")
+    _assert(engine_short_code("piper") == "PIP", "piper short code mismatch")
+    _assert(engine_short_code("edge") == "EDG", "edge short code mismatch")
+    _assert(engine_short_code("openai") == "OAI", "openai short code mismatch")
+    stem = next_output_stem(workspace, source_path, "edge", created_at=run_time)
+    _assert(stem == "260512_144531_Film_EDG", f"output stem mismatch: {stem}")
+    _assert(lektor_assets_dir(workspace, stem).name == "260512_144531_Film_EDG", "lektor dir mismatch")
+    long_source_path = app_dir / ("Bardzo_dlugaaa_nazwa_filmu_" + ("x" * 120) + ".mkv")
+    long_stem = next_output_stem(workspace, long_source_path, "chatterbox", created_at=run_time)
+    _assert(long_stem.startswith("260512_144531_Bardzo_dlugaaa_nazwa_filmu_"), "long output stem prefix mismatch")
+    _assert(long_stem.endswith("_CTB"), "long output stem engine code mismatch")
+    _assert(len(long_stem) <= 80, "output stem should stay short")
     collision_workspace = app_dir / "_self_test_workspace_collision"
     try:
         collision_workspace.mkdir(parents=True, exist_ok=True)
-        (collision_workspace / "Film_edge.mp4").write_text("", encoding="utf-8")
-        collision_stem = next_output_stem(collision_workspace, source_path, "edge")
-        _assert(collision_stem == "Film_edge_2", f"mp4 collision stem mismatch: {collision_stem}")
-        (collision_workspace / "Film_edge.mp4").unlink()
-        (collision_workspace / "Film_edge.mkv").write_text("", encoding="utf-8")
-        collision_stem = next_output_stem(collision_workspace, source_path, "edge")
-        _assert(collision_stem == "Film_edge_2", f"mkv collision stem mismatch: {collision_stem}")
-        (collision_workspace / "Film_edge_2.srt").write_text("", encoding="utf-8")
-        collision_stem = next_output_stem(collision_workspace, source_path, "edge")
-        _assert(collision_stem == "Film_edge_3", f"srt collision stem mismatch: {collision_stem}")
-        (collision_workspace / "Film_edge_3_lektor").mkdir()
-        collision_stem = next_output_stem(collision_workspace, source_path, "edge")
-        _assert(collision_stem == "Film_edge_4", f"lektor dir collision stem mismatch: {collision_stem}")
+        base_collision = "260512_144531_Film_EDG"
+        (collision_workspace / f"{base_collision}.mp4").write_text("", encoding="utf-8")
+        collision_stem = next_output_stem(collision_workspace, source_path, "edge", created_at=run_time)
+        _assert(collision_stem == f"{base_collision}_2", f"mp4 collision stem mismatch: {collision_stem}")
+        (collision_workspace / f"{base_collision}.mp4").unlink()
+        (collision_workspace / f"{base_collision}.mkv").write_text("", encoding="utf-8")
+        collision_stem = next_output_stem(collision_workspace, source_path, "edge", created_at=run_time)
+        _assert(collision_stem == f"{base_collision}_2", f"mkv collision stem mismatch: {collision_stem}")
+        (collision_workspace / f"{base_collision}_2.srt").write_text("", encoding="utf-8")
+        collision_stem = next_output_stem(collision_workspace, source_path, "edge", created_at=run_time)
+        _assert(collision_stem == f"{base_collision}_3", f"srt collision stem mismatch: {collision_stem}")
+        (collision_workspace / f"{base_collision}_3").mkdir()
+        collision_stem = next_output_stem(collision_workspace, source_path, "edge", created_at=run_time)
+        _assert(collision_stem == f"{base_collision}_3", f"lektor dir should not rename stem: {collision_stem}")
     finally:
         _cleanup_tree(collision_workspace)
     messages.append("workspace naming: OK")
@@ -2002,10 +2430,17 @@ def run_self_test(app_dir: Path) -> list[str]:
         failure_engine_dir = failure_paths.engine_dir("edge")
         _assert((failure_engine_dir / "config.json").is_file(), "run should create engine config on first use")
         _assert((failure_engine_dir / "dictionary.json").is_file(), "run should create engine dictionary on first use")
-        error_path = failure_source_dir / "LektorAI" / "Pusty_edge_lektor" / "run_error.json"
-        _assert(error_path.is_file(), "run_error.json missing after failed run")
+        lektor_dirs = [path for path in (failure_source_dir / "LektorAI").glob("*_Pusty_EDG") if path.is_dir()]
+        _assert(len(lektor_dirs) == 1, "failed run lektor dir naming mismatch")
+        error_paths = list(lektor_dirs[0].glob("*_Pusty_EDG_error.json"))
+        _assert(len(error_paths) == 1, "run error report naming mismatch")
+        error_path = error_paths[0]
         error_data = json.loads(error_path.read_text(encoding="utf-8"))
         _assert(error_data.get("status") == "failed", "run_error.json status mismatch")
+        _assert(error_data.get("run_id") == lektor_dirs[0].name, "run_error.json run id mismatch")
+        _assert(error_data.get("report_type") == "error", "run_error.json report type mismatch")
+        _assert(error_data.get("source_filename") == "Pusty.srt", "run_error.json source filename mismatch")
+        _assert(error_data.get("tts_engine_short") == "EDG", "run_error.json engine short mismatch")
         _assert(error_data.get("engine_id") == "edge", "run_error.json engine mismatch")
         _assert(error_data.get("error_type") == "RuntimeError", "run_error.json error type mismatch")
         _assert(error_data.get("source_name") == "Pusty.srt", "run_error.json source mismatch")
@@ -2098,7 +2533,7 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(format_lektor_delay_label(-100) == "0 ms", "negative lektor delay label mismatch")
     _assert(format_lektor_delay_label(0) == "0 ms", "zero lektor delay label mismatch")
     internet_state = next(state for state in manager.list_states() if state.definition.engine_id == "edge")
-    _assert(engine_combo_label("Internetowe", internet_state) == "Internetowe: Edge TTS", "internet combo label should stay compact")
+    _assert(engine_combo_label("Internetowe", internet_state) == "Internetowe: Edge TTS [EDG]", "internet combo label should show short code")
     _assert(
         main_window_refresh_keeps_engine_signals_blocked(),
         "engine refresh should keep combo signals blocked while restoring last engine",
@@ -2182,7 +2617,10 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(coerce_int_for_widget(99, 1, 10) == 10, "settings dialog int clamp mismatch")
     _assert(coerce_float_for_widget("nan", 0.1, 2.0) == 0.1, "settings dialog nan float should fallback")
     _assert(settings_help_button_label() == "?", "settings dialog help button label mismatch")
+    diagnostic_group_keys = [key for _, keys in diagnostic_field_groups() for key in keys]
+    _assert(len(diagnostic_group_keys) == len(set(diagnostic_group_keys)), "diagnostic fields should appear in one group only")
     _assert(is_diagnostic_field("save_processed_subtitles"), "processed subtitles should be diagnostic")
+    _assert(is_diagnostic_field("save_quality_report"), "quality report should be diagnostic")
     _assert(is_diagnostic_field("save_run_reports"), "run reports should be diagnostic")
     _assert(is_diagnostic_field("save_lektor_segments"), "save lektor segments should be diagnostic")
     _assert(is_diagnostic_field("save_lektor_track_before_normalization"), "pre-normalization track should be diagnostic")

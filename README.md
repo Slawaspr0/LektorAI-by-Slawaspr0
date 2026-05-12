@@ -2,7 +2,7 @@
 
 ![LektorAI by Slawaspr0](lektorAI_screen.jpg)
 
-**Wersja: v1.0**
+**Wersja: v1.1**
 
 LektorAI by Slawaspr0 to aplikacja do tworzenia polskiej ścieżki lektorskiej dla filmów i seriali. Program korzysta z wybranego silnika TTS, generuje głos lektora na podstawie napisów, składa go w jedną ścieżkę audio, miksuje z oryginalnym tłem filmu i dodaje do wynikowego pliku MKV.
 
@@ -10,17 +10,17 @@ Projekt jest świadomie skupiony na języku polskim. Nie jest tworzony jako uniw
 
 Projekt jest rozwijany z myślą o jakości lektora, kontroli nad procesem i pracy na wielu silnikach TTS bez mieszania ich zależności.
 
-## Co robi program?
+## Funkcje programu
 
-- Wczytuje plik wideo, SRT albo TXT.
-- Wypakowuje napisy tekstowe z kontenera wideo, jeżeli są dostępne.
-- Stosuje słownik wymowy przypisany do wybranego silnika TTS.
-- Generuje pojedyncze segmenty lektora zgodnie z czasami napisów.
-- Opcjonalnie sprawdza mowę przez Whisper QC.
-- Składa segmenty w kompletną ścieżkę lektora.
-- Miksuje lektora z oryginalnym dźwiękiem filmu.
-- Tworzy wynikowy plik MKV z nową polską ścieżką audio.
-- Dla źródeł 5.1 potrafi przygotować wariant PL 5.1 i dodatkowy wariant PL 2.0.
+- Obsługuje pliki TXT, SRT oraz pliki wideo.
+- Posiada kolejkę plików do przetwarzania.
+- Na podstawie podanych plików generuje polskiego lektora.
+- Pozwala korzystać z wielu silników TTS.
+- Niektóre silniki obsługują klonowanie głosu na podstawie próbki lektora.
+- Ma narzędzia pomagające poprawić wynik generowania mowy.
+- Pozwala użytkownikowi tworzyć własny słownik wymowy.
+- Potrafi dodać polską ścieżkę lektora do filmu.
+- Na życzenie potrafi przygotować dodatkową ścieżkę stereo 2.0 ze źródła 5.1.
 
 ## Wymagania
 
@@ -101,23 +101,6 @@ Aktualne główne typy silników:
 - lokalne, np. Chatterbox i OmniVoice.
 
 Lokalne silniki TTS mają osobne środowiska i osobne foldery. Dzięki temu jeden model nie powinien psuć zależności drugiego modelu.
-
-## Główne funkcje
-
-- Kolejka plików do przetwarzania.
-- Obsługa plików wideo, SRT i TXT.
-- Wypakowywanie napisów tekstowych z wideo.
-- Słownik wymowy osobny dla każdego TTS.
-- Import, eksport i czyszczenie słownika.
-- Osobne ustawienia dla każdego silnika TTS.
-- Menedżer instalacji lokalnych silników TTS.
-- Kontrola mowy przez Whisper QC.
-- Regulacja głośności lektora i tła.
-- Regulacja jakości wynikowej ścieżki lektora.
-- Przesunięcie lektora względem timestampów napisów.
-- Obsługa miksu PL 2.0 i PL 5.1.
-- Logi aplikacji i osobne logi techniczne silników TTS.
-- Opcje diagnostyczne pozwalające zachować pliki pośrednie.
 
 ## Jak przygotować materiał, żeby lektor brzmiał dobrze?
 
@@ -406,4 +389,6 @@ Szczególne podziękowania:
 
 - użytkownikowi [gangg111](https://github.com/gangg111) i projektowi [Lektor_AI](https://github.com/gangg111/Lektor_AI/) za inspirację,
 - projektowi [Chatterbox TTS](https://github.com/resemble-ai/chatterbox) za silnik TTS wykorzystywany w lokalnym generowaniu głosu,
-- projektowi [OmniVoice TTS](https://github.com/k2-fsa/OmniVoice) za silnik TTS wykorzystywany w lokalnym generowaniu głosu.
+- projektowi [OmniVoice TTS](https://github.com/k2-fsa/OmniVoice) za silnik TTS wykorzystywany w lokalnym generowaniu głosu,
+- projektowi [Piper TTS](https://github.com/OHF-Voice/piper1-gpl) za szybki lokalny silnik TTS,
+- projektowi [Coqui XTTS-v2 / Coqui AI TTS](https://github.com/idiap/coqui-ai-TTS) za lokalny silnik TTS z obsługą klonowania głosu.

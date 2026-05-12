@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 APP_NAME = "LektorAI by Slawaspr0"
-APP_VERSION = "v1.0"
+APP_VERSION = "v1.1"
 APP_DIR = Path(__file__).resolve().parent
 APP_PACKAGES_DIR = APP_DIR / "packages"
 if APP_PACKAGES_DIR.is_dir() and str(APP_PACKAGES_DIR) not in sys.path:
@@ -168,7 +168,7 @@ def _usage() -> str:
         "  START.py --self-test             szybki test bez GUI i bez TTS\n"
         "  START.py --list-engines          lista silnikow TTS\n"
         "  START.py --engine-install-plan ID pokazuje plan instalacji lokalnego TTS\n"
-        "  START.py --install-engine ID     instaluje lokalny TTS: chatterbox, omnivoice\n"
+        "  START.py --install-engine ID     instaluje lokalny TTS: chatterbox, omnivoice, piper, coqui_xtts\n"
         "  START.py --update-worker ID      aktualizuje worker.py lokalnego TTS\n"
         "  START.py --remove-engine ID      usuwa caly folder lokalnego TTS\n"
         "  START.py --remove-engine-keep-settings ID usuwa runtime lokalnego TTS, zostawia config i slownik\n"

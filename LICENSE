@@ -74,6 +74,36 @@ OmniVoice is not owned by this project. If installed or used through LektorAI by
 Slawaspr0, it remains licensed by its original authors under its own license.
 
 
+Piper TTS
+---------
+
+Piper TTS is an external TTS engine.
+
+Project: https://github.com/OHF-Voice/piper1-gpl
+License: GNU General Public License v3.0 or later.
+
+Piper TTS is not owned by this project. If installed or used through LektorAI by
+Slawaspr0, it remains licensed by its original authors under its own license.
+Piper voice models may have their own licenses; review the license information
+for the selected voice before redistribution or publication.
+
+
+Coqui XTTS-v2 / Coqui AI TTS
+----------------------------
+
+Coqui AI TTS is an external TTS engine, and XTTS-v2 is an external model used by
+that ecosystem.
+
+Project: https://github.com/idiap/coqui-ai-TTS
+Code license: Mozilla Public License 2.0.
+XTTS-v2 model license: Coqui Public Model License.
+
+Coqui AI TTS and XTTS-v2 are not owned by this project. If installed or used
+through LektorAI by Slawaspr0, they remain licensed by their original authors
+under their own licenses. The XTTS-v2 model license may include
+non-commercial-use restrictions unless the user has separate commercial rights.
+
+
 External binaries and dependencies
 ----------------------------------
 

@@ -39,6 +39,7 @@ class SegmentResult:
     qc_warnings: tuple[str, ...] = ()
     whisper_text: str = ""
     whisper_similarity: float | None = None
+    attempt_details: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -97,4 +98,6 @@ def _dataclass_from_dict(cls, data: dict[str, Any]):
     normalized = {key: value for key, value in data.items() if key in allowed}
     if cls is SegmentResult and isinstance(normalized.get("qc_warnings"), list):
         normalized["qc_warnings"] = tuple(str(item) for item in normalized["qc_warnings"])
+    if cls is SegmentResult and isinstance(normalized.get("attempt_details"), list):
+        normalized["attempt_details"] = tuple(item for item in normalized["attempt_details"] if isinstance(item, dict))
     return cls(**normalized)

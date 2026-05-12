@@ -9,6 +9,8 @@ import re
 
 from app.engines.config_schema import EDGE_PITCH_MAX, EDGE_PITCH_MIN, EDGE_RATE_MAX, EDGE_RATE_MIN, fields_for
 from app.core.media_tools import supported_voice_sample_extensions
+from app.core.paths import build_paths
+from app.stt.faster_whisper_runtime import faster_whisper_import_problem
 
 
 def validate_engine_config(engine_id: str, config: dict[str, Any]) -> list[str]:
@@ -17,23 +19,30 @@ def validate_engine_config(engine_id: str, config: dict[str, Any]) -> list[str]:
         errors.extend(_validate_optional_audio(config, "audio_prompt_path", "probka glosu Chatterbox", supported_voice_sample_extensions(), "WAV/MP3/FLAC"))
     elif engine_id == "omnivoice":
         errors.extend(_validate_optional_audio(config, "reference_audio_path", "probka glosu OmniVoice", supported_voice_sample_extensions(), "WAV/MP3/FLAC"))
+    elif engine_id == "coqui_xtts":
+        errors.extend(_validate_optional_audio(config, "speaker_wav_path", "probka glosu Coqui XTTS", supported_voice_sample_extensions(), "WAV/MP3/FLAC"))
     elif engine_id == "openai":
         errors.extend(_validate_openai(config))
     elif engine_id == "edge":
         errors.extend(_validate_edge(config))
     errors.extend(_validate_device(config))
-    if engine_id in {"edge", "openai"}:
-        errors.extend(validate_whisper_qc_dependency(config))
     return errors
 
 
 def validate_whisper_qc_dependency(config: dict[str, Any], finder=None) -> list[str]:
     if not _bool_config(config.get("whisper_qc_enabled"), False):
         return []
-    finder = finder or importlib.util.find_spec
-    if finder("faster_whisper"):
+    if finder is not None:
+        if finder("faster_whisper"):
+            return []
+        return ["Kontrola tekstu Whisper: brak biblioteki faster-whisper. Zainstaluj requirements albo wylacz te opcje."]
+    paths = build_paths(Path(__file__).resolve().parents[2])
+    problem = faster_whisper_import_problem(paths)
+    if not problem:
         return []
-    return ["Kontrola tekstu Whisper: brak biblioteki faster-whisper. Zainstaluj requirements albo wylacz te opcje."]
+    if problem == "faster-whisper":
+        return ["Kontrola tekstu Whisper: brak silnika STT faster-whisper. Zainstaluj faster-whisper albo wylacz te opcje."]
+    return [f"Kontrola tekstu Whisper: nie mozna uruchomic silnika STT faster-whisper ({problem})."]
 
 
 def _validate_schema_values(engine_id: str, config: dict[str, Any]) -> list[str]:

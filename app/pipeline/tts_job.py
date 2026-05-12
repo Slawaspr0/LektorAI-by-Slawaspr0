@@ -7,10 +7,11 @@ import re
 import shutil
 import traceback
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Callable
+from typing import Any, Callable
 from uuid import uuid4
 
 from app.core.dictionary import load_dictionary
@@ -45,6 +46,11 @@ from app.engines.manager import EngineManager
 from app.engines.protocol import EngineRequest, EngineResult, SegmentRequest, write_request
 from app.engines.runner import DEFAULT_WORKER_TIMEOUT_S, EngineWorkerRunner
 from app.engines.schemas import EngineStatus
+from app.engines.voice_sample_rules import (
+    validate_voice_sample_duration,
+    voice_sample_config_key,
+    voice_sample_rule,
+)
 from app.pipeline.audio_qc import analyze_audio_candidate, analyze_generated_segments, score_audio_qc, summarize_audio_qc
 from app.pipeline.audio_timeline import build_lektor_wav
 from app.pipeline.manifest import write_segments_manifest, write_skipped_segments_manifest
@@ -59,7 +65,8 @@ from app.pipeline.subtitles import (
 )
 from app.pipeline.summary import rel_path, write_run_error, write_run_summary
 from app.pipeline.whisper_qc import score_whisper_transcript, transcribe_audio_with_faster_whisper
-from app.pipeline.workspace import lektor_assets_dir, lektorai_workspace_for, next_output_stem
+from app.pipeline.workspace import engine_short_code, lektor_assets_dir, lektorai_workspace_for, next_output_stem
+from app.stt.faster_whisper_runtime import ensure_faster_whisper_runtime
 
 
 SIDECAR_SUFFIXES = (
@@ -78,6 +85,9 @@ SIDECAR_SUFFIXES = (
     ".forced.pl",
     ".pl.forced",
 )
+
+DETERMINISTIC_RETRY_ENGINES = {"piper"}
+PUNCTUATION_RETRY_ENGINES = {"piper"}
 
 EDGE_TRIM_FADE_MS = 12
 
@@ -105,6 +115,29 @@ class TTSJobResult:
     output_video_path: Path | None = None
 
 
+@dataclass
+class QCRetrySummary:
+    audio_retry_segments: set[int] = field(default_factory=set)
+    audio_extra_attempts: int = 0
+    speech_retry_segments: set[int] = field(default_factory=set)
+    speech_extra_attempts: int = 0
+
+    def record_audio_retry(self, segment_ordinal: int) -> None:
+        self.audio_retry_segments.add(int(segment_ordinal))
+        self.audio_extra_attempts += 1
+
+    def record_speech_retry(self, segment_ordinal: int) -> None:
+        self.speech_retry_segments.add(int(segment_ordinal))
+        self.speech_extra_attempts += 1
+
+
+@dataclass(frozen=True)
+class GenerationOutput:
+    generated_segments: list[tuple[int, Path]]
+    generation_seconds: float
+    segment_analysis: list[dict[str, Any]]
+
+
 def run_tts_job(
     source_path: Path,
     engine_id: str,
@@ -122,6 +155,7 @@ def run_tts_job(
     cancel_requested: Callable[[], bool] | None = None,
 ) -> TTSJobResult:
     job_started = perf_counter()
+    run_started_at = datetime.now()
     source_path = source_path.resolve()
     config_path = manager.ensure_engine_config(engine_id)
     dictionary_path = manager.ensure_engine_dictionary(engine_id)
@@ -131,7 +165,7 @@ def run_tts_job(
 
     workspace = lektorai_workspace_for(source_path)
     workspace.mkdir(parents=True, exist_ok=True)
-    output_stem = next_output_stem(workspace, source_path, engine_id)
+    output_stem = next_output_stem(workspace, source_path, engine_id, created_at=run_started_at)
     subtitle_path = workspace / f"{output_stem}.srt"
     lektor_dir = lektor_assets_dir(workspace, output_stem)
     segments_dir = lektor_dir / "segments"
@@ -161,12 +195,20 @@ def run_tts_job(
             subtitle_path=subtitle_path,
             lektor_dir=lektor_dir,
             segments_dir=segments_dir,
+            run_started_at=run_started_at,
         )
     except Exception as exc:
         try:
             write_run_error(
-                lektor_dir / "run_error.json",
+                _run_report_path(lektor_dir, output_stem, "error"),
                 {
+                    "report_type": "error",
+                    "run_id": output_stem,
+                    "run_timestamp": run_started_at.isoformat(timespec="seconds"),
+                    "source_filename": source_path.name,
+                    "source_stem": source_path.stem,
+                    "tts_engine_short": engine_short_code(engine_id),
+                    "llm_analysis_hint": "Ten raport opisuje nieudany przebieg konwersji. Sprawdz error_type, error, engine_id, ustawienia TTS i etap, na ktorym praca zostala przerwana.",
                     "app_name": APP_NAME,
                     "app_version": APP_VERSION,
                     "source_path": str(source_path),
@@ -208,6 +250,7 @@ def _run_tts_job_prepared(
     subtitle_path: Path,
     lektor_dir: Path,
     segments_dir: Path,
+    run_started_at: datetime,
 ) -> TTSJobResult:
     _raise_if_cancelled(cancel_requested)
     diagnostics = _diagnostic_keep_flags(config, keep_lektor_assets)
@@ -244,11 +287,11 @@ def _run_tts_job_prepared(
     progress(f"Lancuch TTS: {_quality_chain_label(quality_controls)}")
     _emit_file_progress(progress, "tts", 0.0, "Generowanie segmentow TTS")
     if engine_id == "edge":
-        generated_segments, generation_seconds = _generate_edge(processed, segments_dir, config, paths, lektor_dir, progress, cancel_requested)
+        generation = _generate_edge(processed, segments_dir, config, paths, lektor_dir, progress, cancel_requested)
     elif engine_id == "openai":
-        generated_segments, generation_seconds = _generate_openai(processed, segments_dir, config, paths, lektor_dir, progress, cancel_requested)
+        generation = _generate_openai(processed, segments_dir, config, paths, lektor_dir, progress, cancel_requested)
     else:
-        generated_segments, generation_seconds = _generate_local(
+        generation = _generate_local(
             processed,
             source_path,
             engine_id,
@@ -261,6 +304,9 @@ def _run_tts_job_prepared(
             progress,
             cancel_requested,
         )
+    generated_segments = generation.generated_segments
+    generation_seconds = generation.generation_seconds
+    segment_analysis = generation.segment_analysis
     _raise_if_cancelled(cancel_requested)
     _emit_file_progress(progress, "tts", 1.0, "Generowanie segmentow TTS")
 
@@ -421,12 +467,52 @@ def _run_tts_job_prepared(
             _unlink_if_file(lektor_m4a_path)
             lektor_m4a_path = None
 
-    summary_path = lektor_dir / "run_summary.json"
-    _emit_file_progress(progress, "summary", 0.5, "Podsumowanie runu")
+    analysis_path = _run_report_path(lektor_dir, output_stem, "analysis")
+    analysis_payload = _build_run_analysis(
+        source_path=source_path,
+        input_subtitle_path=input_subtitle_path,
+        engine_id=engine_id,
+        output_stem=output_stem,
+        run_started_at=run_started_at,
+        segments=processed,
+        segment_analysis=segment_analysis,
+        config=config,
+        dictionary=dictionary,
+        quality_controls=quality_controls,
+        generation_seconds=generation_seconds,
+        pipeline_seconds=perf_counter() - job_started,
+        aac_bitrate=aac_bitrate,
+        lektor_lufs=lektor_lufs,
+        lektor_weight=lektor_weight,
+        background_lufs=background_lufs,
+        background_weight=background_weight,
+        lektor_delay_ms=lektor_delay_ms,
+        create_stereo_for_surround=create_stereo_for_surround,
+        diagnostics=diagnostics,
+        source_duration=source_duration,
+        source_audio_streams=source_audio_streams,
+        lektor_before_diagnostics=lektor_before_diagnostics,
+        lektor_after_diagnostics=lektor_after_diagnostics,
+        lektor_encoded_duration=lektor_encoded_duration,
+        lektor_encoded_audio_streams=lektor_encoded_audio_streams,
+    )
+    write_run_summary(analysis_path, analysis_payload)
+    if diagnostics["save_quality_report"]:
+        progress("Raport jakosci: zapisano")
+
+    summary_path = _run_report_path(lektor_dir, output_stem, "summary")
+    _emit_file_progress(progress, "summary", 0.5, "Podsumowanie przebiegu")
     pipeline_seconds = perf_counter() - job_started
     write_run_summary(
         summary_path,
         {
+            "report_type": "summary",
+            "run_id": output_stem,
+            "run_timestamp": run_started_at.isoformat(timespec="seconds"),
+            "source_filename": source_path.name,
+            "source_stem": source_path.stem,
+            "tts_engine_short": engine_short_code(engine_id),
+            "llm_analysis_hint": "To skrot przebiegu. Do oceny jakosci ustawien TTS uzyj raportu jakosci, bo zawiera segmenty, proby, score i retry.",
             "app_name": APP_NAME,
             "app_version": APP_VERSION,
             "source_path": str(source_path),
@@ -467,6 +553,7 @@ def _run_tts_job_prepared(
                 "manifest": rel_path(manifest_path, workspace),
                 "skipped_segments": rel_path(skipped_manifest_path, workspace),
                 "audio_qc": rel_path(lektor_dir / "audio_qc.csv", workspace) if (lektor_dir / "audio_qc.csv").exists() else "",
+                "run_analysis": rel_path(analysis_path, workspace) if diagnostics["save_quality_report"] else "",
                 "lektor_przed_normalizacja": rel_path_if_exists(lektor_before_normalization_path, workspace),
                 "lektor_wav": rel_path_if_exists(lektor_wav_path, workspace),
                 "lektor_po_normalizacji": rel_path_if_exists(lektor_wav_path, workspace),
@@ -479,7 +566,8 @@ def _run_tts_job_prepared(
             },
         },
     )
-    progress("Podsumowanie runu: zapisano")
+    if diagnostics["save_run_reports"]:
+        progress("Podsumowanie przebiegu: zapisano")
     _emit_file_progress(progress, "done", 1.0, "Aktualny plik gotowy")
 
     if output_video_path is not None:
@@ -492,6 +580,7 @@ def _run_tts_job_prepared(
             manifest_path=manifest_path,
             skipped_manifest_path=skipped_manifest_path,
             audio_qc_path=lektor_dir / "audio_qc.csv",
+            analysis_path=analysis_path,
             summary_path=summary_path,
             lektor_before_normalization_path=lektor_before_normalization_path,
             lektor_after_normalization_path=lektor_wav_path,
@@ -544,9 +633,21 @@ def _cleanup_lektor_debug_files(
     _cleanup_empty_dir(lektor_dir)
 
 
+def _run_report_path(lektor_dir: Path, output_stem: str, report_type: str) -> Path:
+    return lektor_dir / f"{output_stem}_{safe_report_suffix(report_type)}.json"
+
+
+def safe_report_suffix(report_type: str) -> str:
+    normalized = str(report_type or "").strip().lower()
+    if normalized in {"analysis", "summary", "error"}:
+        return normalized
+    return re.sub(r"[^a-z0-9_-]+", "_", normalized).strip("_") or "report"
+
+
 def _diagnostic_keep_flags(config: dict, keep_all_legacy: bool = False) -> dict[str, bool]:
     keys = (
         "save_processed_subtitles",
+        "save_quality_report",
         "save_run_reports",
         "save_lektor_segments",
         "save_lektor_track_before_normalization",
@@ -567,6 +668,7 @@ def _cleanup_successful_video_run(
     manifest_path: Path | None,
     skipped_manifest_path: Path | None,
     audio_qc_path: Path,
+    analysis_path: Path | None,
     summary_path: Path | None,
     lektor_before_normalization_path: Path | None,
     lektor_after_normalization_path: Path | None,
@@ -575,6 +677,8 @@ def _cleanup_successful_video_run(
 ) -> None:
     if not diagnostics.get("save_processed_subtitles", False):
         _unlink_if_file(subtitle_path)
+    if not diagnostics.get("save_quality_report", False):
+        _unlink_if_file(analysis_path)
     if not diagnostics.get("save_run_reports", False):
         for path in (manifest_path, skipped_manifest_path, audio_qc_path, summary_path):
             _unlink_if_file(path)
@@ -597,6 +701,222 @@ def _cleanup_successful_video_run(
 def _cleanup_empty_dirs(*paths: Path) -> None:
     for path in paths:
         _cleanup_empty_dir(path)
+
+
+def _build_run_analysis(
+    source_path: Path,
+    input_subtitle_path: Path,
+    engine_id: str,
+    output_stem: str,
+    run_started_at: datetime,
+    segments: list[SubtitleSegment],
+    segment_analysis: list[dict[str, Any]],
+    config: dict,
+    dictionary: dict,
+    quality_controls: dict,
+    generation_seconds: float,
+    pipeline_seconds: float,
+    aac_bitrate: str,
+    lektor_lufs: int,
+    lektor_weight: float,
+    background_lufs: int,
+    background_weight: float,
+    lektor_delay_ms: int,
+    create_stereo_for_surround: bool,
+    diagnostics: dict[str, bool],
+    source_duration: float | None,
+    source_audio_streams: list[dict],
+    lektor_before_diagnostics: dict | None,
+    lektor_after_diagnostics: dict | None,
+    lektor_encoded_duration: float | None,
+    lektor_encoded_audio_streams: list[dict],
+) -> dict[str, Any]:
+    records = _merge_segment_analysis(segments, segment_analysis)
+    return {
+        "schema": "lektorai.run_analysis.v1",
+        "report_type": "analysis",
+        "run_id": output_stem,
+        "run_timestamp": run_started_at.isoformat(timespec="seconds"),
+        "source_filename": source_path.name,
+        "source_stem": source_path.stem,
+        "tts_engine_short": engine_short_code(engine_id),
+        "llm_analysis_hint": "Porownaj raporty analysis z tych samych source_filename. Oceniaj ustawienia TTS po aggregates, worst_segments_by_score, liczbie retry, final_score, whisper_similarity i ostrzezeniach QC. Nizszy score jest lepszy.",
+        "score_meaning": "0 = najlepszy wynik QC; im wyzszy score, tym gorsza zgodnosc/jakosc kandydata",
+        "app_name": APP_NAME,
+        "app_version": APP_VERSION,
+        "source": {
+            "path": str(source_path),
+            "name": source_path.name,
+            "duration_s": round(float(source_duration or 0.0), 3),
+            "primary_audio": audio_stream_summary(source_audio_streams[0] if source_audio_streams else None),
+        },
+        "subtitles": {
+            "input_path": str(input_subtitle_path),
+            "processed_segment_count": len(segments),
+            "dictionary_entry_count": int(len(dictionary or {})),
+        },
+        "engine": {
+            "id": str(engine_id),
+            "settings": _sanitize_settings_snapshot(config),
+        },
+        "quality_controls": quality_controls,
+        "audio_output": {
+            "codec": "AAC",
+            "bitrate": str(aac_bitrate),
+            "lektor_lufs": int(lektor_lufs),
+            "lektor_weight": float(lektor_weight),
+            "background_lufs": int(background_lufs),
+            "background_weight": float(background_weight),
+            "lektor_delay_ms": int(lektor_delay_ms),
+            "create_stereo_for_surround": bool(create_stereo_for_surround),
+        },
+        "timings": {
+            "generation_seconds": round(float(generation_seconds), 3),
+            "pipeline_seconds": round(float(pipeline_seconds), 3),
+        },
+        "diagnostic_keep": diagnostics,
+        "audio_diagnostics": {
+            "lektor_before_normalization": lektor_before_diagnostics or {},
+            "lektor_after_normalization": lektor_after_diagnostics or {},
+            "lektor_encoded_duration_s": round(float(lektor_encoded_duration or 0.0), 3),
+            "lektor_encoded_audio": audio_stream_summary(lektor_encoded_audio_streams[0] if lektor_encoded_audio_streams else None),
+        },
+        "output_stem": output_stem,
+        "aggregates": _aggregate_segment_analysis(records),
+        "segments": records,
+    }
+
+
+def _sanitize_settings_snapshot(settings: dict) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key in sorted((settings or {}).keys(), key=str):
+        value = settings.get(key)
+        lowered = str(key).lower()
+        if any(secret in lowered for secret in ("api_key", "token", "secret", "password")):
+            result[str(key)] = "***" if str(value or "").strip() else ""
+            continue
+        result[str(key)] = _json_safe_value(value)
+    return result
+
+
+def _json_safe_value(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _merge_segment_analysis(segments: list[SubtitleSegment], segment_analysis: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_id = {int(item.get("srt_index", item.get("segment_id", -1))): item for item in segment_analysis if isinstance(item, dict)}
+    records: list[dict[str, Any]] = []
+    for ordinal, segment in enumerate(segments, 1):
+        source = dict(by_id.get(int(segment.index), {}))
+        attempts = _bounded_int(source.get("attempts", 1), 1, 999)
+        selected_attempt = _bounded_int(source.get("selected_attempt", 1), 1, max(1, attempts))
+        retries = max(0, _bounded_int(source.get("retries", max(0, attempts - 1)), 0, 999))
+        record = {
+            "ordinal": int(ordinal),
+            "srt_index": int(segment.index),
+            "start_ms": int(segment.start_ms),
+            "end_ms": int(segment.end_ms),
+            "subtitle_duration_ms": max(0, int(segment.end_ms) - int(segment.start_ms)),
+            "text": str(segment.text),
+            "audio_file": str(source.get("audio_file", "")),
+            "attempts": attempts,
+            "retries": retries,
+            "selected_attempt": selected_attempt,
+            "final_score": _optional_number(source.get("final_score", source.get("qc_score"))),
+            "whisper_similarity": _optional_number(source.get("whisper_similarity")),
+            "whisper_text": str(source.get("whisper_text", "") or ""),
+            "qc_warnings": [str(item) for item in source.get("qc_warnings", ()) or ()],
+            "attempt_details": _normalized_attempt_details(source.get("attempt_details", ())),
+        }
+        records.append(record)
+    return records
+
+
+def _normalized_attempt_details(value) -> list[dict[str, Any]]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        result.append({str(key): _json_safe_value(val) for key, val in item.items()})
+    return result
+
+
+def _aggregate_segment_analysis(records: list[dict[str, Any]]) -> dict[str, Any]:
+    scores = [float(record["final_score"]) for record in records if record.get("final_score") is not None]
+    similarities = [float(record["whisper_similarity"]) for record in records if record.get("whisper_similarity") is not None]
+    retry_records = [record for record in records if int(record.get("retries", 0) or 0) > 0]
+    selected_counter: Counter[str] = Counter(str(int(record.get("selected_attempt", 0) or 0)) for record in records)
+    return {
+        "segment_count": len(records),
+        "segments_with_retry": len(retry_records),
+        "extra_attempts": int(sum(int(record.get("retries", 0) or 0) for record in records)),
+        "max_attempts": int(max((int(record.get("attempts", 0) or 0) for record in records), default=0)),
+        "selected_attempt_distribution": dict(sorted(selected_counter.items(), key=lambda item: int(item[0]))),
+        "score": _numeric_summary(scores, lower_is_better=True),
+        "whisper_similarity": _numeric_summary(similarities, lower_is_better=False),
+        "worst_segments_by_score": _worst_segments_by_score(records, limit=12),
+        "retry_segments": [
+            {
+                "ordinal": int(record.get("ordinal", 0) or 0),
+                "srt_index": int(record.get("srt_index", 0) or 0),
+                "attempts": int(record.get("attempts", 0) or 0),
+                "selected_attempt": int(record.get("selected_attempt", 0) or 0),
+                "final_score": record.get("final_score"),
+            }
+            for record in retry_records
+        ],
+    }
+
+
+def _numeric_summary(values: list[float], lower_is_better: bool) -> dict[str, Any]:
+    if not values:
+        return {"count": 0, "lower_is_better": bool(lower_is_better)}
+    return {
+        "count": len(values),
+        "lower_is_better": bool(lower_is_better),
+        "min": round(min(values), 4),
+        "max": round(max(values), 4),
+        "average": round(sum(values) / len(values), 4),
+        "zero_count": sum(1 for value in values if value == 0),
+        "positive_count": sum(1 for value in values if value > 0),
+    }
+
+
+def _worst_segments_by_score(records: list[dict[str, Any]], limit: int = 12) -> list[dict[str, Any]]:
+    scored = [record for record in records if record.get("final_score") is not None]
+    scored.sort(key=lambda item: float(item.get("final_score") or 0), reverse=True)
+    result: list[dict[str, Any]] = []
+    for record in scored[: max(1, int(limit))]:
+        result.append(
+            {
+                "ordinal": int(record.get("ordinal", 0) or 0),
+                "srt_index": int(record.get("srt_index", 0) or 0),
+                "final_score": record.get("final_score"),
+                "attempts": int(record.get("attempts", 0) or 0),
+                "selected_attempt": int(record.get("selected_attempt", 0) or 0),
+                "text": str(record.get("text", "")),
+            }
+        )
+    return result
+
+
+def _optional_number(value):
+    if value is None:
+        return None
+    try:
+        return round(float(value), 4)
+    except (TypeError, ValueError):
+        return None
 
 
 def _is_relative_to(path: Path, base: Path) -> bool:
@@ -676,15 +996,18 @@ def _generate_edge(
     lektor_dir: Path,
     progress,
     cancel_requested: Callable[[], bool] | None = None,
-) -> tuple[list[tuple[int, Path]], float]:
+) -> GenerationOutput:
     generated: list[tuple[int, Path]] = []
+    segment_analysis: list[dict[str, Any]] = []
     audio_attempts = _bounded_int(config.get("audio_qc_retry_attempts", 2), 1, 5)
     speech_attempts = _bounded_int(config.get("whisper_qc_retry_attempts", 1), 1, 5)
+    _ensure_whisper_qc_runtime_if_enabled(config, paths, progress, cancel_requested)
     ffmpeg = find_ffmpeg(paths)
     qc_temp_dir = lektor_dir / "temp_edge_retry_qc"
     if qc_temp_dir.exists():
         shutil.rmtree(qc_temp_dir)
     qc_temp_dir.mkdir(parents=True, exist_ok=True)
+    retry_summary = QCRetrySummary()
     started = perf_counter()
     try:
         for ordinal, segment in enumerate(segments, 1):
@@ -692,8 +1015,8 @@ def _generate_edge(
             edge_tuning_enabled = _edge_tuning_enabled(config, ffmpeg)
             output_suffix = ".wav" if edge_tuning_enabled else ".mp3"
             output_path = segments_dir / f"{segment.index:03d}_{segment.start_ms:09d}_{segment.end_ms:09d}{output_suffix}"
-            progress(f"Edge: segment {ordinal}/{len(segments)}")
-            selected_path = _generate_edge_with_retry(
+            progress(f"Segment {ordinal}/{len(segments)}")
+            selected_path, analysis = _generate_edge_with_retry(
                 segment,
                 ordinal,
                 len(segments),
@@ -701,10 +1024,11 @@ def _generate_edge(
                 segments_dir,
                 config,
                 ffmpeg,
-                paths.engine_dir("edge") / "cache" / "whisper",
+                paths.whisper_cache_dir,
                 qc_temp_dir,
                 audio_attempts,
                 speech_attempts,
+                retry_summary,
                 progress,
                 cancel_requested,
             )
@@ -714,11 +1038,14 @@ def _generate_edge(
                 shutil.move(str(selected_path), str(output_path))
             _cleanup_edge_candidates(segments_dir, segment, output_path)
             generated.append((segment.start_ms, output_path))
+            analysis["audio_file"] = output_path.name
+            segment_analysis.append(analysis)
     finally:
         shutil.rmtree(qc_temp_dir, ignore_errors=True)
     seconds = perf_counter() - started
-    progress(f"Edge: generowanie segmentow {_format_duration_seconds(seconds)}")
-    return generated, seconds
+    _emit_builtin_qc_retry_summary("Edge", config, ffmpeg, retry_summary, progress)
+    progress(f"Generowanie segmentow {_format_duration_seconds(seconds)}")
+    return GenerationOutput(generated, seconds, segment_analysis)
 
 
 def _generate_edge_with_retry(
@@ -733,13 +1060,18 @@ def _generate_edge_with_retry(
     qc_temp_dir: Path,
     audio_attempts: int,
     speech_attempts: int,
+    retry_summary: QCRetrySummary,
     progress,
     cancel_requested: Callable[[], bool] | None = None,
-) -> Path:
+) -> tuple[Path, dict[str, Any]]:
     candidates: list[tuple[int, Path]] = []
+    attempt_details: list[dict[str, Any]] = []
     best_score = 10**9
     best_warnings: tuple[str, ...] = ()
     best_path = output_path
+    best_attempt = 1
+    best_whisper_similarity = None
+    best_whisper_text = ""
     audio_enabled = _bool_config(config.get("audio_qc_enabled"), False) and ffmpeg is not None
     speech_enabled = _bool_config(config.get("whisper_qc_enabled"), False)
     audio_limit = audio_attempts if audio_enabled else 1
@@ -785,6 +1117,16 @@ def _generate_edge_with_retry(
                 audio_enabled,
                 cancel_requested,
             )
+            detail = _builtin_attempt_detail(
+                attempt=candidate_no,
+                audio_attempt=audio_attempt,
+                speech_attempt=speech_attempt,
+                text_variant=_edge_retry_variant_label(retry_texts[candidate_no - 1]),
+                audio_file=candidate_path.name,
+                audio_qc_score=score,
+                audio_qc_warnings=warnings,
+            )
+            attempt_details.append(detail)
             if score < audio_best_score:
                 audio_best_score = score
                 audio_best_warnings = warnings
@@ -793,36 +1135,41 @@ def _generate_edge_with_retry(
             if score == 0:
                 break
             if audio_attempt < audio_limit:
-                progress(_format_builtin_qc_retry_message("Edge Audio QC", ordinal, total_segments, audio_attempt + 1, audio_limit, score, warnings))
+                retry_summary.record_audio_retry(ordinal)
+                progress(_format_short_qc_retry_message("Edge", "kontrola audio", ordinal, total_segments, audio_attempt + 1, audio_limit))
         score = audio_best_score
         warnings = audio_best_warnings
+        whisper_similarity = None
+        whisper_text = ""
         if speech_enabled:
             _raise_if_cancelled(cancel_requested)
-            speech_score, speech_warnings = _score_builtin_speech_candidate(audio_best_path, segment, config, whisper_cache_dir)
+            speech_score, speech_warnings, whisper_text, whisper_similarity = _score_builtin_speech_candidate(audio_best_path, segment, config, whisper_cache_dir)
             score += speech_score
             warnings = tuple(list(warnings) + list(speech_warnings))
+            _update_builtin_attempt_detail(
+                attempt_details,
+                audio_best_attempt,
+                speech_score=speech_score,
+                speech_warnings=speech_warnings,
+                whisper_text=whisper_text,
+                whisper_similarity=whisper_similarity,
+                final_score=score,
+                final_warnings=warnings,
+            )
         if score < best_score:
             best_score = score
             best_warnings = warnings
             best_path = audio_best_path
+            best_attempt = audio_best_attempt
+            best_whisper_similarity = whisper_similarity
+            best_whisper_text = whisper_text
         if score == 0:
             break
         if speech_attempt < speech_limit and candidate_no < len(retry_texts):
-            progress(_format_builtin_qc_retry_message("Edge Whisper QC", ordinal, total_segments, speech_attempt + 1, speech_limit, score, warnings))
-    if len(candidates) > 1:
-        selected_attempt = next(a for a, p in candidates if p == best_path)
-        progress(
-            _format_builtin_qc_selected_message(
-                "Edge",
-                ordinal,
-                total_segments,
-                selected_attempt,
-                len(candidates),
-                best_score,
-                best_warnings,
-            )
-        )
-    return best_path
+            retry_summary.record_speech_retry(ordinal)
+            progress(_format_short_qc_retry_message("Edge", "kontrola mowy", ordinal, total_segments, speech_attempt + 1, speech_limit))
+    _mark_selected_attempt(attempt_details, best_attempt)
+    return best_path, _builtin_segment_analysis(segment, best_path, attempt_details, best_attempt, best_score, best_warnings, best_whisper_text, best_whisper_similarity)
 
 
 def _edge_candidate_path(segments_dir: Path, segment: SubtitleSegment, attempt: int, edge_tuning_enabled: bool = False) -> Path:
@@ -872,36 +1219,25 @@ def _edge_retry_text(text: str, attempt: int) -> str:
     return variants[index]
 
 
+_RETRY_TERMINAL_PUNCTUATION = ".,!?:;"
+
+
 def _edge_retry_text_variants(text: str, limit: int = 5) -> list[str]:
     limit = max(1, int(limit))
     stripped = str(text or "").strip()
     if not stripped:
         return [str(text or "")]
-    candidates: list[str] = []
+    base = _strip_retry_terminal_punctuation(stripped)
+    if not base:
+        return [stripped]
+    return [stripped, base + ".", base + ",", base + "!", base + "?"][:limit]
 
-    def add(candidate: str) -> None:
-        candidate = str(candidate or "").strip()
-        if candidate and candidate not in candidates:
-            candidates.append(candidate)
 
-    add(stripped)
-    base = stripped[:-1].rstrip() if stripped.endswith((".", "!", "?")) else stripped
-    if base and base != stripped:
-        add(base)
-
-    if stripped.endswith("."):
-        add(base + ",")
-    elif stripped.endswith("!"):
-        add(base + ",")
-        add(base + ".")
-    elif stripped.endswith("?"):
-        add(base + ",")
-        add(base + ".")
-    else:
-        add(base + ".")
-        add(base + ",")
-
-    return candidates[:limit]
+def _strip_retry_terminal_punctuation(text: str) -> str:
+    base = str(text or "").strip()
+    while base and base[-1] in _RETRY_TERMINAL_PUNCTUATION:
+        base = base[:-1].rstrip()
+    return base
 
 
 def _generate_openai(
@@ -912,22 +1248,25 @@ def _generate_openai(
     lektor_dir: Path,
     progress,
     cancel_requested: Callable[[], bool] | None = None,
-) -> tuple[list[tuple[int, Path]], float]:
+) -> GenerationOutput:
     generated: list[tuple[int, Path]] = []
+    segment_analysis: list[dict[str, Any]] = []
     audio_attempts = _bounded_int(config.get("audio_qc_retry_attempts", 2), 1, 5)
     speech_attempts = _bounded_int(config.get("whisper_qc_retry_attempts", 1), 1, 5)
+    _ensure_whisper_qc_runtime_if_enabled(config, paths, progress, cancel_requested)
     ffmpeg = find_ffmpeg(paths)
     qc_temp_dir = lektor_dir / "temp_openai_retry_qc"
     if qc_temp_dir.exists():
         shutil.rmtree(qc_temp_dir)
     qc_temp_dir.mkdir(parents=True, exist_ok=True)
+    retry_summary = QCRetrySummary()
     started = perf_counter()
     try:
         for ordinal, segment in enumerate(segments, 1):
             _raise_if_cancelled(cancel_requested)
             output_path = segments_dir / f"{segment.index:03d}_{segment.start_ms:09d}_{segment.end_ms:09d}.wav"
-            progress(f"OpenAI: segment {ordinal}/{len(segments)}")
-            selected_path = _generate_openai_with_retry(
+            progress(f"Segment {ordinal}/{len(segments)}")
+            selected_path, analysis = _generate_openai_with_retry(
                 segment,
                 ordinal,
                 len(segments),
@@ -935,10 +1274,11 @@ def _generate_openai(
                 segments_dir,
                 config,
                 ffmpeg,
-                paths.engine_dir("openai") / "cache" / "whisper",
+                paths.whisper_cache_dir,
                 qc_temp_dir,
                 audio_attempts,
                 speech_attempts,
+                retry_summary,
                 progress,
                 cancel_requested,
             )
@@ -950,12 +1290,15 @@ def _generate_openai(
                 _apply_openai_fade(ffmpeg, output_path, lektor_dir, cancel_requested=cancel_requested)
             _cleanup_openai_candidates(segments_dir, segment, output_path)
             generated.append((segment.start_ms, output_path))
+            analysis["audio_file"] = output_path.name
+            segment_analysis.append(analysis)
     finally:
         shutil.rmtree(qc_temp_dir, ignore_errors=True)
         shutil.rmtree(lektor_dir / "temp_openai_fade", ignore_errors=True)
     seconds = perf_counter() - started
-    progress(f"OpenAI: generowanie segmentow {_format_duration_seconds(seconds)}")
-    return generated, seconds
+    _emit_builtin_qc_retry_summary("OpenAI", config, ffmpeg, retry_summary, progress)
+    progress(f"Generowanie segmentow {_format_duration_seconds(seconds)}")
+    return GenerationOutput(generated, seconds, segment_analysis)
 
 
 def _generate_openai_with_retry(
@@ -970,13 +1313,18 @@ def _generate_openai_with_retry(
     qc_temp_dir: Path,
     audio_attempts: int,
     speech_attempts: int,
+    retry_summary: QCRetrySummary,
     progress,
     cancel_requested: Callable[[], bool] | None = None,
-) -> Path:
+) -> tuple[Path, dict[str, Any]]:
     candidates: list[tuple[int, Path]] = []
+    attempt_details: list[dict[str, Any]] = []
     best_score = 10**9
     best_warnings: tuple[str, ...] = ()
     best_path = output_path
+    best_attempt = 1
+    best_whisper_similarity = None
+    best_whisper_text = ""
     audio_enabled = _bool_config(config.get("audio_qc_enabled"), False) and ffmpeg is not None
     speech_enabled = _bool_config(config.get("whisper_qc_enabled"), False)
     audio_limit = audio_attempts if audio_enabled else 1
@@ -987,6 +1335,7 @@ def _generate_openai_with_retry(
         audio_best_score = 10**9
         audio_best_warnings: tuple[str, ...] = ()
         audio_best_path = output_path
+        audio_best_attempt = max(1, candidate_no + 1)
         for audio_attempt in range(1, audio_limit + 1):
             _raise_if_cancelled(cancel_requested)
             candidate_no += 1
@@ -1011,43 +1360,60 @@ def _generate_openai_with_retry(
                 audio_enabled,
                 cancel_requested,
             )
+            attempt_details.append(
+                _builtin_attempt_detail(
+                    attempt=candidate_no,
+                    audio_attempt=audio_attempt,
+                    speech_attempt=speech_attempt,
+                    text_variant=_edge_retry_variant_label(_edge_retry_text(segment.text, candidate_no)),
+                    audio_file=candidate_path.name,
+                    audio_qc_score=score,
+                    audio_qc_warnings=warnings,
+                )
+            )
             if score < audio_best_score:
                 audio_best_score = score
                 audio_best_warnings = warnings
                 audio_best_path = candidate_path
+                audio_best_attempt = candidate_no
             if score == 0:
                 break
             if audio_attempt < audio_limit:
-                progress(_format_builtin_qc_retry_message("OpenAI Audio QC", ordinal, total_segments, audio_attempt + 1, audio_limit, score, warnings))
+                retry_summary.record_audio_retry(ordinal)
+                progress(_format_short_qc_retry_message("OpenAI", "kontrola audio", ordinal, total_segments, audio_attempt + 1, audio_limit))
         score = audio_best_score
         warnings = audio_best_warnings
+        whisper_similarity = None
+        whisper_text = ""
         if speech_enabled:
             _raise_if_cancelled(cancel_requested)
-            speech_score, speech_warnings = _score_builtin_speech_candidate(audio_best_path, segment, config, whisper_cache_dir)
+            speech_score, speech_warnings, whisper_text, whisper_similarity = _score_builtin_speech_candidate(audio_best_path, segment, config, whisper_cache_dir)
             score += speech_score
             warnings = tuple(list(warnings) + list(speech_warnings))
+            _update_builtin_attempt_detail(
+                attempt_details,
+                audio_best_attempt,
+                speech_score=speech_score,
+                speech_warnings=speech_warnings,
+                whisper_text=whisper_text,
+                whisper_similarity=whisper_similarity,
+                final_score=score,
+                final_warnings=warnings,
+            )
         if score < best_score:
             best_score = score
             best_warnings = warnings
             best_path = audio_best_path
+            best_attempt = audio_best_attempt
+            best_whisper_similarity = whisper_similarity
+            best_whisper_text = whisper_text
         if score == 0:
             break
         if speech_attempt < speech_limit:
-            progress(_format_builtin_qc_retry_message("OpenAI Whisper QC", ordinal, total_segments, speech_attempt + 1, speech_limit, score, warnings))
-    if len(candidates) > 1:
-        selected_attempt = next(a for a, p in candidates if p == best_path)
-        progress(
-            _format_builtin_qc_selected_message(
-                "OpenAI",
-                ordinal,
-                total_segments,
-                selected_attempt,
-                len(candidates),
-                best_score,
-                best_warnings,
-            )
-        )
-    return best_path
+            retry_summary.record_speech_retry(ordinal)
+            progress(_format_short_qc_retry_message("OpenAI", "kontrola mowy", ordinal, total_segments, speech_attempt + 1, speech_limit))
+    _mark_selected_attempt(attempt_details, best_attempt)
+    return best_path, _builtin_segment_analysis(segment, best_path, attempt_details, best_attempt, best_score, best_warnings, best_whisper_text, best_whisper_similarity)
 
 
 def _openai_candidate_path(segments_dir: Path, segment: SubtitleSegment, attempt: int) -> Path:
@@ -1094,12 +1460,129 @@ def _score_builtin_speech_candidate(
     segment: SubtitleSegment,
     config: dict,
     whisper_cache_dir: Path,
-) -> tuple[int, tuple[str, ...]]:
+) -> tuple[int, tuple[str, ...], str, float]:
     transcript = transcribe_audio_with_faster_whisper(candidate_path, config, whisper_cache_dir)
     threshold = _bounded_float(config.get("whisper_qc_min_similarity", 0.62), 0.0, 1.0)
     whisper = score_whisper_transcript(segment.text, transcript, threshold)
     warnings = [str(warning) for warning in whisper.warnings]
-    return int(whisper.score), tuple(warning for warning in warnings if warning)
+    return int(whisper.score), tuple(warning for warning in warnings if warning), str(whisper.text), float(whisper.similarity)
+
+
+def _builtin_attempt_detail(
+    attempt: int,
+    audio_attempt: int,
+    speech_attempt: int,
+    text_variant: str,
+    audio_file: str,
+    audio_qc_score: int,
+    audio_qc_warnings: tuple[str, ...],
+) -> dict[str, Any]:
+    return {
+        "attempt": int(attempt),
+        "audio_attempt": int(audio_attempt),
+        "speech_attempt": int(speech_attempt),
+        "text_variant": str(text_variant),
+        "audio_file": str(audio_file),
+        "audio_qc_score": int(audio_qc_score),
+        "audio_qc_warnings": [str(warning) for warning in audio_qc_warnings],
+        "whisper_checked": False,
+        "whisper_score": None,
+        "whisper_similarity": None,
+        "whisper_text": "",
+        "final_score": int(audio_qc_score),
+        "final_warnings": [str(warning) for warning in audio_qc_warnings],
+        "selected": False,
+    }
+
+
+def _update_builtin_attempt_detail(
+    attempt_details: list[dict[str, Any]],
+    attempt: int,
+    speech_score: int,
+    speech_warnings: tuple[str, ...],
+    whisper_text: str,
+    whisper_similarity: float | None,
+    final_score: int,
+    final_warnings: tuple[str, ...],
+) -> None:
+    for detail in attempt_details:
+        if int(detail.get("attempt", 0) or 0) == int(attempt):
+            detail["whisper_checked"] = True
+            detail["whisper_score"] = int(speech_score)
+            detail["whisper_similarity"] = _optional_number(whisper_similarity)
+            detail["whisper_text"] = str(whisper_text or "")
+            detail["final_score"] = int(final_score)
+            detail["final_warnings"] = [str(warning) for warning in final_warnings]
+            return
+
+
+def _mark_selected_attempt(attempt_details: list[dict[str, Any]], selected_attempt: int) -> None:
+    for detail in attempt_details:
+        detail["selected"] = int(detail.get("attempt", 0) or 0) == int(selected_attempt)
+
+
+def _edge_retry_variant_label(candidate_text: str) -> str:
+    stripped = str(candidate_text or "").rstrip()
+    if not stripped:
+        return "oryginal"
+    if stripped[-1] in _RETRY_TERMINAL_PUNCTUATION:
+        return f"koncowka_{stripped[-1]}"
+    return "oryginal"
+
+
+def _builtin_segment_analysis(
+    segment: SubtitleSegment,
+    audio_path: Path,
+    attempt_details: list[dict[str, Any]],
+    selected_attempt: int,
+    final_score: int,
+    qc_warnings: tuple[str, ...],
+    whisper_text: str,
+    whisper_similarity: float | None,
+) -> dict[str, Any]:
+    return {
+        "srt_index": int(segment.index),
+        "audio_file": audio_path.name,
+        "attempts": len(attempt_details) or 1,
+        "selected_attempt": int(selected_attempt),
+        "retries": max(0, (len(attempt_details) or 1) - 1),
+        "final_score": int(final_score),
+        "qc_warnings": [str(warning) for warning in qc_warnings],
+        "whisper_text": str(whisper_text or ""),
+        "whisper_similarity": _optional_number(whisper_similarity),
+        "attempt_details": attempt_details,
+    }
+
+
+def _local_worker_segment_analysis(
+    segments: list[SubtitleSegment],
+    generated: list[tuple[int, Path]],
+    result: EngineResult,
+) -> list[dict[str, Any]]:
+    by_id = {int(segment.segment_id): segment for segment in result.segments}
+    audio_by_index = {int(segment.index): generated[index][1] for index, segment in enumerate(segments) if index < len(generated)}
+    analysis: list[dict[str, Any]] = []
+    for segment in segments:
+        segment_result = by_id.get(int(segment.index))
+        audio_path = audio_by_index.get(int(segment.index))
+        if segment_result is None:
+            continue
+        attempts = int(segment_result.attempts or 1)
+        analysis.append(
+            {
+                "srt_index": int(segment.index),
+                "audio_file": audio_path.name if audio_path is not None else Path(segment_result.output_path or "").name,
+                "attempts": attempts,
+                "selected_attempt": int(segment_result.selected_attempt or 1),
+                "retries": int(segment_result.retries or max(0, attempts - 1)),
+                "final_score": _optional_number(segment_result.qc_score),
+                "qc_warnings": [str(warning) for warning in segment_result.qc_warnings],
+                "whisper_text": str(segment_result.whisper_text or ""),
+                "whisper_similarity": _optional_number(segment_result.whisper_similarity),
+                "attempt_details": _normalized_attempt_details(segment_result.attempt_details),
+            }
+        )
+    return analysis
 
 
 def _score_builtin_candidate(
@@ -1123,7 +1606,7 @@ def _score_builtin_candidate(
     score += audio_score
     warnings.extend(audio_warnings)
     if _bool_config(config.get("whisper_qc_enabled"), False):
-        speech_score, speech_warnings = _score_builtin_speech_candidate(candidate_path, segment, config, whisper_cache_dir)
+        speech_score, speech_warnings, _whisper_text, _whisper_similarity = _score_builtin_speech_candidate(candidate_path, segment, config, whisper_cache_dir)
         score += speech_score
         warnings.extend(speech_warnings)
     return int(score), tuple(warning for warning in warnings if warning)
@@ -1165,20 +1648,90 @@ def _qc_log_prefix(engine_name: str) -> str:
     return name if name.endswith("QC") else f"{name} QC"
 
 
+def _emit_builtin_qc_retry_summary(
+    engine_id: str,
+    config: dict,
+    ffmpeg: Path | None,
+    retry_summary: QCRetrySummary,
+    progress,
+) -> None:
+    audio_enabled = ffmpeg is not None and _bool_config(config.get("audio_qc_enabled"), False)
+    speech_enabled = _bool_config(config.get("whisper_qc_enabled"), False)
+    if audio_enabled:
+        _emit_qc_retry_summary_line(
+            engine_id,
+            "kontrola audio",
+            len(retry_summary.audio_retry_segments),
+            retry_summary.audio_extra_attempts,
+            progress,
+        )
+    if speech_enabled:
+        _emit_qc_retry_summary_line(
+            engine_id,
+            "kontrola mowy",
+            len(retry_summary.speech_retry_segments),
+            retry_summary.speech_extra_attempts,
+            progress,
+        )
+
+
+def _emit_qc_retry_summary_line(engine_id: str, label: str, segment_count: int, extra_attempts: int, progress) -> None:
+    if int(extra_attempts) > 0:
+        progress(
+            f"{label} ponawiala {_format_polish_count(segment_count, 'segment', 'segmenty', 'segmentow')}; "
+            f"dodatkowe {_format_polish_count(extra_attempts, 'proba', 'proby', 'prob')}"
+        )
+    else:
+        progress(f"{label}: sprawdzono, bez ponowien")
+
+
+def _format_short_qc_retry_message(
+    engine_id: str,
+    label: str,
+    ordinal: int,
+    total_segments: int,
+    next_attempt: int,
+    retry_attempts: int,
+) -> str:
+    module_name = "Audio QC" if "audio" in str(label).lower() else "Whisper QC"
+    return f"{module_name} - segment {ordinal}/{total_segments}, proba {next_attempt}/{retry_attempts}"
+
+
+def _format_polish_count(count: int, singular: str, few: str, many: str) -> str:
+    value = abs(int(count))
+    if value == 1:
+        form = singular
+    elif value % 10 in (2, 3, 4) and value % 100 not in (12, 13, 14):
+        form = few
+    else:
+        form = many
+    return f"{int(count)} {form}"
+
+
 def _quality_controls_summary(engine_id: str, config: dict, ffmpeg_present: bool) -> dict:
     audio_enabled = bool(ffmpeg_present) and _bool_config(config.get("audio_qc_enabled"), False)
     speech_enabled = _bool_config(config.get("whisper_qc_enabled"), False)
     edge_tuning_enabled = engine_id == "edge" and bool(ffmpeg_present) and _bool_config(config.get("edge_apply_segment_fade"), True)
     omnivoice_tuning_enabled = engine_id == "omnivoice" and _bool_config(config.get("omnivoice_trim_edges"), False)
+    xtts_tuning_enabled = engine_id == "coqui_xtts" and _bool_config(config.get("xtts_trim_trailing_silence"), True)
     audio_attempts = _bounded_int(config.get("audio_qc_retry_attempts", 1), 1, 5)
     speech_attempts = _bounded_int(config.get("whisper_qc_retry_attempts", 1), 1, 5)
+    if engine_id in DETERMINISTIC_RETRY_ENGINES:
+        audio_attempts = 1
+        if engine_id not in PUNCTUATION_RETRY_ENGINES:
+            speech_attempts = 1
     chain = ["TTS"]
-    if edge_tuning_enabled or omnivoice_tuning_enabled:
-        chain.append("Wycinanie ciszy na brzegach" if engine_id == "omnivoice" else "Przytnij i wygladz brzegi")
+    if edge_tuning_enabled or omnivoice_tuning_enabled or xtts_tuning_enabled:
+        if engine_id == "omnivoice":
+            chain.append("Wycinanie ciszy na brzegach")
+        elif engine_id == "coqui_xtts":
+            chain.append("Wycinanie koncowej ciszy")
+        else:
+            chain.append("Przytnij i wygladz brzegi")
     if audio_enabled:
-        chain.append(f"Audio QC x{audio_attempts}")
+        chain.append(f"Audio QC x{audio_attempts}" if audio_attempts > 1 else "Audio QC")
     if speech_enabled:
-        chain.append(f"Whisper QC x{speech_attempts}")
+        chain.append(f"Whisper QC x{speech_attempts}" if speech_attempts > 1 else "Whisper QC")
     chain.append("final")
     return {
         "engine_id": str(engine_id),
@@ -1188,6 +1741,7 @@ def _quality_controls_summary(engine_id: str, config: dict, ffmpeg_present: bool
         "audio_qc_retry_attempts": audio_attempts,
         "edge_tuning_enabled": edge_tuning_enabled,
         "omnivoice_tuning_enabled": omnivoice_tuning_enabled,
+        "xtts_tuning_enabled": xtts_tuning_enabled,
         "whisper_qc_enabled": speech_enabled,
         "whisper_qc_retry_attempts": speech_attempts,
         "whisper_qc_model": str(config.get("whisper_qc_model", "small") or "small").strip() or "small",
@@ -1217,8 +1771,9 @@ def _generate_local(
     manager: EngineManager,
     progress,
     cancel_requested: Callable[[], bool] | None = None,
-) -> tuple[list[tuple[int, Path]], float]:
+) -> GenerationOutput:
     engine_dir = paths.engine_dir(engine_id)
+    _ensure_whisper_qc_runtime_if_enabled(config, paths, progress, cancel_requested)
     worker_script = engine_dir / "worker.py"
     if not worker_script.exists():
         raise RuntimeError(f"TTS {engine_id} nie ma worker.py. Zainstaluj silnik ponownie w menadzerze TTS.")
@@ -1237,12 +1792,9 @@ def _generate_local(
     )
 
     write_request(run_paths.request_path, request)
-    model_start_message = _local_model_start_message(engine_id, manager)
-    if model_start_message:
-        progress(model_start_message)
     progress(f"{engine_id}: start workera")
     started = perf_counter()
-    progress_counter = {"done": 0, "model_activity": ""}
+    progress_counter = {"done": 0, "model_activity": "", "model_activity_seen": set()}
     result = runner.run_worker(
         engine_id,
         worker_script,
@@ -1255,18 +1807,30 @@ def _generate_local(
     if not result.ok:
         first_error = next((segment.error for segment in result.segments if not segment.ok and segment.error), result.error)
         raise RuntimeError(first_error or f"TTS {engine_id}: worker zakonczyl prace bledem")
+    _emit_local_worker_qc_summary(engine_id, config, result, progress)
+    generated = _validated_worker_generated_audio(engine_id, request.segments, segments, result, run_paths.request_path.parent)
+    segment_analysis = _local_worker_segment_analysis(segments, generated, result)
+    progress(f"Generowanie segmentow {_format_duration_seconds(seconds)}")
+    return GenerationOutput(generated, seconds, segment_analysis)
+
+
+def _emit_local_worker_qc_summary(engine_id: str, config: dict, result: EngineResult, progress) -> None:
     retry_count = sum(int(segment.retries) for segment in result.segments)
+    retry_segments = sum(1 for segment in result.segments if int(segment.retries) > 0)
     suspicious_count = sum(1 for segment in result.segments if segment.qc_score is not None and float(segment.qc_score) > 0)
-    if retry_count:
-        progress(f"{engine_id}: retry segmentow {retry_count}")
+    audio_enabled = _bool_config(config.get("audio_qc_enabled"), False)
+    speech_enabled = _bool_config(config.get("whisper_qc_enabled"), False)
+    if speech_enabled:
+        _emit_qc_retry_summary_line(engine_id, "kontrola mowy", retry_segments, retry_count, progress)
+    elif audio_enabled:
+        _emit_qc_retry_summary_line(engine_id, "kontrola audio", retry_segments, retry_count, progress)
+    elif retry_count:
+        _emit_qc_retry_summary_line(engine_id, "kontrola jakosci", retry_segments, retry_count, progress)
     if suspicious_count:
-        progress(f"{engine_id}: worker QC podejrzane {suspicious_count}")
+        progress(f"Kontrola jakosci oznaczyla {_format_polish_count(suspicious_count, 'segment', 'segmenty', 'segmentow')} jako podejrzane")
         warning_summary = _local_worker_qc_warning_summary(result)
         if warning_summary:
-            progress(f"{engine_id}: worker QC ostrzezenia: {warning_summary}")
-    generated = _validated_worker_generated_audio(engine_id, request.segments, segments, result, run_paths.request_path.parent)
-    progress(f"{engine_id}: generowanie segmentow {_format_duration_seconds(seconds)}")
-    return generated, seconds
+            progress(f"Ostrzezenia kontroli jakosci: {warning_summary}")
 
 
 def _local_worker_qc_warning_summary(result: EngineResult, limit: int = 4) -> str:
@@ -1334,6 +1898,7 @@ def _prepare_local_voice_sample(
         return dict(config)
     if source_path.suffix.lower() not in supported_voice_sample_extensions():
         return dict(config)
+    _validate_local_voice_sample_duration(engine_id, source_path, paths)
     ffmpeg = find_ffmpeg(paths)
     if ffmpeg is None:
         raise RuntimeError(f"Brak ffmpeg do przygotowania probki glosu. {BINARY_LOOKUP_HINT}")
@@ -1362,15 +1927,27 @@ def _prepare_local_voice_sample(
 
 
 def _local_voice_sample_config_key(engine_id: str) -> str:
-    if engine_id == "chatterbox":
-        return "audio_prompt_path"
-    if engine_id == "omnivoice":
-        return "reference_audio_path"
-    return ""
+    return voice_sample_config_key(engine_id)
+
+
+def _validate_local_voice_sample_duration(engine_id: str, source_path: Path, paths: AppPaths) -> None:
+    rule = voice_sample_rule(engine_id)
+    if rule is None:
+        return
+    ffprobe = find_ffprobe(paths)
+    if ffprobe is None:
+        raise RuntimeError(f"{rule.label}: nie moge sprawdzic dlugosci probki glosu, bo brakuje ffprobe. {BINARY_LOOKUP_HINT}")
+    try:
+        duration_seconds = probe_media_duration(ffprobe, source_path)
+    except Exception as exc:
+        raise RuntimeError(f"{rule.label}: nie mozna odczytac dlugosci pliku audio. Uzyj poprawnego WAV/MP3/FLAC.") from exc
+    errors = validate_voice_sample_duration(engine_id, duration_seconds)
+    if errors:
+        raise RuntimeError(errors[0])
 
 
 def _should_enhance_voice_sample(engine_id: str, config: dict) -> bool:
-    if engine_id in {"chatterbox", "omnivoice"}:
+    if engine_id in {"chatterbox", "omnivoice", "coqui_xtts"}:
         return False
     return not _bool_config(config.get("disable_voice_sample_enhancement"), False)
 
@@ -1448,26 +2025,39 @@ def _validate_worker_retry_diagnostics(engine_id: str, segment_id: int, segment_
 def _local_worker_progress(engine_id: str, total_segments: int, counter: dict[str, object], progress, line: str) -> None:
     match = re.search(r": segment\s+(\d+)\s+OK", line)
     if not match:
+        retry_message = _local_worker_retry_progress_message(engine_id, total_segments, line)
+        if retry_message is not None:
+            progress(retry_message)
+            return
         model_activity = _model_activity_message_for_worker_line(engine_id, line)
-        if model_activity is not None and counter.get("model_activity") != model_activity:
+        seen = counter.setdefault("model_activity_seen", set())
+        if not isinstance(seen, set):
+            seen = set()
+            counter["model_activity_seen"] = seen
+        if model_activity is not None and model_activity not in seen:
+            seen.add(model_activity)
             counter["model_activity"] = model_activity
             progress(model_activity)
         return
     counter["done"] = min(total_segments, int(counter.get("done", 0)) + 1)
     done = counter["done"]
-    progress(f"{engine_id}: segment {done}/{total_segments}")
+    progress(f"Segment {done}/{total_segments}")
 
 
-def _local_model_start_message(engine_id: str, manager: EngineManager) -> str:
-    try:
-        state = manager.state_for(engine_id)
-    except Exception:
-        return f"{engine_id}: przygotowanie modelu"
-    if not state.definition.requires_model:
-        return ""
-    if state.status == EngineStatus.INSTALLED_NO_MODEL:
-        return f"{engine_id}: model niepobrany, rozpoczynam pobieranie przy pierwszym uzyciu"
-    return f"{engine_id}: model w cache, rozpoczynam ladowanie"
+def _local_worker_retry_progress_message(engine_id: str, total_segments: int, line: str) -> str | None:
+    text = str(line or "").strip()
+    match = re.search(r": segment\s+(\d+),\s+(audio|mowa)\s+proba\s+(\d+)/(\d+)", text, re.IGNORECASE)
+    if not match:
+        return None
+    attempt = int(match.group(3))
+    if attempt <= 1:
+        return None
+    label = "kontrola audio" if match.group(2).lower() == "audio" else "kontrola mowy"
+    message = _format_short_qc_retry_message(engine_id, label, int(match.group(1)), total_segments, attempt, int(match.group(4)))
+    score_match = re.search(r"\bqc=([+-]?\d+)", text, re.IGNORECASE)
+    if score_match:
+        message += f", score: {score_match.group(1).strip()}"
+    return message
 
 
 def _model_activity_message_for_worker_line(engine_id: str, line: str) -> str | None:
@@ -1475,6 +2065,10 @@ def _model_activity_message_for_worker_line(engine_id: str, line: str) -> str | 
     if not text:
         return None
     if text.startswith("whisper qc:"):
+        if "sprawdzanie modelu" in text:
+            return "Whisper QC: sprawdzanie obecnosci modelu"
+        if "model w cache" in text:
+            return "Whisper QC: model w cache"
         if "pobieranie modelu" in text:
             return "Whisper QC: pobieranie modelu - prosze czekac"
         if "ladowanie modelu" in text or "ładowanie modelu" in text:
@@ -1482,13 +2076,74 @@ def _model_activity_message_for_worker_line(engine_id: str, line: str) -> str | 
         return None
     if not text.startswith(f"{engine_id.lower()}:"):
         return None
+    if "sprawdzanie modelu" in text:
+        return "Model TTS: sprawdzanie obecnosci modelu"
+    if "model w cache" in text:
+        return "Model TTS: model w cache"
     if "pobieranie modelu" in text:
-        return f"{engine_id}: pobieranie modelu - prosze czekac"
+        return "Model TTS: pobieranie modelu - prosze czekac"
     if "ladowanie modelu" in text or "ładowanie modelu" in text:
-        return f"{engine_id}: ladowanie modelu - prosze czekac"
+        return "Model TTS: ladowanie modelu - prosze czekac"
     if re.search(r"\b(cache|cached)\b", text):
-        return f"{engine_id}: sprawdzanie cache modelu"
+        return "Model TTS: sprawdzanie cache modelu"
     return None
+
+
+def _ensure_common_whisper_cache(paths: AppPaths) -> None:
+    common_cache = paths.whisper_cache_dir
+    if _has_cache_payload(common_cache):
+        return
+    legacy_caches: list[Path] = [paths.cache_dir / "whisper"]
+    legacy_root = paths.runtime_engines_dir
+    if legacy_root.is_dir():
+        legacy_caches.extend(legacy_root.glob("*/cache/whisper"))
+    for legacy_cache in legacy_caches:
+        if legacy_cache.resolve() == common_cache.resolve():
+            continue
+        if not _has_cache_payload(legacy_cache):
+            continue
+        common_cache.mkdir(parents=True, exist_ok=True)
+        for item in legacy_cache.iterdir():
+            if item.name == ".locks":
+                continue
+            destination = common_cache / item.name
+            try:
+                if item.is_dir():
+                    shutil.copytree(item, destination, dirs_exist_ok=True)
+                elif item.is_file() and not destination.exists():
+                    shutil.copy2(item, destination)
+            except OSError:
+                continue
+
+
+def _ensure_whisper_qc_runtime_if_enabled(
+    config: dict,
+    paths: AppPaths,
+    progress,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> None:
+    if not _bool_config(config.get("whisper_qc_enabled"), False):
+        return
+    _raise_if_cancelled(cancel_requested)
+    ensure_faster_whisper_runtime(paths, progress)
+    _raise_if_cancelled(cancel_requested)
+    _ensure_common_whisper_cache(paths)
+
+
+def _has_cache_payload(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    for item in path.rglob("*"):
+        if not item.is_file():
+            continue
+        try:
+            relative = item.relative_to(path)
+        except ValueError:
+            continue
+        if relative.parts and relative.parts[0] == ".locks":
+            continue
+        return True
+    return False
 
 
 def _load_json(path: Path) -> dict:

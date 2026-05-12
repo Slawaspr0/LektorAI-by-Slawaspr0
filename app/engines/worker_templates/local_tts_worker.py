@@ -8,6 +8,7 @@ import shutil
 import sys
 import traceback
 import unicodedata
+import wave
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,13 @@ _WHISPER_MODELS: dict[tuple[str, str, str, str], Any] = {}
 _AUTO_DEVICE = ""
 _OMNIVOICE_MODEL = None
 _OMNIVOICE_MODEL_KEY = ""
+_PIPER_VOICE = None
+_PIPER_VOICE_KEY = ""
+_COQUI_XTTS_MODEL = None
+_COQUI_XTTS_MODEL_KEY = ""
+DETERMINISTIC_RETRY_ENGINES = {"piper"}
+PUNCTUATION_RETRY_ENGINES = {"piper"}
+RETRY_TERMINAL_PUNCTUATION = ".,!?:;"
 
 
 def main() -> int:
@@ -72,6 +80,7 @@ def run_request(request: dict[str, Any]) -> dict[str, Any]:
                     "qc_warnings": generation["qc_warnings"],
                     "whisper_text": generation.get("whisper_text", ""),
                     "whisper_similarity": generation.get("whisper_similarity"),
+                    "attempt_details": generation.get("attempt_details", []),
                 }
             )
             print(
@@ -111,34 +120,53 @@ def synthesize_with_retry(
     subtitle_ms: int,
     segment_id: int,
 ) -> dict[str, Any]:
-    audio_enabled = bool_setting(settings.get("audio_qc_enabled"), False)
-    whisper_enabled = bool_setting(settings.get("whisper_qc_enabled"), False)
-    audio_attempts = bounded_int(settings.get("audio_qc_retry_attempts", default_retry_attempts(engine_id)), 1, 5)
-    whisper_attempts = bounded_int(settings.get("whisper_qc_retry_attempts", 1), 1, 5)
-    audio_limit = audio_attempts if audio_enabled else 1
-    whisper_limit = whisper_attempts if whisper_enabled else 1
+    audio_limit, whisper_limit, audio_enabled, whisper_enabled = effective_retry_settings(engine_id, settings)
     output = Path(output_path)
     candidate_dir = output.parent / "_candidates"
     candidate_dir.mkdir(parents=True, exist_ok=True)
     candidates: list[dict[str, Any]] = []
     final_candidates: list[dict[str, Any]] = []
+    attempt_details: list[dict[str, Any]] = []
     base_seed = _optional_int(settings.get("seed"))
     candidate_no = 0
+    retry_texts = retry_text_variants(engine_id, text, max(1, audio_limit * whisper_limit))
 
     try:
         for whisper_attempt in range(1, whisper_limit + 1):
+            if candidate_no >= len(retry_texts):
+                break
             audio_best: dict[str, Any] | None = None
             for audio_attempt in range(1, audio_limit + 1):
+                if candidate_no >= len(retry_texts):
+                    break
                 candidate_no += 1
                 candidate_path = output if candidate_no == 1 else candidate_dir / f"{output.stem}_try{candidate_no}{output.suffix}"
                 candidate_settings = dict(settings)
                 if base_seed is not None:
                     candidate_settings["seed"] = int(base_seed) if candidate_no == 1 else int(base_seed) + (candidate_no * 10007) + int(segment_id)
 
-                synthesize_once(engine_id, text, str(candidate_path), candidate_settings)
+                synthesize_once(engine_id, retry_texts[candidate_no - 1], str(candidate_path), candidate_settings)
                 qc = audio_qc(candidate_path, subtitle_ms) if audio_enabled else audio_qc_ok(candidate_path)
                 record = {"attempt": candidate_no, "path": candidate_path, "qc": qc}
                 candidates.append(record)
+                attempt_detail = {
+                    "attempt": int(candidate_no),
+                    "audio_attempt": int(audio_attempt),
+                    "speech_attempt": int(whisper_attempt),
+                    "text_variant": retry_variant_label(engine_id, retry_texts[candidate_no - 1]),
+                    "audio_file": candidate_path.name,
+                    "audio_qc_score": int(qc["score"]),
+                    "audio_qc_warnings": list(qc["warnings"]),
+                    "whisper_checked": False,
+                    "whisper_score": None,
+                    "whisper_similarity": None,
+                    "whisper_text": "",
+                    "final_score": int(qc["score"]),
+                    "final_warnings": list(qc["warnings"]),
+                    "selected": False,
+                }
+                record["attempt_detail"] = attempt_detail
+                attempt_details.append(attempt_detail)
                 print(
                     f"{engine_id}: segment {segment_id}, audio proba {audio_attempt}/{audio_limit}, "
                     f"qc={qc['score']}, ostrzezenia={','.join(qc['warnings']) or '-'}"
@@ -151,6 +179,7 @@ def synthesize_with_retry(
             if audio_best is None:
                 continue
             qc = dict(audio_best["qc"])
+            variant_label = retry_variant_label(engine_id, retry_texts[int(audio_best["attempt"]) - 1])
             if whisper_enabled:
                 whisper = whisper_qc(Path(audio_best["path"]), text, settings)
                 qc["score"] = int(qc["score"]) + int(whisper["score"])
@@ -158,15 +187,26 @@ def synthesize_with_retry(
                 qc["whisper_text"] = whisper["text"]
                 qc["whisper_similarity"] = whisper["similarity"]
                 audio_best["qc"] = qc
+                detail = audio_best.get("attempt_detail")
+                if isinstance(detail, dict):
+                    detail["whisper_checked"] = True
+                    detail["whisper_score"] = int(whisper["score"])
+                    detail["whisper_similarity"] = whisper["similarity"]
+                    detail["whisper_text"] = str(whisper["text"])
+                    detail["final_score"] = int(qc["score"])
+                    detail["final_warnings"] = list(qc["warnings"])
             final_candidates.append(audio_best)
             print(
                 f"{engine_id}: segment {segment_id}, mowa proba {whisper_attempt}/{whisper_limit}, "
-                f"qc={qc['score']}, ostrzezenia={','.join(qc['warnings']) or '-'}"
+                f"wariant={variant_label}, qc={qc['score']}, ostrzezenia={','.join(qc['warnings']) or '-'}"
             )
             if int(qc["score"]) == 0:
                 break
 
         best = min(final_candidates or candidates, key=lambda item: int(item["qc"]["score"]))
+        best_detail = best.get("attempt_detail")
+        if isinstance(best_detail, dict):
+            best_detail["selected"] = True
         if Path(best["path"]) != output:
             if output.exists():
                 output.unlink()
@@ -183,6 +223,7 @@ def synthesize_with_retry(
             "qc_warnings": list(best["qc"]["warnings"]),
             "whisper_text": str(best["qc"].get("whisper_text", "")),
             "whisper_similarity": best["qc"].get("whisper_similarity"),
+            "attempt_details": attempt_details,
         }
     finally:
         try:
@@ -197,6 +238,10 @@ def synthesize_once(engine_id: str, text: str, output_path: str, settings: dict[
         synthesize_chatterbox(text, output_path, settings)
     elif engine_id == "omnivoice":
         synthesize_omnivoice(text, output_path, settings)
+    elif engine_id == "piper":
+        synthesize_piper(text, output_path, settings)
+    elif engine_id == "coqui_xtts":
+        synthesize_coqui_xtts(text, output_path, settings)
     else:
         raise RuntimeError(f"Unsupported engine: {engine_id}")
 
@@ -207,6 +252,66 @@ def default_retry_attempts(engine_id: str) -> int:
     if engine_id == "chatterbox":
         return 3
     return 1
+
+
+def effective_retry_settings(engine_id: str, settings: dict[str, Any]) -> tuple[int, int, bool, bool]:
+    audio_enabled = bool_setting(settings.get("audio_qc_enabled"), False)
+    whisper_enabled = bool_setting(settings.get("whisper_qc_enabled"), False)
+    audio_attempts = bounded_int(settings.get("audio_qc_retry_attempts", default_retry_attempts(engine_id)), 1, 5)
+    whisper_attempts = bounded_int(settings.get("whisper_qc_retry_attempts", 1), 1, 5)
+    audio_limit = audio_attempts if audio_enabled else 1
+    whisper_limit = whisper_attempts if whisper_enabled else 1
+    if engine_id in DETERMINISTIC_RETRY_ENGINES:
+        if engine_id in PUNCTUATION_RETRY_ENGINES:
+            return 1, whisper_limit, audio_enabled, whisper_enabled
+        return 1, 1, audio_enabled, whisper_enabled
+    return audio_limit, whisper_limit, audio_enabled, whisper_enabled
+
+
+def effective_retry_limits(engine_id: str, settings: dict[str, Any]) -> tuple[int, int]:
+    audio_limit, whisper_limit, _audio_enabled, _whisper_enabled = effective_retry_settings(engine_id, settings)
+    return audio_limit, whisper_limit
+
+
+def retry_text_for_attempt(engine_id: str, text: str, attempt: int) -> str:
+    variants = retry_text_variants(engine_id, text, max(1, int(attempt)))
+    index = min(max(1, int(attempt)) - 1, len(variants) - 1)
+    return variants[index]
+
+
+def retry_text_variants(engine_id: str, text: str, limit: int) -> list[str]:
+    limit = max(1, int(limit))
+    if engine_id not in PUNCTUATION_RETRY_ENGINES:
+        return [str(text or "") for _ in range(limit)]
+    stripped = str(text or "").strip()
+    if not stripped:
+        return [str(text or "")]
+    base = strip_retry_terminal_punctuation(stripped)
+    if not base:
+        return [stripped]
+    return [stripped, base + ".", base + ",", base + "!", base + "?"][:limit]
+
+
+def strip_retry_terminal_punctuation(text: str) -> str:
+    base = str(text or "").strip()
+    while base and base[-1] in RETRY_TERMINAL_PUNCTUATION:
+        base = base[:-1].rstrip()
+    return base
+
+
+def retry_variant_label(engine_id: str, text: str) -> str:
+    if engine_id not in PUNCTUATION_RETRY_ENGINES:
+        return "oryginal"
+    stripped = str(text or "").strip()
+    if stripped.endswith("."):
+        return "kropka"
+    if stripped.endswith(","):
+        return "przecinek"
+    if stripped.endswith("!"):
+        return "wykrzyknik"
+    if stripped.endswith("?"):
+        return "pytajnik"
+    return "oryginal"
 
 
 def apply_engine_preset(engine_id: str, settings: dict[str, Any]) -> dict[str, Any]:
@@ -230,6 +335,12 @@ def setup_cache(engine_id: str) -> None:
         os.environ["USERPROFILE"] = str(cache_dir)
     if engine_id == "omnivoice":
         os.environ["HF_HOME"] = str(cache_dir)
+    if engine_id == "coqui_xtts":
+        coqui_dir = cache_dir / "coqui"
+        coqui_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["COQUI_TOS_AGREED"] = "1"
+        os.environ["TTS_HOME"] = str(coqui_dir)
+        os.environ["XDG_DATA_HOME"] = str(coqui_dir)
 
 
 def has_local_model_cache() -> bool:
@@ -378,23 +489,26 @@ def whisper_qc(path: Path, expected_text: str, settings: dict[str, Any]) -> dict
 
 
 def transcribe_with_faster_whisper(path: Path, settings: dict[str, Any]) -> str:
+    ensure_faster_whisper_packages_available()
     try:
         from faster_whisper import WhisperModel
     except ModuleNotFoundError as exc:
         if exc.name == "faster_whisper":
-            raise RuntimeError("Whisper QC: brak biblioteki faster-whisper w venv silnika. Przeinstaluj/aktualizuj TTS albo wylacz Whisper QC.") from exc
-        raise
+            raise RuntimeError("Whisper QC: brak silnika STT faster-whisper. Zainstaluj faster-whisper albo wylacz Whisper QC.") from exc
+        raise RuntimeError(f"Whisper QC: brak zaleznosci {exc.name}. Zainstaluj faster-whisper albo wylacz Whisper QC.") from exc
 
     model_name = str(settings.get("whisper_qc_model", "small") or "small").strip() or "small"
     language = str(settings.get("whisper_qc_language", "pl") or "pl").strip() or "pl"
     device = str(settings.get("whisper_qc_device", "cpu") or "cpu").strip() or "cpu"
     compute_type = str(settings.get("whisper_qc_compute_type", "int8") or "int8").strip() or "int8"
-    cache_dir = Path.cwd() / "cache" / "whisper"
+    cache_dir = common_whisper_cache_dir()
     cache_dir.mkdir(parents=True, exist_ok=True)
     key = (model_name, device, compute_type, str(cache_dir))
     model = _WHISPER_MODELS.get(key)
     if model is None:
-        if any(cache_dir.rglob("*")):
+        print(f"whisper qc: sprawdzanie modelu {model_name} na {device}")
+        if has_whisper_model_cache(cache_dir, model_name):
+            print(f"whisper qc: model w cache {model_name}")
             print(f"whisper qc: ladowanie modelu {model_name} na {device}")
         else:
             print(f"whisper qc: pobieranie modelu {model_name} na {device}")
@@ -420,6 +534,63 @@ def text_similarity(expected_text: str, transcript: str) -> float:
     if not expected or not actual:
         return 0.0
     return round(float(SequenceMatcher(None, expected, actual).ratio()), 4)
+
+
+def common_whisper_cache_dir() -> Path:
+    override = str(os.environ.get("LEKTORAI_STT_FASTER_WHISPER_CACHE_DIR", "") or "").strip()
+    if not override:
+        override = str(os.environ.get("LEKTORAI_WHISPER_CACHE_DIR", "") or "").strip()
+    if override:
+        return Path(override)
+    return Path.cwd() / "cache" / "whisper"
+
+
+def ensure_faster_whisper_packages_available() -> None:
+    raw_dirs = str(os.environ.get("LEKTORAI_STT_FASTER_WHISPER_PACKAGES_DIRS", "") or "").strip()
+    package_dirs = [item for item in raw_dirs.split(os.pathsep) if item.strip()]
+    legacy_dir = str(os.environ.get("LEKTORAI_APP_PACKAGES_DIR", "") or "").strip()
+    if legacy_dir:
+        package_dirs.append(legacy_dir)
+    for packages_dir in reversed(package_dirs):
+        packages_path = Path(packages_dir)
+        if not packages_path.is_dir():
+            continue
+        packages_text = str(packages_path)
+        if packages_text not in sys.path:
+            sys.path.insert(0, packages_text)
+
+
+def has_whisper_model_cache(cache_dir: Path, model_name: str) -> bool:
+    if not cache_dir.is_dir():
+        return False
+    candidates = whisper_cache_name_candidates(model_name)
+    for child in cache_dir.iterdir():
+        if not child.is_dir():
+            continue
+        child_name = child.name.lower()
+        if child_name in candidates or any(child_name.endswith(candidate) for candidate in candidates):
+            if any(path.is_file() for path in child.rglob("*")):
+                return True
+    return False
+
+
+def whisper_cache_name_candidates(model_name: str) -> set[str]:
+    model = str(model_name or "").strip().lower().replace("/", "--")
+    aliases = {model}
+    if model == "large":
+        aliases.add("large-v3")
+    if model == "turbo":
+        aliases.add("large-v3-turbo")
+    candidates: set[str] = set()
+    for alias in aliases:
+        candidates.add(f"models--systran--faster-whisper-{alias}")
+        candidates.add(f"models--mobiuslabsgmbh--faster-whisper-{alias}")
+        candidates.add(f"models--openai--whisper-{alias}")
+        candidates.add(f"--faster-whisper-{alias}")
+        candidates.add(f"--whisper-{alias}")
+    if "--" in model:
+        candidates.add(f"models--{model}")
+    return candidates
 
 
 def whisper_similarity_penalty(similarity: float, threshold: float) -> int:
@@ -525,7 +696,9 @@ def synthesize_chatterbox(text: str, output_path: str, settings: dict[str, Any])
     model_key = f"{device}|t3={t3_model}"
     if _CHATTERBOX_MODEL is None or _CHATTERBOX_MODEL_KEY != model_key:
         _patch_chatterbox_watermarker()
+        print(f"chatterbox: sprawdzanie modelu t3={t3_model} na {device}")
         if has_local_model_cache():
+            print(f"chatterbox: model w cache t3={t3_model}")
             print(f"chatterbox: ladowanie modelu t3={t3_model} na {device}")
         else:
             print(f"chatterbox: pobieranie modelu t3={t3_model} na {device}")
@@ -587,7 +760,9 @@ def synthesize_omnivoice(text: str, output_path: str, settings: dict[str, Any]) 
     model_key = f"{model_id}|{device}"
     if _OMNIVOICE_MODEL is None or _OMNIVOICE_MODEL_KEY != model_key:
         dtype = torch.float16 if str(device).startswith("cuda") else torch.float32
+        print(f"omnivoice: sprawdzanie modelu {model_id} na {device}")
         if has_local_model_cache():
+            print(f"omnivoice: model w cache {model_id}")
             print(f"omnivoice: ladowanie modelu {model_id} na {device}")
         else:
             print(f"omnivoice: pobieranie modelu {model_id} na {device}")
@@ -620,6 +795,134 @@ def synthesize_omnivoice(text: str, output_path: str, settings: dict[str, Any]) 
     if bool(settings.get("omnivoice_trim_edges", False)):
         wav_np = trim_omnivoice_silence_edges_np(wav_np, sample_rate)
     sf.write(output_path, wav_np, sample_rate)
+
+
+def synthesize_piper(text: str, output_path: str, settings: dict[str, Any]) -> None:
+    global _PIPER_VOICE, _PIPER_VOICE_KEY
+    if not text.strip():
+        raise RuntimeError("Empty text")
+    from piper import PiperVoice, SynthesisConfig
+    from piper.download_voices import download_voice
+
+    voice_id = str(settings.get("voice", "pl_PL-gosia-medium") or "pl_PL-gosia-medium").strip() or "pl_PL-gosia-medium"
+    models_dir = Path.cwd() / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    model_path = models_dir / f"{voice_id}.onnx"
+    config_path = models_dir / f"{voice_id}.onnx.json"
+    if _PIPER_VOICE is None or _PIPER_VOICE_KEY != voice_id:
+        print(f"piper: sprawdzanie modelu {voice_id}")
+        if not model_path.exists() or not config_path.exists():
+            print(f"piper: pobieranie modelu {voice_id}")
+            download_voice(voice_id, models_dir)
+        else:
+            print(f"piper: model w cache {voice_id}")
+        print(f"piper: ladowanie modelu {voice_id}")
+        _PIPER_VOICE = PiperVoice.load(str(model_path), use_cuda=False)
+        _PIPER_VOICE_KEY = voice_id
+
+    syn_config = SynthesisConfig(
+        speaker_id=bounded_int(settings.get("speaker_id", 0), 0, 999),
+        length_scale=bounded_float(settings.get("length_scale", 1.0), 0.5, 2.0),
+        noise_scale=bounded_float(settings.get("noise_scale", 0.667), 0.0, 1.5),
+        noise_w_scale=bounded_float(settings.get("noise_w_scale", 0.8), 0.0, 1.5),
+    )
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(output), "wb") as wav_file:
+        _PIPER_VOICE.synthesize_wav(text, wav_file, syn_config=syn_config)
+
+
+def synthesize_coqui_xtts(text: str, output_path: str, settings: dict[str, Any]) -> None:
+    global _COQUI_XTTS_MODEL, _COQUI_XTTS_MODEL_KEY
+    if not text.strip():
+        raise RuntimeError("Empty text")
+    os.environ["COQUI_TOS_AGREED"] = "1"
+    from TTS.api import TTS
+
+    device = best_device(str(settings.get("device", "auto")))
+    model_name = "tts_models/multilingual/multi-dataset/xtts_v2"
+    model_key = f"{model_name}|{device}"
+    if _COQUI_XTTS_MODEL is None or _COQUI_XTTS_MODEL_KEY != model_key:
+        print(f"coqui_xtts: sprawdzanie modelu XTTS-v2 na {device}")
+        if has_local_model_cache():
+            print("coqui_xtts: model w cache XTTS-v2")
+            print(f"coqui_xtts: ladowanie modelu XTTS-v2 na {device}")
+        else:
+            print(f"coqui_xtts: pobieranie modelu XTTS-v2 na {device}")
+        _COQUI_XTTS_MODEL = TTS(model_name=model_name, progress_bar=True).to(device)
+        _COQUI_XTTS_MODEL_KEY = model_key
+
+    speaker_wav = str(settings.get("speaker_wav_path", "") or "").strip()
+    speaker = str(settings.get("speaker", "Anna") or "Anna").strip() or "Anna"
+    speed_key = "voice_sample_speed" if speaker_wav else "builtin_voice_speed"
+    speed_default = 1.3 if speaker_wav else 1.6
+    speed_value = settings.get(speed_key, settings.get("speed", speed_default))
+    kwargs = {
+        "text": text,
+        "language": "pl",
+        "file_path": str(output_path),
+        "split_sentences": False,
+        "temperature": bounded_float(settings.get("temperature", 0.1), 0.05, 1.5),
+        "length_penalty": bounded_float(settings.get("length_penalty", 1.0), 0.0, 2.0),
+        "repetition_penalty": bounded_float(settings.get("repetition_penalty", 9.0), 1.0, 12.0),
+        "top_k": bounded_int(settings.get("top_k", 100), 0, 100),
+        "top_p": bounded_float(settings.get("top_p", 1.0), 0.05, 1.0),
+        "speed": bounded_float(speed_value, 0.5, 2.0),
+    }
+    if speaker_wav:
+        if not Path(speaker_wav).is_file():
+            raise RuntimeError(f"Missing Coqui XTTS voice sample: {speaker_wav}")
+        kwargs["speaker_wav"] = speaker_wav
+    else:
+        kwargs["speaker"] = speaker
+    _COQUI_XTTS_MODEL.tts_to_file(**kwargs)
+    if bool(settings.get("xtts_trim_trailing_silence", True)):
+        import soundfile as sf
+
+        wav, sample_rate = sf.read(str(output_path), dtype="float32", always_2d=False)
+        trimmed = trim_xtts_trailing_silence_np(wav, int(sample_rate))
+        sf.write(str(output_path), trimmed, int(sample_rate))
+
+
+def trim_xtts_trailing_silence_np(wav, sample_rate: int):
+    import numpy as np
+
+    data = np.asarray(wav, dtype=np.float32)
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    data = data.reshape(-1)
+    if data.size <= 0 or sample_rate <= 0:
+        return data
+
+    frame_ms = 20
+    frame_size = max(1, int(round(sample_rate * frame_ms / 1000.0)))
+    frame_count = data.size // frame_size
+    if frame_count < 8:
+        return data
+
+    frames = data[: frame_count * frame_size].reshape(frame_count, frame_size)
+    rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
+    db = 20.0 * np.log10(rms + 1e-9)
+    threshold = -50.0
+    active = (db >= threshold).astype(np.int32)
+    smooth = np.convolve(active, np.ones(3, dtype=np.int32), mode="same") >= 2
+    indexes = np.where(smooth)[0]
+    if indexes.size <= 0:
+        return data
+
+    post_pad_ms = 120
+    end = min(data.size, int(round(((int(indexes[-1]) + 1) * frame_ms + post_pad_ms) * sample_rate / 1000.0)))
+    if end >= data.size - frame_size:
+        return data
+    if end < int(round(sample_rate * 0.25)):
+        return data
+
+    trimmed = np.array(data[:end], dtype=np.float32, copy=True)
+    fade_ms = 12
+    fade = min(max(0, int(round(sample_rate * fade_ms / 1000.0))), trimmed.size // 2)
+    if fade > 1:
+        trimmed[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+    return trimmed
 
 
 def trim_omnivoice_silence_edges_np(wav, sample_rate: int):

@@ -28,6 +28,7 @@ from app.core.media_tools import (
     find_mkvmerge,
     find_ffprobe,
     is_video_file,
+    probe_media_duration,
     sanitize_aac_bitrate,
     sanitize_audio_weight,
     sanitize_lektor_delay_ms,
@@ -39,6 +40,10 @@ from app.engines.config_validation import validate_engine_config
 from app.engines.manager import EngineManager
 from app.engines.schemas import EngineKind, EngineState
 from app.engines.status import format_engine_state
+from app.engines.voice_sample_rules import (
+    validate_voice_sample_duration,
+    voice_sample_rule,
+)
 from app.pipeline.subtitles import SUPPORTED_SUBTITLE_EXTENSIONS
 from app.pipeline.progress import (
     FILE_PROGRESS_TOTAL,
@@ -48,8 +53,10 @@ from app.pipeline.progress import (
     safe_unit_eta_seconds,
 )
 from app.pipeline.tts_job import run_tts_job
+from app.pipeline.workspace import engine_short_code
 from app.ui.dialogs.diagnostics_dialog import show_diagnostics
 from app.ui.dialogs.dictionary_dialog import edit_dictionary
+from app.ui.dialogs.log_cleanup_dialog import show_log_cleanup
 from app.ui.dialogs.scrollable_text_dialog import confirm_scrollable_text, show_scrollable_text
 from app.ui.dialogs.settings_dialog import edit_engine_settings
 from app.ui.dialogs.tts_manager_dialog import TTSManagerDialog
@@ -114,9 +121,13 @@ def bool_config_value(value, default: bool = False) -> bool:
 
 
 def engine_combo_label(group_name: str, state: EngineState) -> str:
+    engine_name = f"{state.definition.display_name} [{engine_short_code(state.definition.engine_id)}]"
     if state.definition.kind == EngineKind.INTERNET:
-        return f"{group_name}: {state.definition.display_name}"
-    return f"{group_name}: {format_engine_state(state)}"
+        return f"{group_name}: {engine_name}"
+    text = f"{engine_name} - {state.status.value}"
+    if state.reason:
+        text += f" ({state.reason})"
+    return f"{group_name}: {text}"
 
 
 def aac_quality_options() -> tuple[str, ...]:
@@ -448,6 +459,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_tts_manager.clicked.connect(self.open_tts_manager)
         self.btn_diagnostics = QtWidgets.QPushButton("Diagnostyka")
         self.btn_diagnostics.clicked.connect(self.open_diagnostics)
+        self.btn_log_cleanup = QtWidgets.QPushButton("Czyszczenie logow")
+        self.btn_log_cleanup.clicked.connect(self.open_log_cleanup)
         self.btn_open_output = QtWidgets.QPushButton("Otworz wynik")
         self.btn_open_output.setEnabled(False)
         self.btn_open_output.clicked.connect(self.open_last_output)
@@ -555,6 +568,7 @@ class MainWindow(QtWidgets.QMainWindow):
         middle.addWidget(self.btn_dictionary)
         middle.addWidget(self.btn_tts_manager)
         middle.addWidget(self.btn_diagnostics)
+        middle.addWidget(self.btn_log_cleanup)
         middle.addWidget(self.btn_open_output)
         middle.addWidget(self.lektor_lufs_row)
         middle.addWidget(self.lektor_weight_row)
@@ -815,6 +829,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def open_diagnostics(self) -> None:
         show_diagnostics(self, self.paths, self.engine_manager)
 
+    def open_log_cleanup(self) -> None:
+        show_log_cleanup(self, self.paths, self.log_path)
+
     def start_job(self) -> None:
         engine_id = self.selected_engine_id()
         if not engine_id:
@@ -889,7 +906,28 @@ class MainWindow(QtWidgets.QMainWindow):
                 config = {}
         except Exception:
             config = {}
-        return validate_engine_config(engine_id, config)
+        errors = validate_engine_config(engine_id, config)
+        errors.extend(self.validate_selected_voice_sample_duration(engine_id, config))
+        return errors
+
+    def validate_selected_voice_sample_duration(self, engine_id: str, config: dict) -> list[str]:
+        rule = voice_sample_rule(engine_id)
+        if rule is None:
+            return []
+        value = str(config.get(rule.config_key, "") or "").strip()
+        if not value:
+            return []
+        path = Path(value)
+        if not path.is_file():
+            return []
+        ffprobe = find_ffprobe(self.paths)
+        if ffprobe is None:
+            return [f"{rule.label}: nie moge sprawdzic dlugosci probki glosu, bo brakuje ffprobe. {BINARY_LOOKUP_HINT}"]
+        try:
+            duration_seconds = probe_media_duration(ffprobe, path)
+        except Exception:
+            return [f"{rule.label}: nie mozna odczytac dlugosci pliku audio. Uzyj poprawnego WAV/MP3/FLAC."]
+        return validate_voice_sample_duration(engine_id, duration_seconds)
 
     def validate_queue_files(self, files: list[Path]) -> list[str]:
         errors: list[str] = []
@@ -989,6 +1027,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_settings.setEnabled(actions_enabled)
         self.btn_dictionary.setEnabled(actions_enabled)
         self.btn_tts_manager.setEnabled(enabled)
+        self.btn_log_cleanup.setEnabled(enabled)
         self.aac_quality_combo.setEnabled(enabled)
         self.create_stereo_for_surround_checkbox.setEnabled(enabled)
         self.lektor_lufs_slider.setEnabled(enabled)
@@ -1011,6 +1050,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return False
             diagnostic_keys = (
                 "save_processed_subtitles",
+                "save_quality_report",
                 "save_run_reports",
                 "save_lektor_segments",
                 "save_lektor_track_before_normalization",

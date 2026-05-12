@@ -19,6 +19,7 @@ from app.engines.config_schema import ConfigField, fields_for
 from app.engines.install_specs import get_install_spec
 from app.engines.registry import get_engine_definitions
 from app.engines.schemas import EngineDefinition, EngineKind, EngineState, EngineStatus
+from app.stt.faster_whisper_runtime import faster_whisper_worker_env
 
 
 ProgressFn = Callable[[str], None]
@@ -167,10 +168,17 @@ class EngineManager:
             f"Silnik: {definition.display_name}",
             f"Folder silnika: {engine_dir}",
             f"Venv: {engine_dir / 'venv'}",
-            "PyTorch CUDA:",
-            f"  --index-url {spec.torch_index_url}",
         ]
-        lines.extend(f"  {requirement}" for requirement in spec.torch_requirements)
+        if spec.torch_requirements:
+            lines.extend(
+                [
+                    "PyTorch CUDA:",
+                    f"  --index-url {spec.torch_index_url}",
+                ]
+            )
+            lines.extend(f"  {requirement}" for requirement in spec.torch_requirements)
+        else:
+            lines.append("PyTorch: nie wymagany przez ten silnik")
         lines.extend(
             [
             f"Requirements: {engine_dir / 'requirements.txt'}",
@@ -228,12 +236,16 @@ class EngineManager:
                 self._build_tools_install_command(venv_python),
                 log,
             )
-            self._emit(progress, f"TTS {engine_id}: instalacja PyTorch")
-            self._run_logged_step(
-                "Instalacja PyTorch CUDA",
-                self._torch_install_command(venv_python, spec, constraints_path),
-                log,
-            )
+            if spec.torch_requirements:
+                self._emit(progress, f"TTS {engine_id}: instalacja PyTorch")
+                self._run_logged_step(
+                    "Instalacja PyTorch CUDA",
+                    self._torch_install_command(venv_python, spec, constraints_path),
+                    log,
+                )
+            else:
+                self._emit(progress, f"TTS {engine_id}: PyTorch nie jest wymagany")
+                log.write("Instalacja PyTorch CUDA: pominieto, silnik nie wymaga PyTorch.\n\n")
             self._emit(progress, f"TTS {engine_id}: instalacja pakietow TTS")
             self._run_logged_step(
                 "Instalacja pakietow TTS",
@@ -706,9 +718,7 @@ class EngineManager:
 
     def _worker_env(self) -> dict[str, str]:
         env = dict(os.environ)
-        packages = str(self.paths.app_packages_dir)
-        current = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = os.pathsep.join(part for part in (packages, current) if part)
+        env.update(faster_whisper_worker_env(self.paths))
         return env
 
     def _run_import_checks(self, definition: EngineDefinition, python_path: Path, log) -> None:
@@ -741,7 +751,16 @@ class EngineManager:
             "        print(f'IMPORT MISSING {name}')\n"
             "        missing.append(name)\n"
             "        continue\n"
-            "    module=importlib.import_module(name)\n"
+            "    try:\n"
+            "        module=importlib.import_module(name)\n"
+            "    except ModuleNotFoundError as exc:\n"
+            "        print(f'IMPORT MISSING {name} -> {exc.name}')\n"
+            "        missing.append(name)\n"
+            "        continue\n"
+            "    except Exception as exc:\n"
+            "        print(f'IMPORT ERROR {name} {type(exc).__name__}: {exc}')\n"
+            "        missing.append(name)\n"
+            "        continue\n"
             "    origin=getattr(module, '__file__', None) or getattr(spec, 'origin', '') or 'built-in'\n"
             "    print(f'IMPORT OK {name} {origin}')\n"
             "sys.exit(1 if missing else 0)"
