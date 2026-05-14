@@ -5,7 +5,7 @@ W tym pliku beda zapisywane publiczne zmiany miedzy kolejnymi wersjami LektorAI 
 ## v1.2
 
 - Dodano aktualizator aplikacji.
-- Dodano kompatybilność z nowymi kartami dla Chatterbox i Coqui XTTS-v2.
+- Dodano kompatybilność z nowymi kartami (RTX 5xxx) dla Chatterbox i Coqui XTTS-v2.
 
 ## v1.1
 
