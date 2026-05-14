@@ -16,7 +16,7 @@ from app.core.dictionary import sanitize_dictionary
 from app.core.logging import broken_json_backup_path
 from app.core.paths import AppPaths
 from app.engines.config_schema import ConfigField, fields_for
-from app.engines.install_specs import get_install_spec
+from app.engines.install_specs import get_install_spec, list_install_variants
 from app.engines.registry import get_engine_definitions
 from app.engines.schemas import EngineDefinition, EngineKind, EngineState, EngineStatus
 from app.stt.faster_whisper_runtime import faster_whisper_worker_env
@@ -158,17 +158,31 @@ class EngineManager:
         keep_names = {"config.json", "dictionary.json"}
         return any(child.name not in keep_names for child in engine_dir.iterdir())
 
-    def local_install_preview(self, engine_id: str) -> list[str]:
+    def local_install_variants(self, engine_id: str):
+        definition = self.definitions[engine_id]
+        if definition.kind != EngineKind.LOCAL:
+            return ()
+        return list_install_variants(engine_id)
+
+    def local_install_preview(self, engine_id: str, torch_variant: str | None = None) -> list[str]:
         definition = self.definitions[engine_id]
         if definition.kind != EngineKind.LOCAL:
             raise ValueError("Podglad instalacji dotyczy tylko lokalnych silnikow TTS.")
-        spec = get_install_spec(engine_id)
+        spec = get_install_spec(engine_id, torch_variant)
+        selected_variant = next((variant for variant in list_install_variants(engine_id) if variant.variant_id == torch_variant), None)
         engine_dir = self.paths.engine_dir(engine_id)
         lines = [
             f"Silnik: {definition.display_name}",
             f"Folder silnika: {engine_dir}",
             f"Venv: {engine_dir / 'venv'}",
         ]
+        if selected_variant is not None:
+            lines.extend(
+                [
+                    f"Wariant: {selected_variant.label}",
+                    selected_variant.description,
+                ]
+            )
         if spec.torch_requirements:
             lines.extend(
                 [
@@ -200,12 +214,13 @@ class EngineManager:
             lines.extend(f"  {name}" for name in spec.import_checks)
         return lines
 
-    def install_local_engine(self, engine_id: str, progress: ProgressFn | None = None) -> Path:
+    def install_local_engine(self, engine_id: str, progress: ProgressFn | None = None, torch_variant: str | None = None) -> Path:
         definition = self.definitions[engine_id]
         if definition.kind != EngineKind.LOCAL:
             raise ValueError("Instalacja dotyczy tylko lokalnych silnikow TTS.")
 
-        spec = get_install_spec(engine_id)
+        spec = get_install_spec(engine_id, torch_variant)
+        selected_variant = next((variant for variant in list_install_variants(engine_id) if variant.variant_id == torch_variant), None)
         engine_dir = self.paths.engine_dir(engine_id)
         engine_dir.mkdir(parents=True, exist_ok=True)
 
@@ -225,6 +240,8 @@ class EngineManager:
         self._emit(progress, f"TTS {engine_id}: instalacja rozpoczeta")
         with install_log.open("w", encoding="utf-8") as log:
             log.write(f"Engine: {engine_id}\n")
+            if selected_variant is not None:
+                log.write(f"PyTorch variant: {selected_variant.variant_id} - {selected_variant.label}\n")
             log.write(f"Python: {sys.executable}\n")
             log.write(f"Venv: {venv_dir}\n\n")
             self._emit(progress, f"TTS {engine_id}: przygotowanie venv")
@@ -718,6 +735,8 @@ class EngineManager:
 
     def _worker_env(self) -> dict[str, str]:
         env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
         env.update(faster_whisper_worker_env(self.paths))
         return env
 

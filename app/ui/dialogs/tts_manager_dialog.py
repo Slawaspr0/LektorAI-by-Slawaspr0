@@ -25,14 +25,15 @@ class InstallWorker(QtCore.QThread):
     failed = QtCore.pyqtSignal(str)
     finished_ok = QtCore.pyqtSignal(str)
 
-    def __init__(self, manager: EngineManager, engine_id: str) -> None:
+    def __init__(self, manager: EngineManager, engine_id: str, torch_variant: str | None = None) -> None:
         super().__init__()
         self.manager = manager
         self.engine_id = engine_id
+        self.torch_variant = torch_variant
 
     def run(self) -> None:
         try:
-            self.manager.install_local_engine(self.engine_id, self.message.emit)
+            self.manager.install_local_engine(self.engine_id, self.message.emit, torch_variant=self.torch_variant)
             self.finished_ok.emit(f"TTS {self.engine_id}: gotowy")
         except Exception as exc:
             self.failed.emit(f"TTS {self.engine_id}: BLAD instalacji: {exc}")
@@ -79,8 +80,6 @@ class TTSManagerDialog(QtWidgets.QDialog):
         self.btn_install.clicked.connect(self.prepare_selected)
         self.btn_preview = QtWidgets.QPushButton("Wymagania")
         self.btn_preview.clicked.connect(self.show_install_preview)
-        self.btn_worker = QtWidgets.QPushButton("Aktualizuj worker")
-        self.btn_worker.clicked.connect(self.update_worker)
         self.btn_keep = QtWidgets.QPushButton("Usun model TTS, zostaw ustawienia")
         self.btn_keep.clicked.connect(self.remove_keep_settings)
         self.btn_remove = QtWidgets.QPushButton("Usun calkowicie")
@@ -89,7 +88,6 @@ class TTSManagerDialog(QtWidgets.QDialog):
         self.btn_refresh.clicked.connect(self.refresh)
         actions.addWidget(self.btn_install)
         actions.addWidget(self.btn_preview)
-        actions.addWidget(self.btn_worker)
         actions.addWidget(self.btn_keep)
         actions.addWidget(self.btn_remove)
         actions.addStretch(1)
@@ -150,12 +148,10 @@ class TTSManagerDialog(QtWidgets.QDialog):
         is_local = bool(state and state.definition.kind == EngineKind.LOCAL)
         busy = self.install_worker is not None
         has_engine_dir = bool(state and self.manager.engine_dir_exists(state.definition.engine_id))
-        has_runtime = bool(state and self.manager.local_runtime_exists(state.definition.engine_id))
         has_removable_payload = bool(state and self.manager.removable_payload_exists(state.definition.engine_id))
         self.btn_install.setText(self._install_button_text(state))
         self.btn_install.setEnabled(is_local and not busy)
         self.btn_preview.setEnabled(is_local and not busy)
-        self.btn_worker.setEnabled(is_local and has_runtime and not busy)
         self.btn_keep.setEnabled(should_enable_keep_settings_remove(is_local, has_removable_payload, busy))
         self.btn_remove.setEnabled(is_local and has_engine_dir and not busy)
         self.btn_refresh.setEnabled(not busy)
@@ -169,42 +165,112 @@ class TTSManagerDialog(QtWidgets.QDialog):
             return "Przeinstaluj / aktualizuj"
         return initial_install_button_label()
 
-    def update_worker(self) -> None:
-        state = self.selected_state()
-        if not state:
-            return
-        self.manager.install_worker_script(state.definition.engine_id)
-        self.message.emit(f"TTS {state.definition.engine_id}: zaktualizowano worker")
-        self.refresh()
-        self.changed.emit()
-
     def show_install_preview(self) -> None:
         state = self.selected_state()
         if not state:
             return
-        text = "\n".join(self.manager.local_install_preview(state.definition.engine_id))
+        variants = self.manager.local_install_variants(state.definition.engine_id)
+        if variants:
+            sections: list[str] = []
+            for idx, variant in enumerate(variants, start=1):
+                details = "\n".join(self.manager.local_install_preview(state.definition.engine_id, torch_variant=variant.variant_id))
+                sections.append(
+                    "\n".join(
+                        [
+                            f"WARIANT {idx}: {variant.label}",
+                            variant.description,
+                            "-" * 72,
+                            details,
+                        ]
+                    )
+                )
+            text = ("\n\n" + "=" * 72 + "\n\n").join(sections)
+        else:
+            text = "\n".join(self.manager.local_install_preview(state.definition.engine_id))
         show_scrollable_text(self, "Wymagania TTS", "Plan instalacji lokalnego silnika TTS:", text)
 
     def prepare_selected(self) -> None:
         state = self.selected_state()
         if not state:
             return
-        plan = "\n".join(self.manager.local_install_preview(state.definition.engine_id))
+        selected_variant = self.choose_torch_variant(state)
+        if selected_variant is None and self.manager.local_install_variants(state.definition.engine_id):
+            return
+        plan = "\n".join(self.manager.local_install_preview(state.definition.engine_id, torch_variant=selected_variant))
+        reinstall_runtime = bool(self.manager.local_runtime_exists(state.definition.engine_id) and self.manager.local_install_variants(state.definition.engine_id))
+        prompt = "Rozpoczac instalacje lokalnego TTS? To moze potrwac dlugo i pobrac duzo danych."
+        if reinstall_runtime:
+            prompt = (
+                "Przeinstalowac lokalny TTS? Program utworzy czyste srodowisko dla wybranego wariantu PyTorch, "
+                "zostawiajac Twoje ustawienia i slownik."
+            )
         reply = confirm_scrollable_text(
             self,
             "Instalacja TTS",
-            "Rozpoczac instalacje lokalnego TTS? To moze potrwac dlugo i pobrac duzo danych.",
+            prompt,
             plan,
         )
         if not reply:
             return
-        self.install_worker = InstallWorker(self.manager, state.definition.engine_id)
+        if reinstall_runtime:
+            try:
+                self.manager.remove_engine_keep_user_settings(state.definition.engine_id)
+                self.message.emit(f"TTS {state.definition.engine_id}: usunieto stare srodowisko, ustawienia zostaja")
+            except EngineRemovalError as exc:
+                self.status_label.setText(str(exc))
+                self.message.emit(f"TTS {state.definition.engine_id}: BLAD przygotowania reinstalacji - {exc}")
+                QtWidgets.QMessageBox.warning(self, "Nie mozna przeinstalowac TTS", str(exc))
+                self.refresh()
+                return
+        self.install_worker = InstallWorker(self.manager, state.definition.engine_id, torch_variant=selected_variant)
         self.status_label.setText(f"TTS {state.definition.engine_id}: instalacja rozpoczeta")
         self.install_worker.message.connect(self._install_message)
         self.install_worker.failed.connect(self._install_failed)
         self.install_worker.finished_ok.connect(self._install_finished)
         self._sync_buttons()
         self.install_worker.start()
+
+    def choose_torch_variant(self, state: EngineState) -> str | None:
+        variants = self.manager.local_install_variants(state.definition.engine_id)
+        if not variants:
+            return None
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Wybierz PyTorch")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        label = QtWidgets.QLabel("Wybierz wariant PyTorch dla tego silnika TTS:")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        group = QtWidgets.QButtonGroup(dialog)
+        buttons: list[QtWidgets.QRadioButton] = []
+        for idx, variant in enumerate(variants):
+            button = QtWidgets.QRadioButton(f"{variant.label}\n{variant.description}")
+            button.setChecked(idx == 0)
+            button.setProperty("variant_id", variant.variant_id)
+            button.setMinimumHeight(44)
+            group.addButton(button)
+            buttons.append(button)
+            layout.addWidget(button)
+
+        actions = QtWidgets.QHBoxLayout()
+        actions.addStretch(1)
+        cancel_btn = QtWidgets.QPushButton("Anuluj")
+        ok_btn = QtWidgets.QPushButton("Dalej")
+        cancel_btn.clicked.connect(dialog.reject)
+        ok_btn.clicked.connect(dialog.accept)
+        actions.addWidget(cancel_btn)
+        actions.addWidget(ok_btn)
+        layout.addLayout(actions)
+
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return None
+        selected = group.checkedButton()
+        if selected is None:
+            return variants[0].variant_id
+        return str(selected.property("variant_id") or variants[0].variant_id)
 
     def remove_keep_settings(self) -> None:
         state = self.selected_state()

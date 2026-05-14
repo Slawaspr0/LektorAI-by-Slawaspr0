@@ -2,6 +2,11 @@
 
 W tym pliku beda zapisywane publiczne zmiany miedzy kolejnymi wersjami LektorAI by Slawaspr0.
 
+## v1.2
+
+- Dodano aktualizator aplikacji.
+- Dodano kompatybilność z nowymi kartami dla Chatterbox i Coqui XTTS-v2.
+
 ## v1.1
 
 - Dodano obsługę nowych modeli TTS: Piper oraz Coqui XTTS-v2.

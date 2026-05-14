@@ -2,7 +2,7 @@
 
 ![LektorAI by Slawaspr0](lektorAI_screen.jpg)
 
-**Wersja: v1.1**
+**Wersja: v1.2**
 
 LektorAI by Slawaspr0 to aplikacja do tworzenia polskiej ścieżki lektorskiej dla filmów i seriali. Program korzysta z wybranego silnika TTS, generuje głos lektora na podstawie napisów, składa go w jedną ścieżkę audio, miksuje z oryginalnym tłem filmu i dodaje do wynikowego pliku MKV.
 

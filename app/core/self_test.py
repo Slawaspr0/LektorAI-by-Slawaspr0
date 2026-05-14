@@ -56,7 +56,7 @@ from app.engines.voice_sample_rules import (
     voice_sample_duration_help,
     voice_sample_rule,
 )
-from app.engines.install_specs import INSTALL_SPECS, TORCH_CU126_INDEX, TORCH_CU128_INDEX, get_install_spec
+from app.engines.install_specs import INSTALL_SPECS, TORCH_CU126_INDEX, TORCH_CU128_INDEX, get_install_spec, list_install_variants
 from app.engines.manager import EngineManager
 from app.engines.protocol import (
     EngineRequest,
@@ -98,6 +98,14 @@ from app.pipeline.whisper_qc import (
 from app.stt.faster_whisper_runtime import (
     faster_whisper_package_dirs,
     faster_whisper_worker_env,
+)
+from app.updater.core import (
+    SOURCE_ZIP_URL,
+    check_for_updates,
+    is_protected_update_path,
+    is_update_available,
+    safe_relative_path,
+    update_info_from_dict,
 )
 from app.pipeline.tts_job import (
     _build_local_engine_request,
@@ -146,6 +154,7 @@ from app.ui.main_window import (
     should_enable_engine_actions,
     should_enable_start_button,
     stored_engine_after_selection,
+    worker_message_should_refresh_engine_status,
     main_window_minimum_size,
     main_window_refresh_keeps_engine_signals_blocked,
     slider_value_to_weight,
@@ -189,6 +198,36 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(getattr(start_module, "APP_VERSION", None) == APP_VERSION, "START.py APP_VERSION mismatch")
     _assert(hasattr(start_module, "APP_PACKAGES_DIR"), "START.py should expose portable app packages dir")
     messages.append("version sync: OK")
+
+    update_json = app_dir / "update.json"
+    _assert(update_json.is_file(), "update.json missing")
+    local_update = update_info_from_dict(json.loads(update_json.read_text(encoding="utf-8")))
+    _assert(local_update.app_name == APP_NAME, "update metadata app name mismatch")
+    _assert(local_update.version == APP_VERSION, "update metadata version mismatch")
+    _assert(local_update.zip_url == SOURCE_ZIP_URL, "update metadata zip URL mismatch")
+    newer_update = update_info_from_dict({"version": APP_VERSION, "build_id": "9999.01.01.1", "zip_url": SOURCE_ZIP_URL})
+    _assert(is_update_available(local_update, newer_update), "updater should detect newer build with same app version")
+    same_update = update_info_from_dict(json.loads(update_json.read_text(encoding="utf-8")))
+    _assert(not is_update_available(local_update, same_update), "updater should not flag identical metadata")
+    _assert(safe_relative_path("app/core/version.py") == Path("app/core/version.py"), "updater safe path mismatch")
+    _assert(safe_relative_path("../config.json") is None, "updater should reject parent traversal")
+    _assert(is_protected_update_path(Path("logs/app.log")), "updater should protect logs")
+    _assert(is_protected_update_path(Path("config.json")), "updater should protect config")
+    _assert(not is_protected_update_path(Path("app/core/version.py")), "updater should allow app code updates")
+    remote_update_probe = app_dir / "_self_test_update_remote.json"
+    try:
+        remote_update_probe.write_text(
+            json.dumps({"version": APP_VERSION, "build_id": "9999.01.01.1", "zip_url": SOURCE_ZIP_URL}, indent=2),
+            encoding="utf-8",
+        )
+        check_result = check_for_updates(app_dir, info_url=remote_update_probe.as_uri())
+        _assert(check_result.ok and check_result.update_available, "updater local probe should detect available update")
+    finally:
+        try:
+            remote_update_probe.unlink()
+        except OSError:
+            pass
+    messages.append("updater metadata: OK")
 
     version_result = subprocess.run(
         [sys.executable, "-B", str(app_dir / "START.py"), "--version"],
@@ -250,6 +289,11 @@ def run_self_test(app_dir: Path) -> list[str]:
                 ["--engine-install-plan", "chatterbox"],
                 ("Silnik: Chatterbox", "Venv:", "Pakiety:"),
                 "START.py --engine-install-plan chatterbox",
+            ),
+            (
+                ["--engine-install-plan", "chatterbox", "--torch-cuda", "cu128"],
+                ("Silnik: Chatterbox", "PyTorch CU128", TORCH_CU128_INDEX),
+                "START.py --engine-install-plan chatterbox --torch-cuda cu128",
             ),
         ]
         for args, expected_parts, label in cli_commands:
@@ -457,7 +501,7 @@ def run_self_test(app_dir: Path) -> list[str]:
     sibling_test_dir = app_dir.parent / "TEST"
     sibling_final_dir = app_dir.parent / "FINAL"
     if sibling_test_dir.is_dir() and sibling_final_dir.is_dir():
-        shared_files = ("START.py", "requirements.txt")
+        shared_files = ("START.py", "UPDATER.py", "update.json", "requirements.txt")
         mismatches = [
             name
             for name in shared_files
@@ -505,6 +549,8 @@ def run_self_test(app_dir: Path) -> list[str]:
     if app_dir.name.upper() == "FINAL":
         allowed_final_items = {
             "START.py",
+            "UPDATER.py",
+            "update.json",
             "requirements.txt",
             "README.md",
             "LICENSE",
@@ -557,6 +603,8 @@ def run_self_test(app_dir: Path) -> list[str]:
     elif app_dir.name.upper() == "TEST":
         allowed_test_items = {
             "START.py",
+            "UPDATER.py",
+            "update.json",
             "requirements.txt",
             "config.json",
             "app",
@@ -620,12 +668,26 @@ def run_self_test(app_dir: Path) -> list[str]:
     )
     _assert("chatterbox-tts" not in local_specs["chatterbox"].no_deps_requirements, "chatterbox should install original deps")
     _assert(not local_specs["chatterbox"].allowed_pip_check_prefixes, "chatterbox should not tolerate dependency conflicts in original env")
+    chatterbox_variants = {variant.variant_id: variant for variant in list_install_variants("chatterbox")}
+    _assert(set(chatterbox_variants) == {"cu126", "cu128"}, "chatterbox should expose CU126/CU128 install variants")
+    _assert(chatterbox_variants["cu126"].spec is local_specs["chatterbox"], "chatterbox CU126 variant should use default spec")
+    _assert(chatterbox_variants["cu128"].spec.torch_index_url == TORCH_CU128_INDEX, "chatterbox CU128 variant should use CU128 torch index")
+    _assert(chatterbox_variants["cu128"].spec.torch_requirements == ("torch==2.8.0+cu128", "torchaudio==2.8.0+cu128"), "chatterbox CU128 variant should use torch 2.8 CU128")
+    _assert(chatterbox_variants["cu128"].spec.no_deps_requirements, "chatterbox CU128 variant should install upstream package without deps")
+    _assert(chatterbox_variants["cu128"].spec.allowed_pip_check_prefixes, "chatterbox CU128 variant should tolerate known torch metadata conflicts")
     _assert(local_specs["omnivoice"].torch_requirements == ("torch==2.8.0+cu128", "torchaudio==2.8.0+cu128"), "omnivoice should use its upstream torch pair")
     _assert(local_specs["omnivoice"].torch_index_url == TORCH_CU128_INDEX, "omnivoice torch index mismatch")
     _assert("omnivoice==0.1.5" in local_specs["omnivoice"].requirements, "omnivoice should install pinned PyPI release")
     _assert("piper-tts==1.4.2" in local_specs["piper"].requirements, "piper should install pinned upstream PyPI release")
     _assert(local_specs["coqui_xtts"].torch_requirements == ("torch==2.8.0+cu126", "torchaudio==2.8.0+cu126"), "coqui XTTS should use a CUDA 12.6 torch pair")
     _assert(local_specs["coqui_xtts"].torch_index_url == TORCH_CU126_INDEX, "coqui XTTS torch index mismatch")
+    coqui_variants = {variant.variant_id: variant for variant in list_install_variants("coqui_xtts")}
+    _assert(set(coqui_variants) == {"cu126", "cu128"}, "coqui XTTS should expose CU126/CU128 install variants")
+    _assert(coqui_variants["cu126"].spec is local_specs["coqui_xtts"], "coqui XTTS CU126 variant should use default spec")
+    _assert(coqui_variants["cu128"].spec.torch_index_url == TORCH_CU128_INDEX, "coqui XTTS CU128 variant should use CU128 torch index")
+    _assert(coqui_variants["cu128"].spec.torch_requirements == ("torch==2.8.0+cu128", "torchaudio==2.8.0+cu128"), "coqui XTTS CU128 variant should use torch 2.8 CU128")
+    _assert(not list_install_variants("omnivoice"), "omnivoice already uses CU128 and should not show torch variants")
+    _assert(not list_install_variants("piper"), "piper should not show torch variants")
     _assert(
         any("coqui-tts" in requirement and "github.com/idiap/coqui-ai-TTS" in requirement for requirement in local_specs["coqui_xtts"].requirements),
         "coqui XTTS should install current upstream repo",
@@ -645,6 +707,7 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(any(state.definition.engine_id == "omnivoice" for state in states), "missing omnivoice definition")
     _assert(any(state.definition.engine_id == "piper" for state in states), "missing piper definition")
     _assert(any(state.definition.engine_id == "coqui_xtts" for state in states), "missing coqui XTTS definition")
+    _assert("f5_tts" not in engine_ids, "archived F5-TTS should not be listed as active engine")
     for state in states:
         if state.definition.engine_id in {"chatterbox", "omnivoice", "piper", "coqui_xtts"}:
             install_checks = set(get_install_spec(state.definition.engine_id).import_checks)
@@ -725,6 +788,22 @@ def run_self_test(app_dir: Path) -> list[str]:
                 engine_dir / "constraints.txt",
             )
             _assert("-c" in torch_command and str(engine_dir / "constraints.txt") in torch_command, f"torch install command missing constraints for {engine_id}")
+        for engine_id in ("chatterbox", "coqui_xtts"):
+            cu128_preview = "\n".join(install_preview_manager.local_install_preview(engine_id, torch_variant="cu128"))
+            _assert("PyTorch CU128" in cu128_preview, f"{engine_id} CU128 preview missing variant label")
+            _assert(TORCH_CU128_INDEX in cu128_preview, f"{engine_id} CU128 preview missing torch index")
+            _assert("+cu128" in cu128_preview, f"{engine_id} CU128 preview missing CUDA 12.8 torch package")
+            cu128_command = install_preview_manager._torch_install_command(
+                install_preview_paths.engine_dir(engine_id) / "venv" / "Scripts" / "python.exe",
+                get_install_spec(engine_id, "cu128"),
+                install_preview_paths.engine_dir(engine_id) / "constraints.txt",
+            )
+            _assert(TORCH_CU128_INDEX in cu128_command, f"{engine_id} CU128 install command missing index")
+        try:
+            install_preview_manager.local_install_preview("omnivoice", torch_variant="cu128")
+            raise AssertionError("omnivoice CU128 variant preview should fail because it is already default")
+        except ValueError:
+            pass
         piper_preview = "\n".join(install_preview_manager.local_install_preview("piper"))
         _assert("PyTorch CUDA:" not in piper_preview, "piper install preview should not show torch section")
         _assert("PyTorch: nie wymagany" in piper_preview, "piper install preview should explain missing torch section")
@@ -1030,6 +1109,8 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(venv_env["TMP"].startswith(str(engine_dir)), "venv TMP should stay inside engine dir")
         worker_env = temp_manager._worker_env()
         stt_env = faster_whisper_worker_env(temp_paths)
+        _assert(worker_env.get("PYTHONIOENCODING") == "utf-8", "worker env should force UTF-8 stdio")
+        _assert(worker_env.get("PYTHONUTF8") == "1", "worker env should enable Python UTF-8 mode")
         _assert(
             str(temp_paths.faster_whisper_packages_dir) in stt_env.get("LEKTORAI_STT_FASTER_WHISPER_PACKAGES_DIRS", ""),
             "STT env should expose faster-whisper packages",
@@ -1201,6 +1282,7 @@ def run_self_test(app_dir: Path) -> list[str]:
         omnivoice_mp3_errors = validate_engine_config("omnivoice", {"reference_audio_path": str(optional_mp3_probe)})
         _assert(not omnivoice_mp3_errors, "omnivoice should accept MP3 voice samples")
         coqui_mp3_errors = validate_engine_config("coqui_xtts", {"speaker_wav_path": str(optional_mp3_probe)})
+        _assert(not coqui_mp3_errors, "coqui XTTS should accept MP3 voice samples")
         _assert(not coqui_mp3_errors, "coqui XTTS should accept MP3 voice samples")
     finally:
         for probe in (optional_audio_probe, optional_mp3_probe, optional_flac_probe):
@@ -2263,8 +2345,12 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert("tts_models/multilingual/multi-dataset/xtts_v2" in worker_template_text, "worker template should use XTTS-v2 model")
         _assert("COQUI_TOS_AGREED" in worker_template_text, "worker template should accept Coqui XTTS TOS non-interactively")
         _assert("trim_xtts_trailing_silence_np" in worker_template_text, "worker template should trim Coqui XTTS trailing silence")
+        _assert("synthesize_f5_tts" not in worker_template_text, "archived F5-TTS should not be active in worker template")
         _assert('language="pl"' in worker_template_text, "worker template should hardcode Polish where model API supports it")
         _assert("pobieranie/ladowanie" not in worker_template_text, "worker template should not use ambiguous model activity logs")
+        _assert("configure_worker_stdio()" in worker_template_text, "worker template should configure UTF-8 stdio")
+        _assert('reconfigure(encoding="utf-8", errors="replace")' in worker_template_text, "worker template should replace unencodable stdout/stderr characters")
+        _assert("PYTHONIOENCODING" in worker_template_text and "PYTHONUTF8" in worker_template_text, "worker template should set UTF-8 stdio environment")
         _assert("has_local_model_cache" in worker_template_text, "worker template should distinguish model download from loading")
         _assert("LEKTORAI_STT_FASTER_WHISPER_CACHE_DIR" in worker_template_text, "worker template should use STT faster-whisper cache")
         _assert("LEKTORAI_STT_FASTER_WHISPER_PACKAGES_DIRS" in worker_template_text, "worker template should load STT packages lazily for Whisper QC")
@@ -2538,6 +2624,22 @@ def run_self_test(app_dir: Path) -> list[str]:
         main_window_refresh_keeps_engine_signals_blocked(),
         "engine refresh should keep combo signals blocked while restoring last engine",
     )
+    _assert(
+        worker_message_should_refresh_engine_status("Model TTS: model w cache"),
+        "engine status should refresh after model cache confirmation",
+    )
+    _assert(
+        worker_message_should_refresh_engine_status("Model TTS: ladowanie modelu - prosze czekac"),
+        "engine status should refresh when model loading starts",
+    )
+    _assert(
+        worker_message_should_refresh_engine_status("Segment 1/216"),
+        "engine status should refresh no later than first generated segment",
+    )
+    _assert(
+        not worker_message_should_refresh_engine_status("Whisper QC: model w cache"),
+        "Whisper QC cache messages should not refresh TTS engine status",
+    )
     _assert(main_window_minimum_size() == (980, 620), "main window minimum size mismatch")
     _assert(slider_value_to_weight(20) == 2.0, "audio weight slider conversion mismatch")
     _assert(weight_to_slider_value(1.5) == 15, "audio weight reverse slider conversion mismatch")
@@ -2654,6 +2756,9 @@ def run_self_test(app_dir: Path) -> list[str]:
     merged_visible_settings = merge_engine_settings_values({"seed": 12345, "cfg_value": 2.0}, {"cfg_value": 1.5})
     _assert(merged_visible_settings == {"seed": 12345, "cfg_value": 1.5}, "settings merge should preserve hidden seed")
     _assert(initial_install_button_label() == "Zainstaluj", "TTS manager initial install label mismatch")
+    manager_dialog_source = (app_dir / "app" / "ui" / "dialogs" / "tts_manager_dialog.py").read_text(encoding="utf-8")
+    _assert("btn_install_cu128" not in manager_dialog_source, "TTS manager should use one install button and variant dialog")
+    _assert("def choose_torch_variant" in manager_dialog_source, "TTS manager should show PyTorch variant dialog after install click")
     _assert(should_show_dictionary_row("Batman", "bat"), "dictionary search should match prefix")
     _assert(not should_show_dictionary_row("Alfa", "bat"), "dictionary search should hide non-prefix")
     _assert(should_show_dictionary_row("", "bat"), "dictionary search should keep empty editable rows visible")

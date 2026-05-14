@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 APP_NAME = "LektorAI by Slawaspr0"
-APP_VERSION = "v1.1"
+APP_VERSION = "v1.2"
 APP_DIR = Path(__file__).resolve().parent
 APP_PACKAGES_DIR = APP_DIR / "packages"
 if APP_PACKAGES_DIR.is_dir() and str(APP_PACKAGES_DIR) not in sys.path:
@@ -77,7 +77,7 @@ def main() -> int:
         if manager.definitions[engine_to_install].kind != EngineKind.LOCAL:
             print(f"Silnik nie jest lokalnym TTS do instalacji: {engine_to_install}")
             return 2
-        manager.install_local_engine(engine_to_install, print)
+        manager.install_local_engine(engine_to_install, print, torch_variant=_arg_value("--torch-cuda"))
         return 0
 
     engine_to_preview = _arg_value("--engine-install-plan")
@@ -94,7 +94,7 @@ def main() -> int:
         if manager.definitions[engine_to_preview].kind != EngineKind.LOCAL:
             print(f"Silnik nie jest lokalnym TTS do instalacji: {engine_to_preview}")
             return 2
-        print("\n".join(manager.local_install_preview(engine_to_preview)))
+        print("\n".join(manager.local_install_preview(engine_to_preview, torch_variant=_arg_value("--torch-cuda"))))
         return 0
 
     engine_to_update = _arg_value("--update-worker")
@@ -168,7 +168,9 @@ def _usage() -> str:
         "  START.py --self-test             szybki test bez GUI i bez TTS\n"
         "  START.py --list-engines          lista silnikow TTS\n"
         "  START.py --engine-install-plan ID pokazuje plan instalacji lokalnego TTS\n"
+        "  START.py --engine-install-plan ID --torch-cuda cu128 pokazuje plan dla wariantu PyTorch\n"
         "  START.py --install-engine ID     instaluje lokalny TTS: chatterbox, omnivoice, piper, coqui_xtts\n"
+        "  START.py --install-engine ID --torch-cuda cu128 instaluje wariant PyTorch dla nowszych kart\n"
         "  START.py --update-worker ID      aktualizuje worker.py lokalnego TTS\n"
         "  START.py --remove-engine ID      usuwa caly folder lokalnego TTS\n"
         "  START.py --remove-engine-keep-settings ID usuwa runtime lokalnego TTS, zostawia config i slownik\n"

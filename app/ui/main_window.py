@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import subprocess
+import sys
+import threading
 import traceback
 from pathlib import Path
 from time import monotonic
@@ -36,6 +40,7 @@ from app.core.media_tools import (
 )
 from app.core.paths import AppPaths, build_paths
 from app.core.version import APP_NAME, APP_VERSION
+from app.updater.core import UpdateCheckResult, check_for_updates
 from app.engines.config_validation import validate_engine_config
 from app.engines.manager import EngineManager
 from app.engines.schemas import EngineKind, EngineState
@@ -77,6 +82,32 @@ def progress_bar_style() -> str:
                 border-radius: 3px;
             }
             """
+
+
+class UpdateButton(QtWidgets.QPushButton):
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self._update_available = False
+
+    def set_update_available(self, value: bool) -> None:
+        self._update_available = bool(value)
+        self.update()
+
+    def update_available(self) -> bool:
+        return self._update_available
+
+    def paintEvent(self, event):  # noqa: N802
+        super().paintEvent(event)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        size = 9
+        margin = 7
+        y = max(0, (self.height() - size) // 2)
+        rect = QtCore.QRect(self.width() - size - margin, y, size, size)
+        color = QtGui.QColor("#21d16b") if self._update_available else self.palette().button().color()
+        painter.setPen(QtGui.QPen(QtGui.QColor("#151515"), 1))
+        painter.setBrush(QtGui.QBrush(color))
+        painter.drawEllipse(rect)
 
 
 def compact_app_log_message(message: str, limit: int = 260) -> str:
@@ -141,6 +172,13 @@ def aac_quality_label(value: str) -> str:
 
 def main_window_refresh_keeps_engine_signals_blocked() -> bool:
     return True
+
+
+def worker_message_should_refresh_engine_status(message: str) -> bool:
+    text = " ".join(str(message or "").strip().lower().split())
+    if text.startswith("model tts: "):
+        return "model w cache" in text or "ladowanie modelu" in text or "ładowanie modelu" in text
+    return bool(re.fullmatch(r"segment\s+\d+/\d+", text))
 
 
 def main_window_minimum_size() -> tuple[int, int]:
@@ -370,6 +408,8 @@ class PipelineWorker(QtCore.QThread):
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    update_check_finished = QtCore.pyqtSignal(object, bool)
+
     def __init__(self, paths: AppPaths, logger: logging.Logger, log_path: Path) -> None:
         super().__init__()
         self.paths = paths
@@ -381,6 +421,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine_states: list[EngineState] = []
         self.worker: PipelineWorker | None = None
         self.tts_started_at: float | None = None
+        self.engine_status_refreshed_during_job = False
+        self.update_check_result: UpdateCheckResult | None = None
+        self.update_check_running = False
 
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         min_width, min_height = main_window_minimum_size()
@@ -388,8 +431,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().setSizeGripEnabled(True)
         self._build_ui()
         self._restore_window_state()
+        self.update_check_finished.connect(self.on_update_check_finished)
         self.log(f"Aplikacja uruchomiona: {APP_NAME} {APP_VERSION}")
         self.refresh_engines()
+        QtCore.QTimer.singleShot(1500, lambda: self.start_update_check(show_result=False))
 
     def closeEvent(self, event):  # noqa: N802
         if self.worker is not None and self.worker.isRunning():
@@ -461,6 +506,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_diagnostics.clicked.connect(self.open_diagnostics)
         self.btn_log_cleanup = QtWidgets.QPushButton("Czyszczenie logow")
         self.btn_log_cleanup.clicked.connect(self.open_log_cleanup)
+        self.btn_update = UpdateButton("Aktualizacja")
+        self.btn_update.clicked.connect(self.open_update)
         self.btn_open_output = QtWidgets.QPushButton("Otworz wynik")
         self.btn_open_output.setEnabled(False)
         self.btn_open_output.clicked.connect(self.open_last_output)
@@ -569,6 +616,7 @@ class MainWindow(QtWidgets.QMainWindow):
         middle.addWidget(self.btn_tts_manager)
         middle.addWidget(self.btn_diagnostics)
         middle.addWidget(self.btn_log_cleanup)
+        middle.addWidget(self.btn_update)
         middle.addWidget(self.btn_open_output)
         middle.addWidget(self.lektor_lufs_row)
         middle.addWidget(self.lektor_weight_row)
@@ -630,7 +678,15 @@ class MainWindow(QtWidgets.QMainWindow):
         top_left.setY(max(available.top(), min(top_left.y(), available.bottom() - frame.height())))
         self.move(top_left)
 
-    def refresh_engines(self, clear_cache: bool = True) -> None:
+    def refresh_engines(
+        self,
+        clear_cache: bool = True,
+        log_selection: bool = True,
+        controls_enabled: bool | None = None,
+        store_selection: bool = True,
+    ) -> None:
+        if controls_enabled is None:
+            controls_enabled = self.engine_combo.isEnabled()
         if clear_cache:
             clear_engine_status_cache(self.engine_manager)
         self.engine_states = self.engine_manager.list_states()
@@ -652,7 +708,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         item.setEnabled(False)
         self.restore_last_engine()
         self.engine_combo.blockSignals(False)
-        self.on_engine_changed()
+        self.on_engine_changed(log_selection=log_selection, controls_enabled=controls_enabled, store_selection=store_selection)
 
     def selected_engine_id(self) -> str:
         return str(self.engine_combo.currentData() or "")
@@ -669,16 +725,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if index >= 0:
             self.engine_combo.setCurrentIndex(index)
 
-    def on_engine_changed(self) -> None:
+    def on_engine_changed(
+        self,
+        index: int | None = None,
+        log_selection: bool = True,
+        controls_enabled: bool | None = None,
+        store_selection: bool = True,
+    ) -> None:
+        if controls_enabled is None:
+            controls_enabled = self.engine_combo.isEnabled()
         engine_id = self.selected_engine_id()
-        actions_enabled = self._selected_engine_actions_enabled(True)
+        actions_enabled = self._selected_engine_actions_enabled(bool(controls_enabled))
         self.btn_dictionary.setEnabled(actions_enabled)
         self.btn_settings.setEnabled(actions_enabled)
         if engine_id and actions_enabled:
             self.engine_manager.ensure_engine_config(engine_id)
-            self.log(f"Wybrano TTS: {engine_id}")
-        self.config_store.set_last_engine(stored_engine_after_selection(engine_id, actions_enabled))
-        self._update_start_button(True)
+            if log_selection:
+                self.log(f"Wybrano TTS: {engine_id}")
+        if store_selection:
+            self.config_store.set_last_engine(stored_engine_after_selection(engine_id, actions_enabled))
+        self._update_start_button(bool(controls_enabled))
 
     def add_files(self) -> None:
         files, _ = QtWidgets.QFileDialog.getOpenFileNames(
@@ -832,6 +898,78 @@ class MainWindow(QtWidgets.QMainWindow):
     def open_log_cleanup(self) -> None:
         show_log_cleanup(self, self.paths, self.log_path)
 
+    def open_update(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            QtWidgets.QMessageBox.warning(self, "Aktualizacja", "Najpierw przerwij albo zakoncz aktualne zadanie.")
+            return
+        if self.update_check_result is not None and self.update_check_result.update_available:
+            self.start_update()
+            return
+        self.start_update_check(show_result=True)
+
+    def start_update_check(self, show_result: bool) -> None:
+        if self.update_check_running:
+            if show_result:
+                QtWidgets.QMessageBox.information(self, "Aktualizacja", "Sprawdzanie aktualizacji juz trwa.")
+            return
+        self.update_check_running = True
+        self.btn_update.setEnabled(False)
+
+        def run_check() -> None:
+            result = check_for_updates(self.paths.app_dir)
+            self.update_check_finished.emit(result, bool(show_result))
+
+        threading.Thread(target=run_check, daemon=True).start()
+
+    def on_update_check_finished(self, result: UpdateCheckResult, show_result: bool) -> None:
+        self.update_check_running = False
+        self.update_check_result = result
+        self.btn_update.setEnabled(not (self.worker is not None and self.worker.isRunning()))
+        self.btn_update.set_update_available(bool(result.ok and result.update_available))
+        if result.ok and result.update_available:
+            self.btn_update.setToolTip("Dostepna jest aktualizacja programu.")
+            if not show_result:
+                self.log("Aktualizacja: dostepna nowa wersja")
+                return
+        elif result.ok:
+            self.btn_update.setToolTip("Masz najnowsza wersje programu.")
+        else:
+            self.btn_update.setToolTip("Nie udalo sie sprawdzic aktualizacji.")
+        if not show_result:
+            return
+        if not result.ok:
+            QtWidgets.QMessageBox.warning(self, "Aktualizacja", f"Nie udalo sie sprawdzic aktualizacji.\n{result.error}")
+            return
+        if result.update_available:
+            self.start_update()
+        else:
+            QtWidgets.QMessageBox.information(self, "Aktualizacja", "Masz najnowsza wersje programu.")
+
+    def start_update(self) -> None:
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "Aktualizacja",
+            "Program zamknie sie, pobierze aktualizacje i uruchomi ponownie.\nKontynuowac?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        updater_path = self.paths.app_dir / "UPDATER.py"
+        if not updater_path.is_file():
+            QtWidgets.QMessageBox.warning(self, "Aktualizacja", "Brakuje pliku UPDATER.py.")
+            return
+        try:
+            subprocess.Popen(
+                [sys.executable, str(updater_path), "--app-dir", str(self.paths.app_dir), "--pid", str(os.getpid())],
+                cwd=str(self.paths.app_dir),
+                close_fds=True,
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Aktualizacja", f"Nie udalo sie uruchomic aktualizatora.\n{exc}")
+            return
+        QtWidgets.QApplication.quit()
+
     def start_job(self) -> None:
         engine_id = self.selected_engine_id()
         if not engine_id:
@@ -856,6 +994,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not self.confirm_start(engine_id, files):
             return
+        self.engine_status_refreshed_during_job = False
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.last_output_dir = None
@@ -873,7 +1012,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.selected_lektor_delay_ms(),
             self.selected_create_stereo_for_surround(),
         )
-        self.worker.message.connect(self.log)
+        self.worker.message.connect(self.on_worker_message)
         self.worker.diagnostic.connect(self.log_diagnostic)
         self.worker.progress.connect(self.on_pipeline_progress)
         self.worker.tts_progress.connect(self.on_tts_progress)
@@ -890,6 +1029,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.requestInterruption()
         self.btn_stop.setEnabled(False)
         self.log("Przerwanie: zatrzymuje aktualny proces TTS")
+
+    def on_worker_message(self, message: str) -> None:
+        self.log(message)
+        if self.engine_status_refreshed_during_job:
+            return
+        if not worker_message_should_refresh_engine_status(message):
+            return
+        self.engine_status_refreshed_during_job = True
+        self.refresh_engines(clear_cache=False, log_selection=False, controls_enabled=False, store_selection=False)
 
     def open_last_output(self) -> None:
         if self.last_output_dir is None or not self.last_output_dir.exists():
@@ -997,6 +1145,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log(f"BLAD: {message}")
         self.btn_stop.setEnabled(False)
         self._set_queue_controls_enabled(True)
+        self.refresh_engines(log_selection=False)
         self.progress_label.setText("Przerwano")
         self.tts_progress_label.setText("TTS: -")
         self.tts_progress_bar.setRange(0, 1)
@@ -1008,6 +1157,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log(message)
         self.btn_stop.setEnabled(False)
         self._set_queue_controls_enabled(True)
+        self.refresh_engines(log_selection=False)
         self.progress_label.setText("Gotowe")
         self.tts_progress_label.setText("TTS: -")
         self.tts_progress_bar.setRange(0, 1)
@@ -1028,6 +1178,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_dictionary.setEnabled(actions_enabled)
         self.btn_tts_manager.setEnabled(enabled)
         self.btn_log_cleanup.setEnabled(enabled)
+        self.btn_update.setEnabled(enabled and not self.update_check_running)
         self.aac_quality_combo.setEnabled(enabled)
         self.create_stereo_for_surround_checkbox.setEnabled(enabled)
         self.lektor_lufs_slider.setEnabled(enabled)

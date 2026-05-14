@@ -14,6 +14,22 @@ from pathlib import Path
 from typing import Any
 
 
+def configure_worker_stdio() -> None:
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    os.environ.setdefault("PYTHONUTF8", "1")
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+configure_worker_stdio()
+
+
 _WHISPER_MODELS: dict[tuple[str, str, str, str], Any] = {}
 _AUTO_DEVICE = ""
 _OMNIVOICE_MODEL = None
