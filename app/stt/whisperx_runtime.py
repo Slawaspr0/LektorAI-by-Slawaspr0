@@ -160,6 +160,7 @@ def whisperx_device_needs_cuda(device: str) -> bool:
 
 def ensure_whisperx_gpu_runtime(paths: AppPaths, progress: Callable[[str], None] | None = None) -> None:
     if cuda_runtime_ready(paths, CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID):
+        _emit(progress, "WhisperX: biblioteki GPU gotowe")
         return
     ensure_cuda_runtime(paths, CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID, progress=progress)
     if not cuda_runtime_ready(paths, CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID):

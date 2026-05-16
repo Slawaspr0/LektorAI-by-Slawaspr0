@@ -190,10 +190,12 @@ from app.stt.whisper_cpp_runtime import (
     sanitize_whisper_cpp_device,
     sanitize_whisper_cpp_runtime,
     whisper_cpp_model_file_name,
+    whisper_cpp_runtime_download_label,
     whisper_cpp_runtime_env,
 )
 from app.stt.whisperx_runtime import (
     build_whisperx_command,
+    ensure_whisperx_gpu_runtime,
     normalize_whisperx_compute_type,
     normalize_whisperx_model_name,
     whisperx_runtime_env,
@@ -3437,6 +3439,10 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(set(WHISPER_CPP_RUNTIME_PACKAGES) == {"cpu", "cuda"}, "whisper.cpp runtime variants mismatch")
     _assert(sanitize_whisper_cpp_runtime("CUDA") == "cuda", "whisper.cpp runtime sanitize mismatch")
     _assert(sanitize_whisper_cpp_device("cuda:1") == "cuda:1", "whisper.cpp device sanitize mismatch")
+    _assert(
+        whisper_cpp_runtime_download_label(WHISPER_CPP_RUNTIME_PACKAGES["cuda"]) == "whisper.cpp: pobieranie plikow programu (CUDA)",
+        "whisper.cpp CUDA runtime download label should not be confused with CUDA DLL runtime",
+    )
     cpp_cuda_probe_dir = app_dir / "_self_test_cpp_cuda_runtime"
     cpp_cuda_paths = build_paths(cpp_cuda_probe_dir)
     try:
@@ -3491,6 +3497,9 @@ def run_self_test(app_dir: Path) -> list[str]:
         whisperx_cuda12_dir.mkdir(parents=True)
         for dll_name in CUDA_RUNTIME_PACKAGES[CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID].required_dlls:
             (whisperx_cuda12_dir / dll_name).write_text("", encoding="utf-8")
+        whisperx_gpu_progress: list[str] = []
+        ensure_whisperx_gpu_runtime(whisperx_cuda_paths, progress=whisperx_gpu_progress.append)
+        _assert("WhisperX: biblioteki GPU gotowe" in whisperx_gpu_progress, "WhisperX should report ready GPU libraries even when runtime is already installed")
         whisperx_gpu_env = whisperx_runtime_env(whisperx_cuda_paths, "cuda:1", {"PATH": "BASE"})
         _assert(str(whisperx_cuda12_dir) in whisperx_gpu_env.get("PATH", "").split(os.pathsep), "WhisperX GPU env should include shared CUDA 12 runtime dir")
         whisperx_cpu_env = whisperx_runtime_env(whisperx_cuda_paths, "cpu", {"PATH": "BASE"})

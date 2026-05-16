@@ -78,6 +78,10 @@ def sanitize_whisper_cpp_device(value: str) -> str:
     return "auto"
 
 
+def whisper_cpp_runtime_download_label(package: WhisperCppRuntimePackage) -> str:
+    return f"whisper.cpp: pobieranie plikow programu ({package.label})"
+
+
 def find_whisper_cpp_executable(paths: AppPaths) -> Path | None:
     candidates: list[Path] = []
     for name in WHISPER_CPP_EXECUTABLE_NAMES:
@@ -313,7 +317,7 @@ def _obtain_runtime_archive(
     download_file_with_progress(
         package.url,
         target,
-        label=f"whisper.cpp: pobieranie runtime {package.label}",
+        label=whisper_cpp_runtime_download_label(package),
         progress=progress,
         cancel_requested=cancel_requested,
         timeout_s=30.0,
