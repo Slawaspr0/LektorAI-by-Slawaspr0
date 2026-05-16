@@ -130,6 +130,8 @@ def polish_combo_box(combo: QtWidgets.QComboBox) -> QtWidgets.QComboBox:
 
 
 class UpdateButton(QtWidgets.QPushButton):
+    UPDATE_NEON_GREEN = "#39ff14"
+
     def __init__(self, text: str) -> None:
         super().__init__(text)
         self._update_available = False
@@ -145,11 +147,16 @@ class UpdateButton(QtWidgets.QPushButton):
         super().paintEvent(event)
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        if self._update_available:
+            border_rect = self.rect().adjusted(1, 1, -2, -2)
+            painter.setPen(QtGui.QPen(QtGui.QColor(self.UPDATE_NEON_GREEN), 2))
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(border_rect, 4, 4)
         size = 9
         margin = 7
         y = max(0, (self.height() - size) // 2)
         rect = QtCore.QRect(self.width() - size - margin, y, size, size)
-        color = QtGui.QColor("#21d16b") if self._update_available else self.palette().button().color()
+        color = QtGui.QColor(self.UPDATE_NEON_GREEN) if self._update_available else self.palette().button().color()
         painter.setPen(QtGui.QPen(QtGui.QColor("#151515"), 1))
         painter.setBrush(QtGui.QBrush(color))
         painter.drawEllipse(rect)
