@@ -22,7 +22,11 @@ WHISPER_QC_MODELS: tuple[str, ...] = (
     "turbo",
 )
 
-DEVICE_OPTIONS: tuple[str, ...] = ("auto", "cpu", "cuda", "cuda:0", "cuda:1")
+DEVICE_OPTIONS: tuple[str, ...] = ("auto", "cpu")
+WHISPER_QC_DEVICE_OPTIONS: tuple[str, ...] = ("cpu",)
+WHISPER_QC_COMPUTE_TYPES: tuple[str, ...] = ("int8", "float16")
+WHISPER_QC_COMPUTE_TYPE_LABELS: tuple[str, ...] = ("int8 - CPU\\GPU", "float16 - GPU")
+WHISPER_QC_COMPUTE_TYPE_LABEL_BY_VALUE: dict[str, str] = dict(zip(WHISPER_QC_COMPUTE_TYPES, WHISPER_QC_COMPUTE_TYPE_LABELS))
 
 EDGE_POLISH_VOICES: tuple[str, ...] = ("pl-PL-MarekNeural", "pl-PL-ZofiaNeural")
 EDGE_POLISH_VOICE_LABELS: tuple[str, ...] = ("Marek", "Zofia")
@@ -47,7 +51,9 @@ WHISPER_QC_RETRY_TOOLTIP = (
     "5 = oryginal + maksymalnie 4 ponowienia."
 )
 
-DEVICE_TOOLTIP = "auto: wybiera najlepsze dostepne urzadzenie; cpu: procesor; cuda: domyslna karta NVIDIA; cuda:0/cuda:1: konkretna karta GPU."
+DEVICE_TOOLTIP = "Auto wybiera najlepsze dostepne urzadzenie. Przy kilku kartach mozesz wybrac konkretna karte GPU."
+WHISPER_QC_DEVICE_TOOLTIP = "Urzadzenie dla kontroli mowy. CPU jest najbezpieczniejsze. Przy kilku kartach mozesz ustawic kontrole mowy na innej karcie niz TTS."
+WHISPER_QC_COMPUTE_TOOLTIP = "Tryb pracy kontroli mowy. int8 jest najbezpieczniejsze i zuzywa mniej pamieci; float16 moze byc szybsze na GPU, ale wymaga wiecej VRAM."
 
 
 @dataclass(frozen=True)
@@ -101,6 +107,8 @@ SPEECH_QC_FIELD_KEYS: tuple[str, ...] = (
     "whisper_qc_enabled",
     "whisper_qc_retry_attempts",
     "whisper_qc_model",
+    "whisper_qc_device",
+    "whisper_qc_compute_type",
     "whisper_qc_min_similarity",
 )
 
@@ -128,6 +136,8 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
         ConfigField("whisper_qc_retry_attempts", "Liczba prob", "int", WHISPER_QC_RETRY_TOOLTIP, 1, 5, 1),
         ConfigField("whisper_qc_model", "Model", "choice", "Do wyboru rozne modele dla kontroli mowy.", options=WHISPER_QC_MODELS),
+        ConfigField("whisper_qc_device", "Urzadzenie", "choice", WHISPER_QC_DEVICE_TOOLTIP, options=WHISPER_QC_DEVICE_OPTIONS),
+        ConfigField("whisper_qc_compute_type", "Tryb pracy", "choice", WHISPER_QC_COMPUTE_TOOLTIP, options=WHISPER_QC_COMPUTE_TYPES, option_labels=WHISPER_QC_COMPUTE_TYPE_LABELS),
         ConfigField("whisper_qc_min_similarity", "Zgodnosc tekstu", "float", "Minimalna zgodnosc lektora z tekstem. 0,62 to inaczej minimalna zgodnosc 62%.", 0.0, 1.0, 0.01),
     ),
     "openai": (
@@ -141,6 +151,8 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
         ConfigField("whisper_qc_retry_attempts", "Liczba prob", "int", WHISPER_QC_RETRY_TOOLTIP, 1, 5, 1),
         ConfigField("whisper_qc_model", "Model", "choice", "Do wyboru rozne modele dla kontroli mowy.", options=WHISPER_QC_MODELS),
+        ConfigField("whisper_qc_device", "Urzadzenie", "choice", WHISPER_QC_DEVICE_TOOLTIP, options=WHISPER_QC_DEVICE_OPTIONS),
+        ConfigField("whisper_qc_compute_type", "Tryb pracy", "choice", WHISPER_QC_COMPUTE_TOOLTIP, options=WHISPER_QC_COMPUTE_TYPES, option_labels=WHISPER_QC_COMPUTE_TYPE_LABELS),
         ConfigField("whisper_qc_min_similarity", "Zgodnosc tekstu", "float", "Minimalna zgodnosc lektora z tekstem. 0,62 to inaczej minimalna zgodnosc 62%.", 0.0, 1.0, 0.01),
     ),
     "chatterbox": (
@@ -183,6 +195,8 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
         ConfigField("whisper_qc_retry_attempts", "Liczba prob", "int", WHISPER_QC_RETRY_TOOLTIP, 1, 5, 1),
         ConfigField("whisper_qc_model", "Model", "choice", "Do wyboru rozne modele dla kontroli mowy.", options=WHISPER_QC_MODELS),
+        ConfigField("whisper_qc_device", "Urzadzenie", "choice", WHISPER_QC_DEVICE_TOOLTIP, options=WHISPER_QC_DEVICE_OPTIONS),
+        ConfigField("whisper_qc_compute_type", "Tryb pracy", "choice", WHISPER_QC_COMPUTE_TOOLTIP, options=WHISPER_QC_COMPUTE_TYPES, option_labels=WHISPER_QC_COMPUTE_TYPE_LABELS),
         ConfigField("whisper_qc_min_similarity", "Zgodnosc tekstu", "float", "Minimalna zgodnosc lektora z tekstem. 0,62 to inaczej minimalna zgodnosc 62%.", 0.0, 1.0, 0.01),
     ),
     "omnivoice": (
@@ -224,6 +238,8 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
         ConfigField("whisper_qc_retry_attempts", "Liczba prob", "int", WHISPER_QC_RETRY_TOOLTIP, 1, 5, 1),
         ConfigField("whisper_qc_model", "Model", "choice", "Do wyboru rozne modele dla kontroli mowy.", options=WHISPER_QC_MODELS),
+        ConfigField("whisper_qc_device", "Urzadzenie", "choice", WHISPER_QC_DEVICE_TOOLTIP, options=WHISPER_QC_DEVICE_OPTIONS),
+        ConfigField("whisper_qc_compute_type", "Tryb pracy", "choice", WHISPER_QC_COMPUTE_TOOLTIP, options=WHISPER_QC_COMPUTE_TYPES, option_labels=WHISPER_QC_COMPUTE_TYPE_LABELS),
         ConfigField("whisper_qc_min_similarity", "Zgodnosc tekstu", "float", "Minimalna zgodnosc lektora z tekstem. 0,62 to inaczej minimalna zgodnosc 62%.", 0.0, 1.0, 0.01),
     ),
     "piper": (
@@ -260,6 +276,8 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
         ConfigField("whisper_qc_retry_attempts", "Liczba prob", "int", WHISPER_QC_RETRY_TOOLTIP, 1, 5, 1),
         ConfigField("whisper_qc_model", "Model", "choice", "Do wyboru rozne modele dla kontroli mowy.", options=WHISPER_QC_MODELS),
+        ConfigField("whisper_qc_device", "Urzadzenie", "choice", WHISPER_QC_DEVICE_TOOLTIP, options=WHISPER_QC_DEVICE_OPTIONS),
+        ConfigField("whisper_qc_compute_type", "Tryb pracy", "choice", WHISPER_QC_COMPUTE_TOOLTIP, options=WHISPER_QC_COMPUTE_TYPES, option_labels=WHISPER_QC_COMPUTE_TYPE_LABELS),
         ConfigField("whisper_qc_min_similarity", "Zgodnosc tekstu", "float", "Minimalna zgodnosc lektora z tekstem. 0,62 to inaczej minimalna zgodnosc 62%.", 0.0, 1.0, 0.01),
     ),
     "coqui_xtts": (
@@ -334,6 +352,8 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
         ConfigField("whisper_qc_retry_attempts", "Liczba prob", "int", WHISPER_QC_RETRY_TOOLTIP, 1, 5, 1),
         ConfigField("whisper_qc_model", "Model", "choice", "Do wyboru rozne modele dla kontroli mowy.", options=WHISPER_QC_MODELS),
+        ConfigField("whisper_qc_device", "Urzadzenie", "choice", WHISPER_QC_DEVICE_TOOLTIP, options=WHISPER_QC_DEVICE_OPTIONS),
+        ConfigField("whisper_qc_compute_type", "Tryb pracy", "choice", WHISPER_QC_COMPUTE_TOOLTIP, options=WHISPER_QC_COMPUTE_TYPES, option_labels=WHISPER_QC_COMPUTE_TYPE_LABELS),
         ConfigField("whisper_qc_min_similarity", "Zgodnosc tekstu", "float", "Minimalna zgodnosc lektora z tekstem. 0,62 to inaczej minimalna zgodnosc 62%.", 0.0, 1.0, 0.01),
     ),
 }
@@ -345,6 +365,32 @@ def fields_for(engine_id: str) -> tuple[ConfigField, ...]:
 
 def visible_fields_for(engine_id: str) -> tuple[ConfigField, ...]:
     return tuple(field for field in fields_for(engine_id) if field.visible)
+
+
+def whisper_qc_compute_type_options_for_device(device: str) -> tuple[str, ...]:
+    normalized = str(device or "").strip().casefold()
+    if not normalized or normalized == "cpu":
+        return ("int8",)
+    return WHISPER_QC_COMPUTE_TYPES
+
+
+def whisper_qc_compute_type_labels_for_options(options: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(WHISPER_QC_COMPUTE_TYPE_LABEL_BY_VALUE.get(option, option) for option in options)
+
+
+def whisper_qc_effective_compute_type(device: str, compute_type: str) -> str:
+    allowed = whisper_qc_compute_type_options_for_device(device)
+    requested = str(compute_type or "").strip()
+    return requested if requested in allowed else allowed[0]
+
+
+def faster_whisper_device_kwargs(device: str) -> dict[str, object]:
+    normalized = str(device or "").strip().lower() or "cpu"
+    if normalized.startswith("cuda:"):
+        index_text = normalized.split(":", 1)[1]
+        if index_text.isdigit():
+            return {"device": "cuda", "device_index": int(index_text)}
+    return {"device": normalized}
 
 
 def is_diagnostic_field(field_or_key: ConfigField | str) -> bool:

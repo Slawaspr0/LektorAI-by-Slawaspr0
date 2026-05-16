@@ -1777,6 +1777,7 @@ def _generate_local(
     worker_script = engine_dir / "worker.py"
     if not worker_script.exists():
         raise RuntimeError(f"TTS {engine_id} nie ma worker.py. Zainstaluj silnik ponownie w menadzerze TTS.")
+    manager.install_worker_script(engine_id)
 
     job_id = uuid4().hex
     runner = EngineWorkerRunner(paths, manager)

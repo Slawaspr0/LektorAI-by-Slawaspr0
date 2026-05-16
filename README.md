@@ -2,24 +2,26 @@
 
 ![LektorAI by Slawaspr0](lektorAI_screen.jpg)
 
-**Wersja: v1.2**
+**Wersja: v1.3**
 
 LektorAI by Slawaspr0 to aplikacja do tworzenia polskiej ścieżki lektorskiej dla filmów i seriali. Program korzysta z wybranego silnika TTS, generuje głos lektora na podstawie napisów, składa go w jedną ścieżkę audio, miksuje z oryginalnym tłem filmu i dodaje do wynikowego pliku MKV.
 
 Projekt jest świadomie skupiony na języku polskim. Nie jest tworzony jako uniwersalna, wielojęzyczna platforma TTS. Priorytetem jest polski lektor, poprawna polska wymowa, dobra synchronizacja z napisami i jakość końcowej ścieżki audio.
 
-Projekt jest rozwijany z myślą o jakości lektora, kontroli nad procesem i pracy na wielu silnikach TTS bez mieszania ich zależności.
+Projekt jest rozwijany z myślą o jakości lektora, kontroli nad procesem i pracy na wielu silnikach TTS oraz STT bez mieszania ich zależności.
 
 ## Funkcje programu
 
-- Obsługuje pliki TXT, SRT oraz pliki wideo.
+- Pozwala korzystać z wielu silników TTS.
+- Pozwala korzystać z wielu silników STT.
+- Obsługuje pliki TXT, SRT, audio oraz wideo.
 - Posiada kolejkę plików do przetwarzania.
 - Na podstawie podanych plików generuje polskiego lektora.
-- Pozwala korzystać z wielu silników TTS.
 - Niektóre silniki obsługują klonowanie głosu na podstawie próbki lektora.
 - Ma narzędzia pomagające poprawić wynik generowania mowy.
 - Pozwala użytkownikowi tworzyć własny słownik wymowy.
 - Potrafi dodać polską ścieżkę lektora do filmu.
+- Potrafi głos w filmie zapisać do postaci napisów.
 - Na życzenie potrafi przygotować dodatkową ścieżkę stereo 2.0 ze źródła 5.1.
 
 ## Wymagania
@@ -40,7 +42,7 @@ python -m pip install -r requirements.txt
 
 ### Narzędzia zewnętrzne
 
-Program wymaga trzech narzędzi:
+Program wymaga następujących bibliotek do działania:
 
 ```text
 ffmpeg.exe
@@ -53,8 +55,6 @@ Aplikacja szuka ich w tej kolejności:
 1. w systemowym `PATH`,
 2. w folderze aplikacji, obok pliku `START.py`.
 
-W wersji przenośnej najprościej wrzucić wymagane pliki `.exe` bezpośrednio do folderu, w którym znajduje się `START.py`. Jeżeli dana edycja FFmpeg albo MKVToolNix wymaga dodatkowych plików `.dll`, powinny leżeć obok plików `.exe`.
-
 ### Internet
 
 Internet jest potrzebny dla:
@@ -62,24 +62,21 @@ Internet jest potrzebny dla:
 - Edge TTS,
 - OpenAI TTS,
 - pierwszego pobrania modeli lokalnych,
-- instalacji lokalnych silników TTS.
+- instalacji lokalnych silników TTS i STT.
 
 Po pobraniu modeli lokalne silniki mogą działać bez ponownego pobierania danych, o ile ich cache nie zostanie usunięty.
 
 ### GPU / CUDA
 
-Lokalne modele TTS mogą korzystać z karty NVIDIA i CUDA. Program ma opcję wyboru urządzenia, np. `auto`, `cpu`, `cuda`, `cuda:0`, `cuda:1`.
+Lokalne modele TTS i STT mogą korzystać z karty NVIDIA i CUDA. Program ma opcję wyboru urządzenia, np. `auto`, `cpu`, `cuda`, `cuda:0`, `cuda:1`.
 
-Jeżeli komputer nie ma CUDA, lokalny model może działać na CPU, ale generowanie będzie znacznie wolniejsze albo dany silnik może nie być praktyczny w użyciu.
+Silniki STT uruchamiane na CPU nie wymagają CUDA Toolkit. CUDA Toolkit jest potrzebny wtedy, gdy użytkownik chce uruchamiać STT na GPU.
 
-### Orientacyjne wymagania lokalnych TTS
+W praktyce:
 
-Nie podajemy tu sztywnego minimum VRAM, bo realne zużycie zależy od wersji modelu, długości tekstu, ustawień, wersji PyTorch/CUDA i sterowników. Najbezpieczniej traktować poniższe informacje jako praktyczne wskazówki, a szczegóły sprawdzić również w dokumentacji danego projektu.
-
-| Model | Krótka wskazówka sprzętowa |
-| --- | --- |
-| Chatterbox | Zalecana karta NVIDIA z CUDA. Uruchomienie na CPU może być możliwe, ale przy generowaniu lektora do filmów będzie bardzo wolne. Im więcej VRAM, tym stabilniej przy długich materiałach i większej liczbie prób QC. |
-| OmniVoice | Zalecana karta NVIDIA z CUDA. Model ma też ścieżkę instalacji CPU, ale w praktyce do dłuższych runów lektora warto używać GPU. Przy słabszym sprzęcie najlepiej zaczynać od krótkich testów. |
+- `whisper.cpp` wymaga CUDA Toolkit tylko przy użyciu wariantu CUDA,
+- `WhisperX` wymaga CUDA Toolkit przy użyciu GPU; przy CPU można go pominąć,
+- `faster-whisper` na CPU nie wymaga CUDA; przy użyciu GPU wymaga karty NVIDIA, aktualnego sterownika NVIDIA oraz CUDA Toolkit.
 
 ## Uruchomienie
 
@@ -89,18 +86,28 @@ Główny plik startowy aplikacji:
 python START.py
 ```
 
-Aplikacja przy pierwszym uruchomieniu utworzy potrzebne pliki konfiguracyjne i foldery robocze. Lokalne silniki TTS można zainstalować później z poziomu menedżera TTS.
+Aplikacja przy pierwszym uruchomieniu utworzy potrzebne pliki konfiguracyjne i foldery robocze. Lokalne silniki TTS i STT można zainstalować później z poziomu programu.
 
-## Silniki TTS
+## Silniki TTS i STT
 
-Program jest przygotowany pod modułową obsługę silników TTS.
+Program jest przygotowany pod modułową obsługę silników TTS i STT.
 
-Aktualne główne typy silników:
+Aktualne silniki TTS:
 
-- internetowe, np. Edge TTS i OpenAI TTS,
-- lokalne, np. Chatterbox i OmniVoice.
+- Edge TTS,
+- OpenAI TTS,
+- Chatterbox,
+- OmniVoice,
+- Piper TTS,
+- Coqui XTTS-v2.
 
-Lokalne silniki TTS mają osobne środowiska i osobne foldery. Dzięki temu jeden model nie powinien psuć zależności drugiego modelu.
+Aktualne silniki STT:
+
+- faster-whisper,
+- whisper.cpp,
+- WhisperX.
+
+Lokalne silniki mają osobne środowiska i osobne foldery. Dzięki temu jeden model nie powinien psuć zależności drugiego modelu.
 
 ## Jak przygotować materiał, żeby lektor brzmiał dobrze?
 
@@ -383,7 +390,7 @@ Najlepszy efekt daje połączenie czystych napisów, dobrej próbki głosu, osob
 
 ## Podziękowania
 
-Projekt powstał dzięki analizie, testom i inspiracji wieloma rozwiązaniami TTS oraz narzędziami do pracy z lektorem.
+Projekt powstał dzięki analizie, testom i inspiracji wieloma rozwiązaniami TTS, STT oraz narzędziami do pracy z lektorem.
 
 Szczególne podziękowania:
 
@@ -391,4 +398,7 @@ Szczególne podziękowania:
 - projektowi [Chatterbox TTS](https://github.com/resemble-ai/chatterbox) za silnik TTS wykorzystywany w lokalnym generowaniu głosu,
 - projektowi [OmniVoice TTS](https://github.com/k2-fsa/OmniVoice) za silnik TTS wykorzystywany w lokalnym generowaniu głosu,
 - projektowi [Piper TTS](https://github.com/OHF-Voice/piper1-gpl) za szybki lokalny silnik TTS,
-- projektowi [Coqui XTTS-v2 / Coqui AI TTS](https://github.com/idiap/coqui-ai-TTS) za lokalny silnik TTS z obsługą klonowania głosu.
+- projektowi [Coqui XTTS-v2 / Coqui AI TTS](https://github.com/idiap/coqui-ai-TTS) za lokalny silnik TTS z obsługą klonowania głosu,
+- projektowi [faster-whisper](https://github.com/SYSTRAN/faster-whisper) za silnik STT,
+- projektowi [whisper.cpp](https://github.com/ggml-org/whisper.cpp) za lokalny silnik STT,
+- projektowi [WhisperX](https://github.com/m-bain/whisperX) za silnik STT z dokładniejszym wyrównywaniem timestampów.

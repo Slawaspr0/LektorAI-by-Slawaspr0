@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 APP_NAME = "LektorAI by Slawaspr0"
-APP_VERSION = "v1.2"
+APP_VERSION = "v1.3"
 APP_DIR = Path(__file__).resolve().parent
 APP_PACKAGES_DIR = APP_DIR / "packages"
 if APP_PACKAGES_DIR.is_dir() and str(APP_PACKAGES_DIR) not in sys.path:

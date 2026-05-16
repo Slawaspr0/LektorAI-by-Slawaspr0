@@ -367,6 +367,7 @@ def _run_command_capture_text(
     command: list[str],
     timeout: int,
     cancel_requested: Callable[[], bool] | None = None,
+    output_callback: Callable[[str], None] | None = None,
 ) -> CommandCaptureResult:
     process = subprocess.Popen(
         [
@@ -399,7 +400,7 @@ def _run_command_capture_text(
     timed_out = False
     try:
         while process.poll() is None:
-            _drain_text_output(output_queue, output_lines)
+            _drain_text_output(output_queue, output_lines, output_callback)
             if cancel_requested is not None and cancel_requested():
                 cancelled = True
                 _terminate_process_tree(process)
@@ -415,7 +416,7 @@ def _run_command_capture_text(
             _terminate_process_tree(process)
             return_code = process.wait(timeout=10)
         reader.join(timeout=2)
-        _drain_text_output(output_queue, output_lines)
+        _drain_text_output(output_queue, output_lines, output_callback)
     except Exception:
         _terminate_process_tree(process)
         raise
@@ -667,12 +668,19 @@ def run_ffmpeg_with_progress(
         raise RuntimeError("\n".join(tail[-80:]) or "ffmpeg failed")
 
 
-def _drain_text_output(output_queue: queue.Queue[str], output_lines: list[str]) -> None:
+def _drain_text_output(
+    output_queue: queue.Queue[str],
+    output_lines: list[str],
+    output_callback: Callable[[str], None] | None = None,
+) -> None:
     while True:
         try:
-            output_lines.append(output_queue.get_nowait())
+            line = output_queue.get_nowait()
         except queue.Empty:
             return
+        output_lines.append(line)
+        if output_callback is not None:
+            output_callback(line)
 
 
 def _drain_ffmpeg_progress_output(

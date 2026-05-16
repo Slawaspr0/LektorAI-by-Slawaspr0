@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.core.dictionary import sanitize_dictionary
+from app.core.gpu_devices import DeviceChoices, build_device_choices, detect_cuda_devices
 from app.core.logging import broken_json_backup_path
 from app.core.paths import AppPaths
 from app.engines.config_schema import ConfigField, fields_for
@@ -25,6 +26,10 @@ from app.stt.faster_whisper_runtime import faster_whisper_worker_env
 ProgressFn = Callable[[str], None]
 
 
+def should_recreate_venv(python_exists: bool, pip_available: bool) -> bool:
+    return bool(python_exists) and not bool(pip_available)
+
+
 class EngineRemovalError(RuntimeError):
     pass
 
@@ -34,6 +39,7 @@ class EngineManager:
         self.paths = paths
         self.definitions = {d.engine_id: d for d in get_engine_definitions()}
         self._package_check_cache: dict[tuple[str, str], tuple[str, ...]] = {}
+        self._cuda_device_cache: dict[str, tuple[dict[str, Any], ...]] = {}
 
     def list_states(self) -> list[EngineState]:
         return [self.state_for(defn.engine_id) for defn in self.definitions.values()]
@@ -150,6 +156,15 @@ class EngineManager:
             return False
         engine_dir = self.paths.engine_dir(engine_id)
         return engine_dir.exists() and self._venv_python(engine_dir).exists() and (engine_dir / "worker.py").exists()
+
+    def torch_device_choices(self, engine_id: str, *, include_auto: bool) -> DeviceChoices:
+        python_path = self._python_for_device_detection(engine_id)
+        cache_key = str(python_path)
+        devices = self._cuda_device_cache.get(cache_key)
+        if devices is None:
+            devices = detect_cuda_devices(python_path)
+            self._cuda_device_cache[cache_key] = devices
+        return build_device_choices(devices, include_auto=include_auto)
 
     def removable_payload_exists(self, engine_id: str) -> bool:
         engine_dir = self.paths.engine_dir(engine_id)
@@ -328,6 +343,23 @@ class EngineManager:
         if os.name == "nt":
             return engine_dir / "venv" / "Scripts" / "python.exe"
         return engine_dir / "venv" / "bin" / "python"
+
+    def _python_for_device_detection(self, engine_id: str) -> Path:
+        try:
+            definition = self.definitions[engine_id]
+        except KeyError:
+            return Path(sys.executable)
+        if definition.kind == EngineKind.LOCAL:
+            venv_python = self._venv_python(self.paths.engine_dir(engine_id))
+            if venv_python.exists():
+                return venv_python
+        for definition in self.definitions.values():
+            if definition.kind != EngineKind.LOCAL:
+                continue
+            venv_python = self._venv_python(self.paths.engine_dir(definition.engine_id))
+            if venv_python.exists():
+                return venv_python
+        return Path(sys.executable)
 
     def _has_api_key(self, engine_dir: Path) -> bool:
         return bool(self._api_key_source(engine_dir))
@@ -588,8 +620,17 @@ class EngineManager:
     def _ensure_venv(self, venv_dir: Path, log) -> None:
         python_path = self._venv_python(venv_dir.parent)
         if python_path.exists():
-            log.write("Venv istnieje, pomijam tworzenie.\n\n")
-            return
+            if self._venv_pip_available(python_path):
+                log.write("Venv istnieje i ma dzialajacy pip, pomijam tworzenie.\n\n")
+                return
+            if should_recreate_venv(True, False):
+                log.write("Venv istnieje, ale pip jest uszkodzony lub niepelny. Odtwarzam venv.\n")
+                log.flush()
+                self._remove_path(venv_dir)
+        elif venv_dir.exists():
+            log.write("Venv istnieje bez python.exe. Odtwarzam venv.\n")
+            log.flush()
+            self._remove_path(venv_dir)
         log.write("Tworzenie venv...\n")
         log.flush()
         temp_env = self._venv_creation_env(venv_dir)
@@ -606,6 +647,29 @@ class EngineManager:
                 else:
                     os.environ[name] = value
         log.write("Venv utworzony.\n\n")
+
+    def _venv_pip_available(self, python_path: Path) -> bool:
+        try:
+            startupinfo = None
+            creationflags = 0
+            if os.name == "nt":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                creationflags = subprocess.CREATE_NO_WINDOW
+            result = subprocess.run(
+                [str(python_path), "-m", "pip", "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
+            )
+        except Exception:
+            return False
+        return result.returncode == 0 and "pip" in (result.stdout or "").lower()
 
     def _bootstrap_venv_pip(self, venv_dir: Path, env: dict[str, str], log) -> None:
         bundled_dir = Path(sys.base_prefix) / "Lib" / "ensurepip" / "_bundled"

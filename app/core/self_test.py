@@ -13,6 +13,8 @@ from pathlib import Path
 from app.core.dictionary import sanitize_dictionary, save_dictionary
 from app.core.config import AppConfigStore
 from app.core.diagnostics import collect_diagnostics
+from app.core.download import progress_percent_step_for_size
+from app.core.gpu_devices import build_device_choices
 from app.core.logging import app_log_path, broken_json_backup_path, engine_log_path, safe_name, setup_app_logger
 from app.core.log_cleanup import cleanup_logs, preview_log_cleanup
 from app.core.media_tools import (
@@ -49,7 +51,16 @@ from app.core.paths import build_paths
 from app.core.preflight import build_preflight_report
 from app.core.version import APP_NAME, APP_VERSION
 from app.cli.engine_commands import remove_engine_command
-from app.engines.config_schema import fields_for, is_audio_qc_field, is_diagnostic_field, is_speech_qc_field, visible_fields_for
+from app.engines.config_schema import (
+    faster_whisper_device_kwargs,
+    fields_for,
+    is_audio_qc_field,
+    is_diagnostic_field,
+    is_speech_qc_field,
+    visible_fields_for,
+    whisper_qc_effective_compute_type,
+    whisper_qc_compute_type_options_for_device,
+)
 from app.engines.config_validation import validate_engine_config, validate_whisper_qc_dependency
 from app.engines.voice_sample_rules import (
     validate_voice_sample_duration,
@@ -57,7 +68,7 @@ from app.engines.voice_sample_rules import (
     voice_sample_rule,
 )
 from app.engines.install_specs import INSTALL_SPECS, TORCH_CU126_INDEX, TORCH_CU128_INDEX, get_install_spec, list_install_variants
-from app.engines.manager import EngineManager
+from app.engines.manager import EngineManager, should_recreate_venv
 from app.engines.protocol import (
     EngineRequest,
     EngineResult,
@@ -135,6 +146,45 @@ from app.pipeline.tts_job import (
 )
 from app.pipeline.audio_timeline import SAMPLE_RATE, SEGMENT_EDGE_FADE_MS, build_lektor_wav
 from app.pipeline.workspace import engine_short_code, lektor_assets_dir, lektorai_workspace_for, next_output_stem
+from app.stt.job import (
+    SttRemovedSegment,
+    SttSettings,
+    default_stt_transcribe_kwargs,
+    filter_stt_dialogue_segments,
+    filter_repeated_stt_hallucinations,
+    is_stt_non_dialogue_text,
+    is_stt_input_file,
+    load_whisperx_json_segments,
+    merge_short_stt_segments,
+    next_stt_output_stem,
+    save_stt_diagnostics,
+    split_stt_subtitle_segments,
+    split_stt_text,
+    stt_removed_segments_as_srt,
+    stt_removed_segments_payload,
+    stt_model_cache_key,
+    wrap_stt_subtitle_text,
+)
+from app.stt.languages import STT_LANGUAGE_CODES, STT_LANGUAGE_OPTIONS, stt_language_label
+from app.stt.subtitle_profiles import (
+    ENGLISH_USA_SUBTITLE_PROFILE,
+    FALLBACK_SUBTITLE_PROFILE,
+    subtitle_profile_for_language,
+)
+from app.stt.whisper_cpp_runtime import (
+    WHISPER_CPP_RUNTIME_PACKAGES,
+    build_whisper_cpp_command,
+    normalize_whisper_cpp_model_name,
+    sanitize_whisper_cpp_device,
+    sanitize_whisper_cpp_runtime,
+    whisper_cpp_model_file_name,
+)
+from app.stt.whisperx_runtime import (
+    build_whisperx_command,
+    normalize_whisperx_compute_type,
+    normalize_whisperx_model_name,
+    whisperx_device_args,
+)
 from app.ui.main_window import (
     audio_defaults_summary,
     build_start_confirmation_text,
@@ -171,6 +221,7 @@ from app.ui.dialogs.settings_dialog import (
     merge_engine_settings_values,
     diagnostic_field_groups,
     settings_help_button_label,
+    should_show_vram_info_button,
 )
 from app.ui.dialogs.dictionary_dialog import should_show_dictionary_row
 from app.ui.dialogs.dictionary_dialog import load_dictionary_external_file, save_dictionary_external_file
@@ -187,6 +238,12 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(paths.cache_dir == app_dir.resolve() / "cache", "portable app cache dir mismatch")
     _assert(paths.runtime_stt_dir == app_dir.resolve() / "stt", "portable STT runtime dir mismatch")
     _assert(paths.stt_dir("faster_whisper") == app_dir.resolve() / "stt" / "faster_whisper", "portable faster-whisper STT dir mismatch")
+    _assert(paths.whisper_cpp_stt_dir == app_dir.resolve() / "stt" / "whisper_cpp", "portable whisper.cpp STT dir mismatch")
+    _assert(paths.whisper_cpp_runtime_bin_dir == app_dir.resolve() / "stt" / "whisper_cpp" / "bin", "portable whisper.cpp runtime dir mismatch")
+    _assert(paths.whisper_cpp_runtime_metadata_path == app_dir.resolve() / "stt" / "whisper_cpp" / "runtime.json", "portable whisper.cpp runtime metadata mismatch")
+    _assert(paths.whisperx_stt_dir == app_dir.resolve() / "stt" / "whisperx", "portable WhisperX STT dir mismatch")
+    _assert(paths.whisperx_venv_dir == app_dir.resolve() / "stt" / "whisperx" / "venv", "portable WhisperX venv dir mismatch")
+    _assert(paths.whisperx_cache_dir == app_dir.resolve() / "stt" / "whisperx" / "cache", "portable WhisperX cache dir mismatch")
     _assert(paths.faster_whisper_packages_dir == app_dir.resolve() / "stt" / "faster_whisper" / "packages", "portable faster-whisper packages dir mismatch")
     _assert(paths.faster_whisper_cache_dir == app_dir.resolve() / "stt" / "faster_whisper" / "cache", "portable faster-whisper cache dir mismatch")
     _assert(paths.whisper_cache_dir == paths.faster_whisper_cache_dir, "legacy Whisper cache alias mismatch")
@@ -228,6 +285,11 @@ def run_self_test(app_dir: Path) -> list[str]:
         except OSError:
             pass
     messages.append("updater metadata: OK")
+
+    _assert(progress_percent_step_for_size(5 * 1024 * 1024) == 0, "small downloads should not report percent steps")
+    _assert(progress_percent_step_for_size(50 * 1024 * 1024) == 20, "medium downloads should report 20 percent steps")
+    _assert(progress_percent_step_for_size(500 * 1024 * 1024) == 10, "large downloads should report 10 percent steps")
+    messages.append("download progress policy: OK")
 
     version_result = subprocess.run(
         [sys.executable, "-B", str(app_dir / "START.py"), "--version"],
@@ -1240,6 +1302,36 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(any("skonczona" in error for error in nonfinite_errors), "non-finite float validation missing")
     device_errors = validate_engine_config("chatterbox", {"device": "gpu0"})
     _assert(any("Urzadzenie" in error for error in device_errors), "device validation label should be user friendly")
+    whisper_device_errors = validate_engine_config("chatterbox", {"whisper_qc_device": "auto"})
+    _assert(
+        any("Urzadzenie kontroli mowy" in error for error in whisper_device_errors),
+        "Whisper QC device validation label should be user friendly",
+    )
+    whisper_compute_errors = validate_engine_config("chatterbox", {"whisper_qc_compute_type": "fast"})
+    _assert(
+        any("Tryb kontroli mowy" in error for error in whisper_compute_errors),
+        "Whisper QC compute type validation label should be user friendly",
+    )
+    _assert(
+        whisper_qc_compute_type_options_for_device("cpu") == ("int8",),
+        "Whisper QC on CPU should expose only int8",
+    )
+    _assert(
+        "float16" in whisper_qc_compute_type_options_for_device("cuda:1"),
+        "Whisper QC on CUDA should expose float16",
+    )
+    _assert(
+        whisper_qc_effective_compute_type("cpu", "float16") == "int8",
+        "Whisper QC CPU should force int8 compute type",
+    )
+    _assert(
+        faster_whisper_device_kwargs("cuda:1") == {"device": "cuda", "device_index": 1},
+        "faster-whisper cuda:N kwargs mismatch",
+    )
+    _assert(
+        faster_whisper_device_kwargs("cpu") == {"device": "cpu"},
+        "faster-whisper CPU kwargs mismatch",
+    )
     omnivoice_range_errors = validate_engine_config("omnivoice", {"num_step": 2, "guidance_scale": 5.0, "speed": 2.0})
     _assert(any("Kroki inferencji" in error for error in omnivoice_range_errors), "omnivoice num_step range validation missing")
     _assert(any("CFG" in error for error in omnivoice_range_errors), "omnivoice CFG range validation missing")
@@ -1522,6 +1614,21 @@ def run_self_test(app_dir: Path) -> list[str]:
             f"{engine_id} Whisper QC default mismatch",
         )
         _assert(int(defaults[engine_id].get("whisper_qc_retry_attempts", 0)) >= 1, f"{engine_id} Whisper QC retry attempts should have a default")
+        _assert(defaults[engine_id].get("whisper_qc_device") == "cpu", f"{engine_id} Whisper QC should default to CPU")
+        _assert(defaults[engine_id].get("whisper_qc_compute_type") == "int8", f"{engine_id} Whisper QC should default to safe int8")
+        _assert(field_labels.get("whisper_qc_device") == "Urzadzenie", f"{engine_id} Whisper QC device label should be simple")
+        _assert(field_labels.get("whisper_qc_compute_type") == "Tryb pracy", f"{engine_id} Whisper QC compute label should be simple")
+    gpu_choices = build_device_choices(
+        (
+            {"index": 0, "name": "NVIDIA RTX 3090", "total_memory": 25769803776},
+            {"index": 1, "name": "NVIDIA RTX 3090", "total_memory": 25769803776},
+        ),
+        include_auto=True,
+    )
+    _assert(gpu_choices.values == ("auto", "cpu", "cuda:0", "cuda:1"), "GPU choices should expose detected CUDA devices")
+    _assert("RTX 3090" in gpu_choices.labels[2] and "24.0 GB" in gpu_choices.labels[2], "GPU choice labels should show card name and VRAM")
+    stt_gpu_choices = build_device_choices(({"index": 1, "name": "NVIDIA RTX 3090", "total_memory": 25769803776},), include_auto=False)
+    _assert(stt_gpu_choices.values == ("cpu", "cuda:1"), "STT choices should default to CPU without auto")
     for engine_id in ("chatterbox",):
         _assert("seed" in {field.key for field in fields_for(engine_id)}, f"{engine_id} seed should stay in config schema")
         _assert("seed" not in {field.key for field in visible_fields_for(engine_id)}, f"{engine_id} seed should be hidden from UI")
@@ -1633,7 +1740,7 @@ def run_self_test(app_dir: Path) -> list[str]:
     for engine_id in ("chatterbox", "omnivoice", "coqui_xtts"):
         device_field = next(field for field in fields_for(engine_id) if field.key == "device")
         _assert(device_field.field_type == "choice", f"{engine_id} device should be a dropdown")
-        _assert(device_field.options == ("auto", "cpu", "cuda", "cuda:0", "cuda:1"), f"{engine_id} device options mismatch")
+        _assert(device_field.options == ("auto", "cpu"), f"{engine_id} base device options should stay safe before GPU detection")
     messages.append("Whisper QC config fields: OK")
 
     _assert(normalize_for_whisper_qc("No już, silos!") == "no juz silos", "Whisper QC normalize mismatch")
@@ -2801,6 +2908,14 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(not should_enable_keep_settings_remove(True, False, False), "keep remove should be disabled without runtime")
     _assert(not should_enable_keep_settings_remove(True, True, True), "keep remove should be disabled while busy")
     _assert(should_enable_keep_settings_remove(True, True, False), "keep remove should be enabled for local runtime")
+    _assert(not should_recreate_venv(False, False), "missing venv should be created without rebuild path")
+    _assert(should_recreate_venv(True, False), "existing venv with broken pip should be recreated")
+    _assert(not should_recreate_venv(True, True), "existing venv with working pip should be reused")
+    _assert(should_show_vram_info_button("chatterbox"), "Chatterbox settings should show VRAM info")
+    _assert(should_show_vram_info_button("omnivoice"), "OmniVoice settings should show VRAM info")
+    _assert(should_show_vram_info_button("coqui_xtts"), "Coqui XTTS settings should show VRAM info")
+    _assert(not should_show_vram_info_button("piper"), "Piper settings should not show VRAM info")
+    _assert(not should_show_vram_info_button("edge"), "Edge settings should not show VRAM info")
     messages.append("settings dialog helpers: OK")
 
     config_store = AppConfigStore(app_dir / "_self_test_config.json")
@@ -2825,6 +2940,80 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(config_store.create_stereo_for_surround() is False, "surround stereo option setter mismatch")
         config_store.set_create_stereo_for_surround(True)
         _assert(config_store.create_stereo_for_surround() is True, "surround stereo option should accept true")
+        _assert(config_store.stt_settings() == SttSettings(), "default STT settings mismatch")
+        default_stt = config_store.stt_settings()
+        _assert(default_stt.accuracy == "standard", "default STT accuracy mismatch")
+        _assert(default_stt.vad_enabled is True, "default STT VAD should be enabled")
+        _assert(default_stt.vad_sensitivity == "standard", "default STT VAD sensitivity mismatch")
+        _assert(default_stt.whisperx_device == "cpu", "default WhisperX device should be CPU")
+        _assert(default_stt.whisperx_compute_type == "int8", "default WhisperX compute type should be int8")
+        _assert(default_stt.postprocess_enabled is True, "default STT postprocessing should be enabled")
+        _assert(default_stt.save_prepared_audio is False, "default STT prepared audio diagnostic should be disabled")
+        _assert(default_stt.save_report is False, "default STT report diagnostic should be disabled")
+        _assert(default_stt.save_log is False, "default STT log diagnostic should be disabled")
+        config_store.set_stt_model("large-v3")
+        config_store.set_stt_language("pl")
+        config_store.set_stt_device("cpu")
+        config_store.set_stt_compute_type("float16")
+        config_store.set_stt_accuracy("accurate")
+        config_store.set_stt_vad_enabled(False)
+        config_store.set_stt_vad_sensitivity("strong")
+        config_store.set_stt_postprocess_enabled(False)
+        config_store.set_stt_save_prepared_audio(True)
+        config_store.set_stt_save_report(True)
+        config_store.set_stt_save_log(True)
+        stt_settings = config_store.stt_settings()
+        _assert(stt_settings.model == "large-v3", "STT model setter mismatch")
+        _assert(stt_settings.language == "pl", "STT language setter mismatch")
+        _assert(stt_settings.device == "cpu", "STT device setter mismatch")
+        _assert(stt_settings.compute_type == "int8", "STT CPU compute type should be forced to int8")
+        _assert(stt_settings.accuracy == "accurate", "STT accuracy setter mismatch")
+        _assert(stt_settings.vad_enabled is False, "STT VAD enabled setter mismatch")
+        _assert(stt_settings.vad_sensitivity == "strong", "STT VAD sensitivity setter mismatch")
+        _assert(stt_settings.postprocess_enabled is False, "STT postprocessing setter mismatch")
+        _assert(stt_settings.save_prepared_audio is True, "STT prepared audio diagnostic setter mismatch")
+        _assert(stt_settings.save_report is True, "STT report diagnostic setter mismatch")
+        _assert(stt_settings.save_log is True, "STT log diagnostic setter mismatch")
+        config_store.set_stt_whisperx_device("cuda:1")
+        config_store.set_stt_whisperx_compute_type("float16")
+        whisperx_stt_settings = config_store.stt_settings()
+        _assert(whisperx_stt_settings.whisperx_device == "cuda:1", "WhisperX device setter mismatch")
+        _assert(whisperx_stt_settings.whisperx_compute_type == "float16", "WhisperX compute type setter mismatch")
+        config_store.set_stt_whisperx_device("cpu")
+        _assert(config_store.stt_settings().whisperx_compute_type == "int8", "WhisperX CPU compute type should be forced to int8")
+        config_store.set_stt_engine("whisperx")
+        whisperx_defaults = config_store.stt_settings()
+        _assert(whisperx_defaults.model == "small", "WhisperX should keep an independent model setting")
+        _assert(whisperx_defaults.whisperx_device == "cpu", "WhisperX should default to CPU independently")
+        _assert(whisperx_defaults.postprocess_enabled is True, "WhisperX postprocessing should default to enabled")
+        _assert(whisperx_defaults.save_report is False, "WhisperX diagnostics should default to disabled")
+        config_store.set_stt_model("medium")
+        config_store.set_stt_postprocess_enabled(False)
+        config_store.set_stt_save_report(True)
+        config_store.set_stt_whisperx_device("cuda:1")
+        config_store.set_stt_engine("faster_whisper")
+        faster_again = config_store.stt_settings()
+        _assert(faster_again.model == "large-v3", "faster-whisper model should not be changed by WhisperX")
+        _assert(faster_again.device == "cpu", "faster-whisper device should stay independent from WhisperX")
+        _assert(faster_again.postprocess_enabled is False, "faster-whisper postprocessing should stay independent from WhisperX")
+        _assert(faster_again.save_report is True, "faster-whisper diagnostics should stay independent from WhisperX")
+        config_store.set_stt_engine("whisper_cpp")
+        whisper_cpp_defaults = config_store.stt_settings()
+        _assert(whisper_cpp_defaults.model == "small", "whisper.cpp should keep an independent model setting")
+        _assert(whisper_cpp_defaults.whisper_cpp_runtime == "cpu", "whisper.cpp should default to CPU runtime")
+        _assert(whisper_cpp_defaults.whisper_cpp_device == "auto", "whisper.cpp CUDA device should default to auto")
+        _assert(whisper_cpp_defaults.postprocess_enabled is True, "whisper.cpp postprocessing should default to enabled")
+        _assert(whisper_cpp_defaults.save_report is False, "whisper.cpp diagnostics should default to disabled")
+        config_store.set_stt_accuracy("bad")
+        config_store.set_stt_vad_sensitivity("bad")
+        _assert(config_store.stt_settings().accuracy == "standard", "STT should sanitize unknown accuracy")
+        _assert(config_store.stt_settings().vad_sensitivity == "standard", "STT should sanitize unknown VAD sensitivity")
+        config_store.set_stt_language("ja")
+        _assert(config_store.stt_settings().language == "ja", "STT should accept Japanese language code")
+        config_store.set_stt_language("de")
+        _assert(config_store.stt_settings().language == "de", "STT should accept German language code")
+        config_store.set_stt_language("bad-language")
+        _assert(config_store.stt_settings().language == "auto", "STT should sanitize unknown language code")
     finally:
         try:
             (app_dir / "_self_test_config.json").unlink()
@@ -2970,6 +3159,13 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(isinstance(bad_sections_data.get("output"), dict), "bad output section should be restored")
         _assert(bad_sections_data["ui"]["last_file_dir"] == "", "bad ui section default mismatch")
         _assert(bad_sections_data["tts"]["last_engine"] == "", "bad tts section default mismatch")
+        _assert(bad_sections_data["stt"]["engine"] == "faster_whisper", "bad stt section default mismatch")
+        bad_sections_store.set_stt_engine("whisper_cpp")
+        _assert(bad_sections_store.stt_settings().engine == "whisper_cpp", "STT engine selection should persist")
+        bad_sections_store.set_stt_engine("whisperx")
+        _assert(bad_sections_store.stt_settings().engine == "whisperx", "WhisperX STT engine selection should persist")
+        bad_sections_store.set_stt_whisper_cpp_threads("12")
+        _assert(bad_sections_store.stt_settings().whisper_cpp_threads == 12, "whisper.cpp thread setting should persist")
         _assert(bad_sections_data["output"]["aac_bitrate"] == "384k", "bad output section AAC bitrate default mismatch")
         _assert(bad_sections_data["custom_root_flag"] == "keep-root", "custom root key should survive bad section repair")
         bad_sections_store.set_last_file_dir(str(app_dir))
@@ -2982,6 +3178,333 @@ def run_self_test(app_dir: Path) -> list[str]:
         except OSError:
             pass
     messages.append("app config bad sections: OK")
+
+    stt_output_probe_dir = app_dir / "_self_test_stt_workspace"
+    try:
+        video_path = stt_output_probe_dir / "Film testowy.mkv"
+        audio_path = stt_output_probe_dir / "Glos.wav"
+        subtitle_path = stt_output_probe_dir / "Napisy.srt"
+        stt_output_probe_dir.mkdir(parents=True, exist_ok=True)
+        video_path.write_text("", encoding="utf-8")
+        audio_path.write_text("", encoding="utf-8")
+        subtitle_path.write_text("", encoding="utf-8")
+        _assert(is_stt_input_file(video_path), "STT should accept video input")
+        _assert(is_stt_input_file(audio_path), "STT should accept audio input")
+        _assert(not is_stt_input_file(subtitle_path), "STT should not accept subtitle input")
+        first_stem = next_stt_output_stem(stt_output_probe_dir, video_path)
+        _assert(first_stem.endswith("_Film_testowy_STT_FW"), "STT output stem should include source and engine")
+        (stt_output_probe_dir / first_stem).mkdir()
+        second_stem = next_stt_output_stem(stt_output_probe_dir, video_path)
+        _assert(second_stem == f"{first_stem}_2", "STT output stem should avoid collisions")
+        cpp_stem = next_stt_output_stem(stt_output_probe_dir, video_path, engine="whisper_cpp")
+        _assert(cpp_stem.endswith("_Film_testowy_STT_WCPP"), "whisper.cpp STT output stem should include engine code")
+    finally:
+        _cleanup_tree(stt_output_probe_dir)
+    messages.append("STT helpers: OK")
+    _assert(STT_LANGUAGE_CODES[0] == "auto", "STT language list should start with auto")
+    _assert({"pl", "en", "de", "ja", "zh"}.issubset(set(STT_LANGUAGE_CODES)), "STT language list should include common Whisper languages")
+    _assert(len(STT_LANGUAGE_OPTIONS) > 80, "STT should expose full Whisper language list")
+    _assert(stt_language_label("ja").startswith("ja - "), "STT language label should include language code")
+    _assert(
+        stt_model_cache_key("small", "cuda:1", "float16", paths.faster_whisper_cache_dir)
+        == ("small", "cuda:1", "float16", str(paths.faster_whisper_cache_dir)),
+        "STT model cache key mismatch",
+    )
+    stt_kwargs = default_stt_transcribe_kwargs()
+    _assert(stt_kwargs["vad_filter"] is True, "STT should enable VAD to reduce silence hallucinations")
+    _assert(stt_kwargs["condition_on_previous_text"] is False, "STT should not carry previous text between windows")
+    _assert(stt_kwargs["temperature"] == 0.0, "STT should use deterministic transcription by default")
+    accurate_stt_kwargs = default_stt_transcribe_kwargs(SttSettings(accuracy="accurate", vad_sensitivity="strong"))
+    _assert(accurate_stt_kwargs["beam_size"] == 8, "STT accurate mode should increase beam size")
+    _assert(accurate_stt_kwargs["vad_parameters"]["min_silence_duration_ms"] == 250, "STT strong VAD should use shorter silence threshold")
+    fast_no_vad_kwargs = default_stt_transcribe_kwargs(SttSettings(accuracy="fast", vad_enabled=False))
+    _assert(fast_no_vad_kwargs["beam_size"] == 1, "STT fast mode should reduce beam size")
+    _assert(fast_no_vad_kwargs["vad_filter"] is False, "STT should allow disabling VAD")
+    _assert("vad_parameters" not in fast_no_vad_kwargs, "STT disabled VAD should not pass VAD parameters")
+    _assert(whisper_cpp_model_file_name("large-v3") == "ggml-large-v3.bin", "whisper.cpp model file mismatch")
+    _assert(whisper_cpp_model_file_name("turbo") == "ggml-large-v3-turbo.bin", "whisper.cpp turbo model file mismatch")
+    _assert(whisper_cpp_model_file_name("large") == "ggml-large-v3.bin", "whisper.cpp large alias mismatch")
+    _assert(normalize_whisper_cpp_model_name("large") == "large-v3", "whisper.cpp large model normalize mismatch")
+    _assert(set(WHISPER_CPP_RUNTIME_PACKAGES) == {"cpu", "cuda"}, "whisper.cpp runtime variants mismatch")
+    _assert(sanitize_whisper_cpp_runtime("CUDA") == "cuda", "whisper.cpp runtime sanitize mismatch")
+    _assert(sanitize_whisper_cpp_device("cuda:1") == "cuda:1", "whisper.cpp device sanitize mismatch")
+    cpp_command = build_whisper_cpp_command(
+        exe_path=Path("whisper-cli.exe"),
+        model_path=Path("models") / "ggml-small.bin",
+        input_wav=Path("audio.wav"),
+        output_base=Path("wynik"),
+        language="pl",
+        threads=6,
+    )
+    _assert(cpp_command[:6] == ["whisper-cli.exe", "-m", str(Path("models") / "ggml-small.bin"), "-f", "audio.wav", "-osrt"], "whisper.cpp command core args mismatch")
+    _assert("-l" in cpp_command and "pl" in cpp_command, "whisper.cpp command should pass language")
+    _assert("-t" in cpp_command and "6" in cpp_command, "whisper.cpp command should pass thread count")
+    _assert("-pp" in cpp_command, "whisper.cpp command should enable progress output")
+    _assert("-sns" in cpp_command, "whisper.cpp command should suppress non-speech tokens")
+    cpp_cpu_command = build_whisper_cpp_command(
+        exe_path=Path("whisper-cli.exe"),
+        model_path=Path("models") / "ggml-small.bin",
+        input_wav=Path("audio.wav"),
+        output_base=Path("wynik"),
+        device="cpu",
+    )
+    _assert("-ng" in cpp_cpu_command, "whisper.cpp CPU command should disable GPU")
+    cpp_cuda_command = build_whisper_cpp_command(
+        exe_path=Path("whisper-cli.exe"),
+        model_path=Path("models") / "ggml-small.bin",
+        input_wav=Path("audio.wav"),
+        output_base=Path("wynik"),
+        device="cuda:1",
+    )
+    _assert("-dev" in cpp_cuda_command and "1" in cpp_cuda_command, "whisper.cpp CUDA command should select GPU")
+    _assert(whisperx_device_args("cuda:1") == ("cuda", 1), "WhisperX should split cuda device index")
+    _assert(whisperx_device_args("cpu") == ("cpu", 0), "WhisperX should accept CPU device")
+    _assert(normalize_whisperx_compute_type("float16", "cpu") == "int8", "WhisperX CPU should avoid float16")
+    _assert(normalize_whisperx_compute_type("float16", "cuda") == "float16", "WhisperX CUDA should keep float16")
+    _assert(normalize_whisperx_model_name("turbo") == "large-v3-turbo", "WhisperX turbo alias mismatch")
+    whisperx_command = build_whisperx_command(
+        python_path=Path("python.exe"),
+        input_wav=Path("audio.wav"),
+        output_dir=Path("out"),
+        model="small",
+        model_dir=Path("cache"),
+        language="pl",
+        device="cuda:1",
+        compute_type="float16",
+        batch_size=8,
+        beam_size=5,
+    )
+    _assert(whisperx_command[:3] == ["python.exe", "-m", "whisperx"], "WhisperX command core args mismatch")
+    _assert("--output_format" in whisperx_command and "json" in whisperx_command, "WhisperX command should write JSON")
+    _assert("--device" in whisperx_command and "cuda" in whisperx_command, "WhisperX command should use CUDA")
+    _assert("--device_index" in whisperx_command and "1" in whisperx_command, "WhisperX command should select GPU index")
+    _assert("--language" in whisperx_command and "pl" in whisperx_command, "WhisperX command should pass selected language")
+    whisperx_json_probe = app_dir / "_self_test_whisperx.json"
+    try:
+        whisperx_json_probe.write_text(
+            json.dumps(
+                {
+                    "language": "en",
+                    "segments": [
+                        {"start": 1.25, "end": 2.5, "text": "Hello there."},
+                        {"start": 2.5, "end": 3.0, "text": ""},
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        whisperx_segments, whisperx_language = load_whisperx_json_segments(whisperx_json_probe)
+        _assert(whisperx_language == "en", "WhisperX JSON parser should preserve detected language")
+        _assert(len(whisperx_segments) == 1 and whisperx_segments[0].start_ms == 1250, "WhisperX JSON parser should convert timestamps")
+    finally:
+        whisperx_json_probe.unlink(missing_ok=True)
+    _assert(subtitle_profile_for_language("en") == ENGLISH_USA_SUBTITLE_PROFILE, "STT should use English USA profile for English")
+    _assert(subtitle_profile_for_language("english") == ENGLISH_USA_SUBTITLE_PROFILE, "STT should accept normalized English language names")
+    _assert(subtitle_profile_for_language("pl") == FALLBACK_SUBTITLE_PROFILE, "STT should use global fallback until language profile exists")
+    _assert(is_stt_non_dialogue_text("*Dramatic music*"), "STT should treat music descriptions as non-dialogue")
+    _assert(is_stt_non_dialogue_text("[applause]"), "STT should treat bracketed sound descriptions as non-dialogue")
+    _assert(is_stt_non_dialogue_text("The End"), "STT should treat common silence hallucinations as non-dialogue")
+    _assert(not is_stt_non_dialogue_text("I love music."), "STT should not drop normal dialogue containing the word music")
+    removed_stt_details: list[SttRemovedSegment] = []
+    dialogue_segments, removed_non_dialogue = filter_stt_dialogue_segments(
+        [
+            SubtitleSegment(index=1, start_ms=0, end_ms=1000, text="*Dramatic music*"),
+            SubtitleSegment(index=2, start_ms=1000, end_ms=2000, text="Are you okay?"),
+            SubtitleSegment(index=3, start_ms=2000, end_ms=3000, text="[applause]"),
+        ],
+        removed_segments=removed_stt_details,
+    )
+    _assert(removed_non_dialogue == 2 and len(dialogue_segments) == 1, "STT should filter obvious non-dialogue captions")
+    _assert(dialogue_segments[0].index == 1 and dialogue_segments[0].text == "Are you okay?", "STT dialogue filter should reindex segments")
+    _assert(len(removed_stt_details) == 2 and removed_stt_details[0].start_ms == 0, "STT should remember removed non-dialogue timestamps")
+    repeated_removed_details: list[SttRemovedSegment] = []
+    repeated_segments, repeated_removed = filter_repeated_stt_hallucinations(
+        [
+            SubtitleSegment(index=1, start_ms=152700, end_ms=153240, text="Trigger, trigger."),
+            SubtitleSegment(index=2, start_ms=153240, end_ms=153540, text="Trigger, trigger."),
+            SubtitleSegment(index=3, start_ms=155000, end_ms=156000, text="Real dialogue."),
+        ],
+        removed_segments=repeated_removed_details,
+    )
+    _assert(repeated_removed == 2 and len(repeated_segments) == 1, "STT should filter repeated short hallucination groups")
+    _assert(repeated_segments[0].index == 1 and repeated_segments[0].text == "Real dialogue.", "STT repeated filter should reindex remaining segments")
+    _assert(len(repeated_removed_details) == 2 and "trigger" in repeated_removed_details[0].reason, "STT should remember repeated hallucination timestamps")
+    removed_payload = stt_removed_segments_payload(repeated_removed_details)
+    _assert(removed_payload[0]["start"] == "00:02:32,700", "STT removed payload should include readable timestamps")
+    removed_srt_segments = stt_removed_segments_as_srt(repeated_removed_details)
+    _assert(removed_srt_segments[0].text.startswith("[powtorzony fragment: trigger]"), "STT removed SRT should include removal reason")
+    stt_diag_dir = app_dir / "_self_test_stt_diag"
+    _cleanup_tree(stt_diag_dir)
+    stt_diag_dir.mkdir(parents=True, exist_ok=True)
+    stt_diag_events = ["STT: test"]
+    try:
+        save_stt_diagnostics(
+            output_dir=stt_diag_dir,
+            temp_wav=stt_diag_dir / "missing.wav",
+            source_path=app_dir / "Film testowy.mkv",
+            settings=SttSettings(save_report=True, save_log=True),
+            transcribe_kwargs={"beam_size": 5},
+            detected_language="en",
+            subtitle_profile=ENGLISH_USA_SUBTITLE_PROFILE,
+            raw_segment_count=3,
+            final_segment_count=1,
+            duration_seconds=1.25,
+            events=stt_diag_events,
+            removed_segments=repeated_removed_details,
+        )
+        stt_report = json.loads((stt_diag_dir / "stt_report.json").read_text(encoding="utf-8"))
+        _assert(stt_report["removed_segments"]["count"] == 2, "STT report should include removed postprocessing fragments")
+        _assert((stt_diag_dir / "stt_removed_segments.srt").is_file(), "STT diagnostics should save removed fragments as SRT")
+        _assert("00:02:32,700 --> 00:02:33,240" in (stt_diag_dir / "stt_removed_segments.srt").read_text(encoding="utf-8"), "STT removed SRT should preserve timestamps")
+    finally:
+        _cleanup_tree(stt_diag_dir)
+    repeated_single_word_segments, repeated_single_word_removed = filter_repeated_stt_hallucinations(
+        [
+            SubtitleSegment(index=1, start_ms=152700, end_ms=152970, text="Trigger,"),
+            SubtitleSegment(index=2, start_ms=152970, end_ms=153240, text="trigger."),
+            SubtitleSegment(index=3, start_ms=153240, end_ms=153390, text="Trigger,"),
+            SubtitleSegment(index=4, start_ms=153390, end_ms=153540, text="trigger."),
+            SubtitleSegment(index=5, start_ms=155000, end_ms=156000, text="Real dialogue."),
+        ]
+    )
+    _assert(repeated_single_word_removed == 4 and len(repeated_single_word_segments) == 1, "STT should filter repeated single-word hallucination groups")
+    single_uncommon_word, single_uncommon_word_removed = filter_repeated_stt_hallucinations(
+        [SubtitleSegment(index=1, start_ms=1000, end_ms=1600, text="Trigger.")]
+    )
+    _assert(single_uncommon_word_removed == 0 and len(single_uncommon_word) == 1, "STT should keep a single suspicious word")
+    common_repeat, common_repeat_removed = filter_repeated_stt_hallucinations(
+        [
+            SubtitleSegment(index=1, start_ms=1000, end_ms=1300, text="No, no."),
+            SubtitleSegment(index=2, start_ms=1300, end_ms=1600, text="No, no."),
+        ]
+    )
+    _assert(common_repeat_removed == 0 and len(common_repeat) == 2, "STT should keep common dialogue repeats")
+    short_tail_segments, short_tail_merge_count = merge_short_stt_segments(
+        [
+            SubtitleSegment(index=1, start_ms=162920, end_ms=164232, text="Skiff's had a vital signs on"),
+            SubtitleSegment(index=2, start_ms=164232, end_ms=164420, text="her."),
+            SubtitleSegment(index=3, start_ms=169280, end_ms=169986, text="I'm going to check"),
+            SubtitleSegment(index=4, start_ms=169986, end_ms=170260, text="pupils."),
+        ],
+        profile=ENGLISH_USA_SUBTITLE_PROFILE,
+    )
+    formatted_short_tail = split_stt_subtitle_segments(short_tail_segments, profile=ENGLISH_USA_SUBTITLE_PROFILE)
+    _assert(short_tail_merge_count == 2, "STT should merge short tail fragments")
+    _assert(
+        [item.text for item in formatted_short_tail]
+        == ["Skiff's had a vital signs on her.", "I'm going to check pupils."],
+        "STT should keep short one-word tails in the same subtitle cue",
+    )
+    inbound_tail_segments, inbound_tail_merge_count = merge_short_stt_segments(
+        [
+            SubtitleSegment(index=1, start_ms=126000, end_ms=128119, text="Get her loaded up and tell County we've got one"),
+            SubtitleSegment(index=2, start_ms=128119, end_ms=128480, text="inbound."),
+        ],
+        profile=ENGLISH_USA_SUBTITLE_PROFILE,
+    )
+    _assert(inbound_tail_merge_count == 1, "STT should merge a single-word sentence tail from the next timestamp")
+    _assert(
+        split_stt_subtitle_segments(inbound_tail_segments, profile=ENGLISH_USA_SUBTITLE_PROFILE)[0].text
+        == "Get her loaded up and tell County we've got one inbound.",
+        "STT should keep a single-word sentence tail with the previous cue",
+    )
+    _assert(
+        "\n" not in wrap_stt_subtitle_text("alpha beta gamma delta watermelon", max_line_chars=25),
+        "STT output should keep each cue as a single line",
+    )
+    old_repeated_segments, old_repeated_removed = filter_repeated_stt_hallucinations(
+        [
+            SubtitleSegment(index=1, start_ms=152700, end_ms=152970, text="Trigger,"),
+            SubtitleSegment(index=2, start_ms=152970, end_ms=153240, text="trigger."),
+            SubtitleSegment(index=3, start_ms=153240, end_ms=153390, text="Trigger,"),
+            SubtitleSegment(index=4, start_ms=155000, end_ms=156000, text="Real dialogue."),
+        ]
+    )
+    _assert(old_repeated_removed == 3 and len(old_repeated_segments) == 1, "STT should also filter three-item repeated hallucination groups")
+    merged_short_segments, short_merge_count = merge_short_stt_segments(
+        [
+            SubtitleSegment(index=1, start_ms=99140, end_ms=99764, text="What happened to"),
+            SubtitleSegment(index=2, start_ms=99764, end_ms=99920, text="you?"),
+            SubtitleSegment(index=3, start_ms=100500, end_ms=101100, text="Next sentence."),
+        ],
+        profile=ENGLISH_USA_SUBTITLE_PROFILE,
+    )
+    _assert(short_merge_count == 1, "STT should merge sentence fragments split by whisper.cpp")
+    _assert(merged_short_segments[0].text == "What happened to you?", "STT should preserve merged sentence text")
+    _assert(len(merged_short_segments) == 2 and merged_short_segments[0].index == 1 and merged_short_segments[1].index == 2, "STT merged segments should be reindexed")
+    medical_fragments, medical_merge_count = merge_short_stt_segments(
+        [
+            SubtitleSegment(index=1, start_ms=194140, end_ms=195551, text="We're coming in with a Caucasian"),
+            SubtitleSegment(index=2, start_ms=195551, end_ms=195860, text="female,"),
+            SubtitleSegment(index=3, start_ms=196220, end_ms=197100, text="mid to late 20s,"),
+            SubtitleSegment(index=4, start_ms=197400, end_ms=198160, text="in severe shock,"),
+            SubtitleSegment(index=5, start_ms=198380, end_ms=198796, text="multiple"),
+            SubtitleSegment(index=6, start_ms=198796, end_ms=199420, text="lacerations,"),
+            SubtitleSegment(index=7, start_ms=199860, end_ms=200622, text="possible gunshot"),
+            SubtitleSegment(index=8, start_ms=200622, end_ms=200860, text="wound"),
+            SubtitleSegment(index=9, start_ms=200860, end_ms=201485, text="through the left"),
+            SubtitleSegment(index=10, start_ms=201485, end_ms=201680, text="hand,"),
+            SubtitleSegment(index=11, start_ms=201980, end_ms=202489, text="through and"),
+            SubtitleSegment(index=12, start_ms=202489, end_ms=202860, text="through."),
+        ],
+        profile=ENGLISH_USA_SUBTITLE_PROFILE,
+    )
+    _assert(medical_merge_count == 11 and len(medical_fragments) == 1, "STT should rebuild heavily split whisper.cpp sentences before formatting")
+    _assert("possible gunshot wound through the left hand" in medical_fragments[0].text, "STT should preserve text while rebuilding split sentence")
+    medical_formatted = split_stt_subtitle_segments(medical_fragments, profile=ENGLISH_USA_SUBTITLE_PROFILE)
+    _assert(len(medical_formatted) == 1, "STT should keep rebuilt complete sentences together for translation and TTS")
+    complete_sentence_fragments, complete_sentence_merge_count = merge_short_stt_segments(
+        [
+            SubtitleSegment(index=1, start_ms=388100, end_ms=392426, text="You made it very clear a long time ago that you're not interested in being my"),
+            SubtitleSegment(index=2, start_ms=392426, end_ms=392819, text="sister,"),
+            SubtitleSegment(index=3, start_ms=392819, end_ms=393100, text="okay?"),
+        ],
+        profile=ENGLISH_USA_SUBTITLE_PROFILE,
+    )
+    _assert(complete_sentence_merge_count == 2 and len(complete_sentence_fragments) == 1, "STT should merge complete sentence fragments split by timestamps")
+    complete_sentence_formatted = split_stt_subtitle_segments(complete_sentence_fragments, profile=ENGLISH_USA_SUBTITLE_PROFILE)
+    _assert(
+        [item.text for item in complete_sentence_formatted]
+        == ["You made it very clear a long time ago that you're not interested in being my sister, okay?"],
+        "STT should keep a complete sentence in one cue even when it is longer than subtitle display limits",
+    )
+    long_stt_text = "are you okay? Can you hear me? I've got someone on the south lawn. We need paramedics over here"
+    split_text = split_stt_text(long_stt_text)
+    _assert(
+        split_text
+        == [
+            "are you okay?",
+            "Can you hear me?",
+            "I've got someone on the south lawn.",
+            "We need paramedics over here",
+        ],
+        "STT should split long subtitle text at sentence boundaries",
+    )
+    long_sentence = "This is a very long subtitle line that has no punctuation and still should be split in a readable place"
+    _assert(max(len(part.replace("\n", " ")) for part in split_stt_text(long_sentence)) <= 64, "STT should split long unpunctuated text")
+    formatted_segments = split_stt_subtitle_segments(
+        [SubtitleSegment(index=1, start_ms=1000, end_ms=9000, text=long_stt_text)]
+    )
+    _assert(len(formatted_segments) == 4, "STT should split one long segment into multiple SRT cues")
+    _assert(formatted_segments[0].start_ms == 1000 and formatted_segments[-1].end_ms == 9000, "STT split should preserve segment bounds")
+    _assert(all("\n" not in item.text for item in formatted_segments), "STT output should not use multiline cues")
+    dense_text = "One two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen."
+    dense_segments = split_stt_subtitle_segments(
+        [SubtitleSegment(index=1, start_ms=1000, end_ms=3000, text=dense_text)],
+        profile=ENGLISH_USA_SUBTITLE_PROFILE,
+    )
+    _assert(
+        all(len(item.text.splitlines()) == 1 for item in dense_segments),
+        "English STT profile should keep subtitles to one line",
+    )
+    high_cps_text = "One two three four five six seven eight nine ten."
+    high_cps_segments = split_stt_subtitle_segments(
+        [SubtitleSegment(index=1, start_ms=1000, end_ms=2000, text=high_cps_text)],
+        profile=ENGLISH_USA_SUBTITLE_PROFILE,
+    )
+    _assert(len(high_cps_segments) == 1, "English STT profile should not split only because reading speed is high")
+    messages.append("STT languages: OK")
 
     config_store = AppConfigStore(app_dir / "_self_test_config_filter.json")
     unsupported_path = app_dir / "_self_test_unsupported.bin"

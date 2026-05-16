@@ -2,6 +2,13 @@
 
 W tym pliku beda zapisywane publiczne zmiany miedzy kolejnymi wersjami LektorAI by Slawaspr0.
 
+## v1.3
+
+- Dodano silniki STT: faster-whisper, whisper.cpp oraz WhisperX.
+- Dodano dodatkowe formatowanie dla STT.
+- Tam, gdzie to możliwe, dodano użycie GPU.
+- Dodano orientacyjną tabelę zużycia VRAM dla modeli TTS.
+
 ## v1.2
 
 - Dodano aktualizator aplikacji.

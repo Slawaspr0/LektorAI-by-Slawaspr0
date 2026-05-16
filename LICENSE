@@ -28,7 +28,7 @@ This MIT License applies only to the LektorAI by Slawaspr0 application code
 written for this project.
 
 LektorAI by Slawaspr0 can install, call, launch or interoperate with external
-TTS engines, APIs, models, Python packages and command-line tools. Those
+TTS/STT engines, APIs, models, Python packages and command-line tools. Those
 external components are not relicensed by this MIT License. They remain under
 their own licenses, terms of service, model licenses and usage policies.
 
@@ -104,11 +104,54 @@ under their own licenses. The XTTS-v2 model license may include
 non-commercial-use restrictions unless the user has separate commercial rights.
 
 
+faster-whisper
+--------------
+
+faster-whisper is an external STT engine by SYSTRAN.
+
+Project: https://github.com/SYSTRAN/faster-whisper
+License: MIT License.
+
+faster-whisper is not owned by this project. If installed or used through
+LektorAI by Slawaspr0, it remains licensed by its original authors under its own
+license. Speech recognition models used with faster-whisper may have their own
+licenses and terms.
+
+
+whisper.cpp
+-----------
+
+whisper.cpp is an external STT engine by the ggml authors.
+
+Project: https://github.com/ggml-org/whisper.cpp
+License: MIT License.
+
+whisper.cpp is not owned by this project. If installed or used through LektorAI
+by Slawaspr0, it remains licensed by its original authors under its own license.
+Speech recognition models used with whisper.cpp may have their own licenses and
+terms.
+
+
+WhisperX
+--------
+
+WhisperX is an external STT engine.
+
+Project: https://github.com/m-bain/whisperX
+License: BSD 2-Clause License.
+
+WhisperX is not owned by this project. If installed or used through LektorAI by
+Slawaspr0, it remains licensed by its original authors under its own license.
+Speech recognition, alignment and diarization models used with WhisperX may
+have their own licenses and terms.
+
+
 External binaries and dependencies
 ----------------------------------
 
 LektorAI by Slawaspr0 may use external binaries and Python packages such as
-ffmpeg, ffprobe, mkvmerge, PyTorch, faster-whisper and other dependencies.
+ffmpeg, ffprobe, mkvmerge, PyTorch, faster-whisper, whisper.cpp, WhisperX and
+other dependencies.
 These components remain under their own licenses and are not relicensed by this
 MIT License.
 

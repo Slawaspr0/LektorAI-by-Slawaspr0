@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,32 @@ from app.engines.config_schema import (
     is_diagnostic_field,
     is_speech_qc_field,
     visible_fields_for,
+    whisper_qc_compute_type_labels_for_options,
+    whisper_qc_compute_type_options_for_device,
+)
+
+
+FieldOptionOverrides = dict[str, tuple[tuple[str, ...], tuple[str, ...]]]
+VRAM_INFO_ENGINE_IDS: tuple[str, ...] = ("chatterbox", "omnivoice", "coqui_xtts")
+
+
+TTS_VRAM_ESTIMATES: tuple[tuple[str, str], ...] = (
+    ("Chatterbox", "ok. 4 GB"),
+    ("OmniVoice", "ok. 2.5 GB"),
+    ("Coqui XTTS-v2", "ok. 2 GB"),
+)
+
+
+WHISPER_VRAM_ESTIMATES: tuple[tuple[str, str, str], ...] = (
+    ("tiny", "ok. 0.4 GB", "ok. 0.5 GB"),
+    ("base", "ok. 0.5 GB", "ok. 0.6 GB"),
+    ("small", "ok. 0.8 GB", "ok. 1 GB"),
+    ("medium", "ok. 1.5 GB", "ok. 2.5 GB"),
+    ("large", "ok. 2.5 GB", "ok. 4.8 GB"),
+    ("large-v1", "ok. 2.5 GB", "ok. 4.8 GB"),
+    ("large-v2", "ok. 2.5 GB", "ok. 4.8 GB"),
+    ("large-v3", "ok. 2.5 GB", "ok. 4.8 GB"),
+    ("turbo / large-v3-turbo", "ok. 1.5 GB", "ok. 2.6 GB"),
 )
 
 
@@ -81,11 +108,13 @@ class EngineSettingsDialog(QtWidgets.QDialog):
         engine_id: str,
         config: dict[str, Any],
         default_config: dict[str, Any],
+        option_overrides: FieldOptionOverrides | None = None,
     ) -> None:
         super().__init__(parent)
         self.engine_id = engine_id
         self.config = dict(config)
         self.default_config = dict(default_config)
+        self.option_overrides = dict(option_overrides or {})
         self.widgets: dict[str, QtWidgets.QWidget] = {}
         self.setWindowTitle(f"Ustawienia TTS - {engine_name}")
         self.resize(680, 520)
@@ -98,7 +127,7 @@ class EngineSettingsDialog(QtWidgets.QDialog):
         scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         content = QtWidgets.QWidget()
         content_layout = QtWidgets.QVBoxLayout(content)
-        fields = visible_fields_for(self.engine_id)
+        fields = self._visible_fields()
         model_fields = tuple(
             field
             for field in fields
@@ -114,7 +143,8 @@ class EngineSettingsDialog(QtWidgets.QDialog):
                 else len(DIAGNOSTIC_FIELD_KEYS),
             )
         )
-
+        if should_show_vram_info_button(self.engine_id):
+            content_layout.addWidget(self._vram_info_button())
         content_layout.addLayout(self._form_for(model_fields))
         if audio_qc_fields:
             self._add_section(content_layout, "Kontrola audio", "Techniczna kontrola wygenerowanego pliku audio.")
@@ -149,6 +179,7 @@ class EngineSettingsDialog(QtWidgets.QDialog):
         buttons.addWidget(self.btn_restore)
         buttons.addWidget(self.btn_exit)
         root.addLayout(buttons)
+        self._wire_whisper_compute_type_guard()
 
     def _add_section(self, layout: QtWidgets.QVBoxLayout, title: str, tooltip: str) -> None:
         line = QtWidgets.QFrame()
@@ -175,10 +206,48 @@ class EngineSettingsDialog(QtWidgets.QDialog):
             self.widgets[field.key] = widget
         return form
 
+    def _vram_info_button(self) -> QtWidgets.QPushButton:
+        button = QtWidgets.QPushButton("Zuzycie VRAM")
+        button.setToolTip("Pokazuje orientacyjne zuzycie pamieci karty graficznej.")
+        button.setStyleSheet(
+            "QPushButton { background-color: #b7791f; color: white; font-weight: 600; }"
+            "QPushButton:hover { background-color: #c98a2a; }"
+        )
+        button.clicked.connect(lambda: show_vram_info(self))
+        return button
+
     def restore_defaults(self) -> None:
         self.config = dict(self.default_config)
-        for field in visible_fields_for(self.engine_id):
+        for field in self._visible_fields():
             self._set_widget_value(field, self.default_config.get(field.key, ""))
+        self._sync_whisper_compute_type_options()
+
+    def _wire_whisper_compute_type_guard(self) -> None:
+        device_widget = self.widgets.get("whisper_qc_device")
+        compute_widget = self.widgets.get("whisper_qc_compute_type")
+        if not isinstance(device_widget, QtWidgets.QComboBox) or not isinstance(compute_widget, QtWidgets.QComboBox):
+            return
+        device_widget.currentIndexChanged.connect(self._sync_whisper_compute_type_options)
+        self._sync_whisper_compute_type_options()
+
+    def _sync_whisper_compute_type_options(self, *_args) -> None:
+        device_widget = self.widgets.get("whisper_qc_device")
+        compute_widget = self.widgets.get("whisper_qc_compute_type")
+        if not isinstance(device_widget, QtWidgets.QComboBox) or not isinstance(compute_widget, QtWidgets.QComboBox):
+            return
+        device = choice_data_for_widget(device_widget)
+        allowed = whisper_qc_compute_type_options_for_device(device)
+        labels = whisper_qc_compute_type_labels_for_options(allowed)
+        current = choice_data_for_widget(compute_widget)
+        selected = current if current in allowed else allowed[0]
+        compute_widget.blockSignals(True)
+        compute_widget.clear()
+        for label, option in zip(labels, allowed):
+            compute_widget.addItem(label, option)
+        index = compute_widget.findData(selected)
+        compute_widget.setCurrentIndex(index if index >= 0 else 0)
+        compute_widget.setEnabled(len(allowed) > 1)
+        compute_widget.blockSignals(False)
 
     def _label_widget(self, field: ConfigField) -> QtWidgets.QWidget:
         container = QtWidgets.QWidget()
@@ -279,7 +348,7 @@ class EngineSettingsDialog(QtWidgets.QDialog):
 
     def values(self) -> dict[str, Any]:
         data: dict[str, Any] = {}
-        for field in visible_fields_for(self.engine_id):
+        for field in self._visible_fields():
             widget = self.widgets[field.key]
             if hasattr(widget, "edge_value"):
                 data[field.key] = widget.edge_value()
@@ -297,6 +366,9 @@ class EngineSettingsDialog(QtWidgets.QDialog):
                 line_edit = widget.findChild(QtWidgets.QLineEdit)
                 data[field.key] = line_edit.text().strip() if line_edit is not None else ""
         return data
+
+    def _visible_fields(self) -> tuple[ConfigField, ...]:
+        return apply_field_option_overrides(visible_fields_for(self.engine_id), self.option_overrides)
 
     def _set_widget_value(self, field: ConfigField, value: Any) -> None:
         widget = self.widgets.get(field.key)
@@ -330,6 +402,7 @@ def edit_engine_settings(
     engine_id: str,
     config_path: Path,
     default_config: dict[str, Any] | None = None,
+    option_overrides: FieldOptionOverrides | None = None,
 ) -> bool:
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -337,12 +410,122 @@ def edit_engine_settings(
             config = {}
     except Exception:
         config = {}
-    dialog = EngineSettingsDialog(parent, engine_name, engine_id, config, default_config or {})
+    dialog = EngineSettingsDialog(parent, engine_name, engine_id, config, default_config or {}, option_overrides)
     if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
         return False
     updated = merge_engine_settings_values(config, dialog.values())
     config_path.write_text(json.dumps(updated, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return True
+
+
+def should_show_vram_info_button(engine_id: str) -> bool:
+    return str(engine_id or "").strip() in VRAM_INFO_ENGINE_IDS
+
+
+def show_vram_info(parent: QtWidgets.QWidget | None = None) -> None:
+    dialog = VramInfoDialog(parent)
+    dialog.exec()
+
+
+def build_vram_info_text() -> str:
+    lines = [
+        "Wartosci sa orientacyjne i moga sie roznic zaleznie od sterownika, bibliotek oraz programow dzialajacych w tle.",
+        "",
+        "Lokalne modele TTS:",
+        *[f"- {name}: {value}" for name, value in TTS_VRAM_ESTIMATES],
+        "",
+        "Whisper QC:",
+        "Model | int8 | float16",
+        "--- | --- | ---",
+    ]
+    lines.extend(f"{model} | {int8} | {float16}" for model, int8, float16 in WHISPER_VRAM_ESTIMATES)
+    lines.extend(
+        [
+            "",
+            "Do sumy warto zostawic dodatkowy zapas 1.5-2 GB VRAM.",
+            "Jesli karta ma za malo pamieci, wybierz mniejszy model Whisper, tryb int8 albo ustaw Whisper QC na CPU.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+class VramInfoDialog(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Zuzycie VRAM")
+        self.resize(560, 560)
+        layout = QtWidgets.QVBoxLayout(self)
+        intro = QtWidgets.QLabel(
+            "Wartosci sa orientacyjne i moga sie roznic zaleznie od sterownika, bibliotek oraz programow dzialajacych w tle."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        layout.addWidget(section_label("Lokalne modele TTS"))
+        layout.addWidget(simple_table(("Model", "VRAM"), TTS_VRAM_ESTIMATES))
+
+        layout.addWidget(section_label("Whisper QC"))
+        layout.addWidget(simple_table(("Model", "int8", "float16"), WHISPER_VRAM_ESTIMATES))
+
+        note = QtWidgets.QLabel(
+            "Do sumy warto zostawic dodatkowy zapas 1.5-2 GB VRAM. "
+            "Jesli karta ma za malo pamieci, wybierz mniejszy model Whisper, tryb int8 albo ustaw Whisper QC na CPU."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+
+
+def section_label(text: str) -> QtWidgets.QLabel:
+    label = QtWidgets.QLabel(text)
+    font = label.font()
+    font.setBold(True)
+    label.setFont(font)
+    return label
+
+
+def simple_table(headers: tuple[str, ...], rows: tuple[tuple[str, ...], ...]) -> QtWidgets.QTableWidget:
+    table = QtWidgets.QTableWidget(len(rows), len(headers))
+    table.setHorizontalHeaderLabels(list(headers))
+    table.verticalHeader().setVisible(False)
+    table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+    table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+    table.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+    table.setAlternatingRowColors(True)
+    for row_index, row in enumerate(rows):
+        for column_index, value in enumerate(row):
+            item = QtWidgets.QTableWidgetItem(str(value))
+            if column_index > 0:
+                item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            table.setItem(row_index, column_index, item)
+    table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+    table.resizeRowsToContents()
+    row_height = table.horizontalHeader().height() + sum(table.rowHeight(row) for row in range(table.rowCount())) + 4
+    table.setFixedHeight(row_height)
+    return table
+
+
+def apply_field_option_overrides(
+    fields: tuple[ConfigField, ...],
+    overrides: FieldOptionOverrides | None,
+) -> tuple[ConfigField, ...]:
+    if not overrides:
+        return fields
+    updated: list[ConfigField] = []
+    for field in fields:
+        override = overrides.get(field.key)
+        if override is None:
+            updated.append(field)
+            continue
+        options, labels = override
+        if not options:
+            updated.append(field)
+            continue
+        updated.append(replace(field, options=tuple(options), option_labels=tuple(labels)))
+    return tuple(updated)
 
 
 def merge_engine_settings_values(config: dict[str, Any], visible_values: dict[str, Any]) -> dict[str, Any]:

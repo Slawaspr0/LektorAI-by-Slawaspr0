@@ -42,6 +42,11 @@ from app.core.paths import AppPaths, build_paths
 from app.core.version import APP_NAME, APP_VERSION
 from app.updater.core import UpdateCheckResult, check_for_updates
 from app.engines.config_validation import validate_engine_config
+from app.engines.config_schema import (
+    WHISPER_QC_MODELS,
+    whisper_qc_compute_type_labels_for_options,
+    whisper_qc_compute_type_options_for_device,
+)
 from app.engines.manager import EngineManager
 from app.engines.schemas import EngineKind, EngineState
 from app.engines.status import format_engine_state
@@ -59,12 +64,46 @@ from app.pipeline.progress import (
 )
 from app.pipeline.tts_job import run_tts_job
 from app.pipeline.workspace import engine_short_code
+from app.stt.job import SttSettings, SUPPORTED_STT_INPUT_EXTENSIONS, is_stt_input_file, run_stt_job
+from app.stt.languages import STT_LANGUAGE_OPTIONS
+from app.stt.whisper_cpp_runtime import WHISPER_CPP_RUNTIME_PACKAGES, whisper_cpp_runtime_ready
 from app.ui.dialogs.diagnostics_dialog import show_diagnostics
 from app.ui.dialogs.dictionary_dialog import edit_dictionary
 from app.ui.dialogs.log_cleanup_dialog import show_log_cleanup
 from app.ui.dialogs.scrollable_text_dialog import confirm_scrollable_text, show_scrollable_text
 from app.ui.dialogs.settings_dialog import edit_engine_settings
 from app.ui.dialogs.tts_manager_dialog import TTSManagerDialog
+
+
+STT_ACCURACY_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("Szybciej", "fast"),
+    ("Standard", "standard"),
+    ("Dokladniej", "accurate"),
+)
+STT_VAD_SENSITIVITY_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("Lagodna", "gentle"),
+    ("Standardowa", "standard"),
+    ("Mocniejsza", "strong"),
+)
+STT_ENGINE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("faster-whisper", "faster_whisper"),
+    ("whisper.cpp", "whisper_cpp"),
+    ("WhisperX", "whisperx"),
+)
+STT_WHISPER_CPP_THREAD_OPTIONS: tuple[tuple[str, int], ...] = (
+    ("Auto", 0),
+    ("2", 2),
+    ("4", 4),
+    ("6", 6),
+    ("8", 8),
+    ("12", 12),
+    ("16", 16),
+    ("24", 24),
+    ("32", 32),
+)
+STT_WHISPER_CPP_RUNTIME_OPTIONS: tuple[tuple[str, str], ...] = tuple(
+    (package.label, package.variant) for package in WHISPER_CPP_RUNTIME_PACKAGES.values()
+)
 
 
 def progress_bar_style() -> str:
@@ -82,6 +121,12 @@ def progress_bar_style() -> str:
                 border-radius: 3px;
             }
             """
+
+
+def polish_combo_box(combo: QtWidgets.QComboBox) -> QtWidgets.QComboBox:
+    combo.setMinimumHeight(28)
+    combo.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+    return combo
 
 
 class UpdateButton(QtWidgets.QPushButton):
@@ -407,6 +452,86 @@ class PipelineWorker(QtCore.QThread):
         self.tts_progress.emit(progress_value_for_stage("tts", ratio), FILE_PROGRESS_TOTAL, label)
 
 
+class SttWorker(QtCore.QThread):
+    message = QtCore.pyqtSignal(str)
+    diagnostic = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(int, int)
+    output_ready = QtCore.pyqtSignal(str)
+    failed = QtCore.pyqtSignal(str)
+    finished_ok = QtCore.pyqtSignal(str)
+
+    def __init__(self, files: list[Path], paths: AppPaths, settings: SttSettings) -> None:
+        super().__init__()
+        self.files = files
+        self.paths = paths
+        self.settings = settings
+
+    def run(self) -> None:
+        total = len(self.files)
+        failed: list[tuple[str, str]] = []
+        output_dirs: list[str] = []
+        try:
+            for index, source_path in enumerate(self.files, 1):
+                if self.isInterruptionRequested():
+                    self.finished_ok.emit("STT: przerwano przez uzytkownika")
+                    return
+                self.progress.emit(index - 1, total)
+                self.message.emit(f"STT: przetwarzanie {source_path.name}")
+                try:
+                    result = run_stt_job(
+                        source_path,
+                        self.paths,
+                        self.settings,
+                        progress=self.message.emit,
+                        cancel_requested=self.isInterruptionRequested,
+                    )
+                except Exception as exc:
+                    if self.isInterruptionRequested() or "Przerwano przez uzytkownika" in str(exc):
+                        self.message.emit("STT: przerwano przez uzytkownika")
+                        self.finished_ok.emit("STT: przerwano przez uzytkownika")
+                        return
+                    failed.append((source_path.name, str(exc)))
+                    self.diagnostic.emit(
+                        "BLAD STT pliku "
+                        f"{source_path.name}\n"
+                        f"Typ: {type(exc).__name__}\n"
+                        f"Komunikat: {exc}\n"
+                        f"{traceback.format_exc()}"
+                    )
+                    self.message.emit(f"BLAD STT pliku {source_path.name}: {exc}")
+                    self.progress.emit(index, total)
+                    continue
+                output_dirs.append(str(result.workspace))
+                self.output_ready.emit(str(result.workspace))
+                self.message.emit(f"STT: zapisano {result.segment_count} segmentow w {format_duration(result.duration_seconds)}")
+                self.message.emit(f"STT: wynik {result.output_srt.name}")
+                self.progress.emit(index, total)
+                if self.isInterruptionRequested():
+                    self.finished_ok.emit("STT: przerwano przez uzytkownika")
+                    return
+            done = total - len(failed)
+            self.message.emit(f"STT: gotowe {done}/{total}, bledy {len(failed)}")
+            if output_dirs:
+                unique_output_dirs = list(dict.fromkeys(output_dirs))
+                self.message.emit(f"STT: foldery wynikow {len(unique_output_dirs)}, ostatni {Path(unique_output_dirs[-1]).name}")
+            if failed:
+                for name, error in failed[:8]:
+                    self.message.emit(f"STT nieudany plik: {name} - {error}")
+                if len(failed) > 8:
+                    self.message.emit(f"STT nieudane pliki: +{len(failed) - 8} wiecej")
+                self.finished_ok.emit(f"STT zakonczono z bledami: {len(failed)}")
+            else:
+                self.finished_ok.emit("STT zakonczono")
+        except Exception as exc:
+            self.diagnostic.emit(
+                "BLAD krytyczny STT\n"
+                f"Typ: {type(exc).__name__}\n"
+                f"Komunikat: {exc}\n"
+                f"{traceback.format_exc()}"
+            )
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QtWidgets.QMainWindow):
     update_check_finished = QtCore.pyqtSignal(object, bool)
 
@@ -420,6 +545,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine_manager = EngineManager(paths)
         self.engine_states: list[EngineState] = []
         self.worker: PipelineWorker | None = None
+        self.stt_worker: SttWorker | None = None
         self.tts_started_at: float | None = None
         self.engine_status_refreshed_during_job = False
         self.update_check_result: UpdateCheckResult | None = None
@@ -437,11 +563,11 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(1500, lambda: self.start_update_check(show_result=False))
 
     def closeEvent(self, event):  # noqa: N802
-        if self.worker is not None and self.worker.isRunning():
+        if self._is_any_worker_running():
             QtWidgets.QMessageBox.warning(
                 self,
-                "Konwersja trwa",
-                "Najpierw przerwij kolejke albo poczekaj na zakonczenie aktualnego pliku.",
+                "Praca trwa",
+                "Najpierw przerwij zadanie albo poczekaj na zakonczenie aktualnego pliku.",
             )
             event.ignore()
             return
@@ -452,10 +578,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_ui(self) -> None:
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        root = QtWidgets.QHBoxLayout(central)
+        root = QtWidgets.QVBoxLayout(central)
+        self.tabs = QtWidgets.QTabWidget()
+        root.addWidget(self.tabs)
+
+        tts_tab = QtWidgets.QWidget()
+        tts_root = QtWidgets.QHBoxLayout(tts_tab)
+        self.tabs.addTab(tts_tab, "TTS")
         self.main_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         self.main_splitter.setChildrenCollapsible(False)
-        root.addWidget(self.main_splitter)
+        tts_root.addWidget(self.main_splitter)
 
         left_panel = QtWidgets.QWidget()
         left = QtWidgets.QVBoxLayout(left_panel)
@@ -647,6 +779,242 @@ class MainWindow(QtWidgets.QMainWindow):
         for index in range(3):
             self.main_splitter.setStretchFactor(index, 1)
         self.main_splitter.setSizes([420, 420, 420])
+        self._build_stt_tab()
+
+    def _build_stt_tab(self) -> None:
+        stt_tab = QtWidgets.QWidget()
+        root = QtWidgets.QHBoxLayout(stt_tab)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        root.addWidget(splitter)
+
+        left_panel = QtWidgets.QWidget()
+        left = QtWidgets.QVBoxLayout(left_panel)
+        self.stt_queue = QueueListWidget()
+        self.stt_queue.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.stt_queue.files_dropped.connect(self.add_stt_file_paths)
+        self.stt_queue_status = QtWidgets.QLabel("Pliki: 0 | wideo: 0 | audio: 0")
+        self.btn_stt_add = QtWidgets.QPushButton("Dodaj pliki")
+        self.btn_stt_add.clicked.connect(self.add_stt_files)
+        self.btn_stt_remove = QtWidgets.QPushButton("Usun zaznaczone")
+        self.btn_stt_remove.clicked.connect(self.remove_selected_stt_files)
+        self.btn_stt_clear = QtWidgets.QPushButton("Wyczysc")
+        self.btn_stt_clear.clicked.connect(self.clear_stt_files)
+        self.btn_stt_sort = QtWidgets.QPushButton("Sortuj")
+        self.btn_stt_sort.clicked.connect(self.sort_stt_queue)
+        stt_actions_top = QtWidgets.QHBoxLayout()
+        stt_actions_top.addWidget(self.btn_stt_add)
+        stt_actions_top.addWidget(self.btn_stt_remove)
+        stt_actions_top.addWidget(self.btn_stt_clear)
+        stt_actions_bottom = QtWidgets.QHBoxLayout()
+        stt_actions_bottom.addWidget(self.btn_stt_sort)
+        left.addWidget(QtWidgets.QLabel("Kolejka STT"))
+        left.addWidget(self.stt_queue_status)
+        left.addWidget(self.stt_queue, 1)
+        left.addLayout(stt_actions_top)
+        left.addLayout(stt_actions_bottom)
+        splitter.addWidget(left_panel)
+
+        settings = self.config_store.stt_settings()
+        middle_panel = QtWidgets.QScrollArea()
+        middle_panel.setWidgetResizable(True)
+        middle_panel.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        middle_content = QtWidgets.QWidget()
+        middle = QtWidgets.QVBoxLayout(middle_content)
+        middle.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetMinimumSize)
+        middle_panel.setWidget(middle_content)
+        self.stt_engine_combo = polish_combo_box(QtWidgets.QComboBox())
+        for label, value in STT_ENGINE_OPTIONS:
+            self.stt_engine_combo.addItem(label, value)
+        self._set_combo_data(self.stt_engine_combo, settings.engine)
+        self.stt_engine_combo.setToolTip("Silnik rozpoznawania mowy.")
+        self.stt_engine_combo.currentIndexChanged.connect(self._on_stt_engine_changed)
+
+        self.stt_model_combo = polish_combo_box(QtWidgets.QComboBox())
+        for model in WHISPER_QC_MODELS:
+            self.stt_model_combo.addItem(model, model)
+        self._set_combo_data(self.stt_model_combo, settings.model)
+        self.stt_model_combo.setToolTip("Model do tworzenia napisow z mowy.")
+        self.stt_model_combo.currentIndexChanged.connect(self._on_stt_model_changed)
+
+        self.stt_language_combo = polish_combo_box(QtWidgets.QComboBox())
+        for value, label in STT_LANGUAGE_OPTIONS:
+            self.stt_language_combo.addItem(label, value)
+        self._set_combo_data(self.stt_language_combo, settings.language)
+        self.stt_language_combo.setToolTip("Jezyk rozpoznawanej mowy. Auto pozwala modelowi samemu wykryc jezyk.")
+        self.stt_language_combo.currentIndexChanged.connect(self._on_stt_language_changed)
+
+        self.stt_device_combo = polish_combo_box(QtWidgets.QComboBox())
+        device_choices = self.engine_manager.torch_device_choices("", include_auto=False)
+        for label, value in zip(device_choices.labels, device_choices.values):
+            self.stt_device_combo.addItem(label, value)
+        self._set_combo_data(self.stt_device_combo, settings.device)
+        self.stt_device_combo.setToolTip("Urzadzenie dla STT. CPU jest najbezpieczniejsze, GPU moze byc szybsze.")
+        self.stt_device_combo.currentIndexChanged.connect(self._on_stt_device_changed)
+
+        self.stt_compute_combo = polish_combo_box(QtWidgets.QComboBox())
+        self.stt_compute_combo.setToolTip("Tryb pracy STT. Na CPU dostepny jest tylko int8.")
+        self.stt_compute_combo.currentIndexChanged.connect(self._on_stt_compute_type_changed)
+        self._refresh_stt_compute_options(settings.compute_type)
+
+        self.stt_accuracy_combo = polish_combo_box(QtWidgets.QComboBox())
+        for label, value in STT_ACCURACY_OPTIONS:
+            self.stt_accuracy_combo.addItem(label, value)
+        self._set_combo_data(self.stt_accuracy_combo, settings.accuracy)
+        self.stt_accuracy_combo.setToolTip("Okresla balans miedzy szybkoscia i dokladnoscia rozpoznawania mowy.")
+        self.stt_accuracy_combo.currentIndexChanged.connect(self._on_stt_accuracy_changed)
+
+        self.stt_vad_checkbox = QtWidgets.QCheckBox("Pomijanie ciszy")
+        self.stt_vad_checkbox.setChecked(settings.vad_enabled)
+        self.stt_vad_checkbox.setToolTip("Pomija fragmenty bez mowy, zeby ograniczyc powtarzane lub zmyslone napisy.")
+        self.stt_vad_checkbox.toggled.connect(self._on_stt_vad_enabled_changed)
+
+        self.stt_vad_sensitivity_combo = polish_combo_box(QtWidgets.QComboBox())
+        for label, value in STT_VAD_SENSITIVITY_OPTIONS:
+            self.stt_vad_sensitivity_combo.addItem(label, value)
+        self._set_combo_data(self.stt_vad_sensitivity_combo, settings.vad_sensitivity)
+        self.stt_vad_sensitivity_combo.setToolTip("Okresla, jak mocno program pomija cisze i tlo bez mowy.")
+        self.stt_vad_sensitivity_combo.setEnabled(settings.vad_enabled)
+        self.stt_vad_sensitivity_combo.currentIndexChanged.connect(self._on_stt_vad_sensitivity_changed)
+
+        self.stt_whisper_cpp_threads_combo = polish_combo_box(QtWidgets.QComboBox())
+        for label, value in STT_WHISPER_CPP_THREAD_OPTIONS:
+            self.stt_whisper_cpp_threads_combo.addItem(label, value)
+        self._set_combo_data(self.stt_whisper_cpp_threads_combo, settings.whisper_cpp_threads)
+        self.stt_whisper_cpp_threads_combo.setToolTip("Liczba watkow CPU dla whisper.cpp. Auto dobiera wartosc samodzielnie.")
+        self.stt_whisper_cpp_threads_combo.currentIndexChanged.connect(self._on_stt_whisper_cpp_threads_changed)
+
+        self.stt_whisper_cpp_runtime_combo = polish_combo_box(QtWidgets.QComboBox())
+        for label, value in STT_WHISPER_CPP_RUNTIME_OPTIONS:
+            self.stt_whisper_cpp_runtime_combo.addItem(label, value)
+        self._set_combo_data(self.stt_whisper_cpp_runtime_combo, settings.whisper_cpp_runtime)
+        self.stt_whisper_cpp_runtime_combo.setToolTip("Wybierz CPU albo CUDA. Runtime pobierze sie przy pierwszym uzyciu.")
+        self.stt_whisper_cpp_runtime_combo.currentIndexChanged.connect(self._on_stt_whisper_cpp_runtime_changed)
+
+        self.stt_whisper_cpp_device_combo = polish_combo_box(QtWidgets.QComboBox())
+        whisper_cpp_device_choices = self.engine_manager.torch_device_choices("", include_auto=True)
+        for label, value in zip(whisper_cpp_device_choices.labels, whisper_cpp_device_choices.values):
+            self.stt_whisper_cpp_device_combo.addItem(label, value)
+        self._set_combo_data(self.stt_whisper_cpp_device_combo, settings.whisper_cpp_device)
+        self.stt_whisper_cpp_device_combo.setToolTip("Urzadzenie dla whisper.cpp CUDA. Auto zostawia wybor programowi.")
+        self.stt_whisper_cpp_device_combo.currentIndexChanged.connect(self._on_stt_whisper_cpp_device_changed)
+
+        self.stt_whisper_cpp_runtime_status = QtWidgets.QLabel("")
+        self.stt_whisper_cpp_runtime_status.setWordWrap(True)
+
+        self.stt_save_audio_checkbox = QtWidgets.QCheckBox("Przygotowane audio")
+        self.stt_save_audio_checkbox.setChecked(settings.save_prepared_audio)
+        self.stt_save_audio_checkbox.setToolTip("Zachowuje audio przygotowane do rozpoznawania mowy.")
+        self.stt_save_audio_checkbox.toggled.connect(self._on_stt_save_prepared_audio_changed)
+
+        self.stt_save_report_checkbox = QtWidgets.QCheckBox("Raport STT")
+        self.stt_save_report_checkbox.setChecked(settings.save_report)
+        self.stt_save_report_checkbox.setToolTip("Zachowuje podsumowanie przebiegu STT.")
+        self.stt_save_report_checkbox.toggled.connect(self._on_stt_save_report_changed)
+
+        self.stt_save_log_checkbox = QtWidgets.QCheckBox("Log STT")
+        self.stt_save_log_checkbox.setChecked(settings.save_log)
+        self.stt_save_log_checkbox.setToolTip("Zachowuje prosty log przebiegu STT.")
+        self.stt_save_log_checkbox.toggled.connect(self._on_stt_save_log_changed)
+
+        self.stt_postprocess_checkbox = QtWidgets.QCheckBox("Formatowanie LektorAI")
+        self.stt_postprocess_checkbox.setChecked(settings.postprocess_enabled)
+        self.stt_postprocess_checkbox.setToolTip(
+            "Po wlaczeniu aplikacja oczyszcza i uklada napisy. Po wylaczeniu zapisuje surowszy wynik silnika STT."
+        )
+        self.stt_postprocess_checkbox.toggled.connect(self._on_stt_postprocess_enabled_changed)
+
+        self.btn_stt_open_output = QtWidgets.QPushButton("Otworz wynik")
+        self.btn_stt_open_output.setEnabled(False)
+        self.btn_stt_open_output.clicked.connect(self.open_last_stt_output)
+        self.last_stt_output_dir: Path | None = None
+        self.stt_progress_label = QtWidgets.QLabel("STT: -")
+        self.stt_progress_bar = QtWidgets.QProgressBar()
+        self.stt_progress_bar.setRange(0, 1)
+        self.stt_progress_bar.setValue(0)
+        self.stt_progress_bar.setTextVisible(True)
+        self.stt_progress_bar.setFormat("%v/%m")
+        self.stt_progress_bar.setStyleSheet(progress_bar_style())
+        self.btn_stt_start = QtWidgets.QPushButton("START STT")
+        self.btn_stt_start.clicked.connect(self.start_stt_job)
+        self.btn_stt_stop = QtWidgets.QPushButton("Przerwij")
+        self.btn_stt_stop.setEnabled(False)
+        self.btn_stt_stop.clicked.connect(self.stop_stt_job)
+
+        middle.addWidget(QtWidgets.QLabel("Silnik STT"))
+        middle.addWidget(self.stt_engine_combo)
+        middle.addWidget(QtWidgets.QLabel("Model"))
+        middle.addWidget(self.stt_model_combo)
+        middle.addWidget(QtWidgets.QLabel("Jezyk"))
+        middle.addWidget(self.stt_language_combo)
+        middle.addWidget(self.stt_postprocess_checkbox)
+
+        self.stt_faster_whisper_box = QtWidgets.QGroupBox("Ustawienia faster-whisper")
+        faster_whisper_layout = QtWidgets.QVBoxLayout(self.stt_faster_whisper_box)
+        self.stt_device_label = QtWidgets.QLabel("Urzadzenie")
+        faster_whisper_layout.addWidget(self.stt_device_label)
+        faster_whisper_layout.addWidget(self.stt_device_combo)
+        self.stt_compute_label = QtWidgets.QLabel("Tryb pracy")
+        faster_whisper_layout.addWidget(self.stt_compute_label)
+        faster_whisper_layout.addWidget(self.stt_compute_combo)
+        faster_whisper_layout.addWidget(self.stt_vad_checkbox)
+        self.stt_vad_sensitivity_label = QtWidgets.QLabel("Czulosc pomijania ciszy")
+        faster_whisper_layout.addWidget(self.stt_vad_sensitivity_label)
+        faster_whisper_layout.addWidget(self.stt_vad_sensitivity_combo)
+        self.stt_accuracy_label = QtWidgets.QLabel("Dokladnosc")
+        faster_whisper_layout.addWidget(self.stt_accuracy_label)
+        faster_whisper_layout.addWidget(self.stt_accuracy_combo)
+        self.stt_whisperx_note = QtWidgets.QLabel("WhisperX uzywa wlasnego wykrywania mowy i wyrownania timestampow.")
+        self.stt_whisperx_note.setWordWrap(True)
+        faster_whisper_layout.addWidget(self.stt_whisperx_note)
+
+        self.stt_whisper_cpp_box = QtWidgets.QGroupBox("Ustawienia whisper.cpp")
+        whisper_cpp_layout = QtWidgets.QVBoxLayout(self.stt_whisper_cpp_box)
+        whisper_cpp_layout.addWidget(QtWidgets.QLabel("Runtime"))
+        whisper_cpp_layout.addWidget(self.stt_whisper_cpp_runtime_combo)
+        whisper_cpp_layout.addWidget(QtWidgets.QLabel("Urzadzenie CUDA"))
+        whisper_cpp_layout.addWidget(self.stt_whisper_cpp_device_combo)
+        whisper_cpp_layout.addWidget(QtWidgets.QLabel("Watki CPU"))
+        whisper_cpp_layout.addWidget(self.stt_whisper_cpp_threads_combo)
+        whisper_cpp_layout.addWidget(self.stt_whisper_cpp_runtime_status)
+
+        middle.addSpacing(8)
+        middle.addWidget(self.stt_faster_whisper_box)
+        middle.addWidget(self.stt_whisper_cpp_box)
+        middle.addSpacing(8)
+        diagnostics_box = QtWidgets.QGroupBox("Opcje diagnostyczne")
+        diagnostics_layout = QtWidgets.QVBoxLayout(diagnostics_box)
+        diagnostics_layout.addWidget(self.stt_save_audio_checkbox)
+        diagnostics_layout.addWidget(self.stt_save_report_checkbox)
+        diagnostics_layout.addWidget(self.stt_save_log_checkbox)
+        middle.addWidget(diagnostics_box)
+        middle.addWidget(self.btn_stt_open_output)
+        middle.addStretch(1)
+        middle.addWidget(self.stt_progress_label)
+        middle.addWidget(self.stt_progress_bar)
+        middle.addWidget(self.btn_stt_start)
+        middle.addWidget(self.btn_stt_stop)
+        splitter.addWidget(middle_panel)
+
+        right_panel = QtWidgets.QWidget()
+        right = QtWidgets.QVBoxLayout(right_panel)
+        self.stt_log_view = QtWidgets.QPlainTextEdit()
+        self.stt_log_view.setReadOnly(True)
+        self.stt_log_view.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.WidgetWidth)
+        right.addWidget(QtWidgets.QLabel("Log STT"))
+        right.addWidget(self.stt_log_view, 1)
+        splitter.addWidget(right_panel)
+        for index in range(3):
+            splitter.setStretchFactor(index, 1)
+        splitter.setSizes([420, 420, 420])
+        self.tabs.addTab(stt_tab, "STT")
+        self._load_stt_controls_for_engine(str(self.stt_engine_combo.currentData() or "faster_whisper"))
+        self._refresh_stt_engine_settings_visibility()
+
+    def _set_combo_data(self, combo: QtWidgets.QComboBox, value: str | int) -> None:
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
 
     def _restore_window_state(self) -> None:
         state = self.config_store.window_state()
@@ -859,6 +1227,76 @@ class MainWindow(QtWidgets.QMainWindow):
         subtitle_count = sum(1 for path in files if path.suffix.lower() in SUPPORTED_SUBTITLE_EXTENSIONS)
         self.queue_status.setText(f"Pliki: {len(files)} | wideo: {video_count} | napisy/tekst: {subtitle_count}")
 
+    def add_stt_files(self) -> None:
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Wybierz pliki STT",
+            self._file_dialog_start_dir(),
+            "Audio / wideo (*.mkv *.mp4 *.avi *.mov *.webm *.wmv *.m4v *.aac *.ac3 *.flac *.m4a *.mp3 *.ogg *.opus *.wav *.wma);;Wszystkie pliki (*)",
+        )
+        self.add_stt_file_paths(files)
+
+    def add_stt_file_paths(self, files: list[str]) -> None:
+        added = 0
+        skipped = 0
+        unsupported = 0
+        accepted_paths: list[Path] = [Path(self.stt_queue.item(i).text()) for i in range(self.stt_queue.count())]
+        for file_path in files:
+            path = Path(file_path)
+            if not path.is_file() or not is_stt_input_file(path):
+                unsupported += 1
+                continue
+            if path_in_list(path, accepted_paths):
+                skipped += 1
+                continue
+            self.stt_queue.addItem(str(path))
+            accepted_paths.append(path)
+            added += 1
+        if accepted_paths:
+            self.config_store.set_last_file_dir(str(accepted_paths[-1].resolve().parent))
+        if added:
+            self.log_stt(f"STT: dodano {added} plik(ow)")
+        if skipped:
+            self.log_stt(f"STT: pominieto duplikaty {skipped}")
+        if unsupported:
+            self.log_stt(f"STT: pominieto nieobslugiwane typy {unsupported}")
+        self.update_stt_queue_status()
+
+    def remove_selected_stt_files(self) -> None:
+        selected = self.stt_queue.selectedItems()
+        if not selected:
+            return
+        for item in selected:
+            row = self.stt_queue.row(item)
+            self.stt_queue.takeItem(row)
+        self.log_stt(f"STT: usunieto {len(selected)} plik(ow)")
+        self.update_stt_queue_status()
+
+    def clear_stt_files(self) -> None:
+        count = self.stt_queue.count()
+        if count <= 0:
+            return
+        self.stt_queue.clear()
+        self.log_stt(f"STT: wyczyszczono {count} plik(ow)")
+        self.update_stt_queue_status()
+
+    def sort_stt_queue(self) -> None:
+        if self.stt_queue.count() <= 1:
+            return
+        paths = [self.stt_queue.item(i).text() for i in range(self.stt_queue.count())]
+        paths.sort(key=natural_path_key)
+        self.stt_queue.clear()
+        for path in paths:
+            self.stt_queue.addItem(path)
+        self.log_stt("STT: posortowano po nazwie pliku")
+        self.update_stt_queue_status()
+
+    def update_stt_queue_status(self) -> None:
+        files = [Path(self.stt_queue.item(i).text()) for i in range(self.stt_queue.count())]
+        video_count = sum(1 for path in files if is_video_file(path))
+        audio_count = len(files) - video_count
+        self.stt_queue_status.setText(f"Pliki: {len(files)} | wideo: {video_count} | audio: {audio_count}")
+
     def open_dictionary(self) -> None:
         engine_id = self.selected_engine_id()
         if not engine_id:
@@ -882,9 +1320,24 @@ class MainWindow(QtWidgets.QMainWindow):
         state = next((s for s in self.engine_states if s.definition.engine_id == engine_id), None)
         engine_name = state.definition.display_name if state else engine_id
         default_config = state.definition.default_config if state else {}
-        if edit_engine_settings(self, engine_name, engine_id, config_path, default_config):
+        if edit_engine_settings(
+            self,
+            engine_name,
+            engine_id,
+            config_path,
+            default_config,
+            self.engine_settings_option_overrides(engine_id),
+        ):
             self.log(f"Ustawienia {engine_id}: zapisano")
             self.refresh_engines()
+
+    def engine_settings_option_overrides(self, engine_id: str) -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+        tts_devices = self.engine_manager.torch_device_choices(engine_id, include_auto=True)
+        stt_devices = self.engine_manager.torch_device_choices(engine_id, include_auto=False)
+        return {
+            "device": (tts_devices.values, tts_devices.labels),
+            "whisper_qc_device": (stt_devices.values, stt_devices.labels),
+        }
 
     def open_tts_manager(self) -> None:
         dialog = TTSManagerDialog(self, self.engine_manager)
@@ -899,7 +1352,7 @@ class MainWindow(QtWidgets.QMainWindow):
         show_log_cleanup(self, self.paths, self.log_path)
 
     def open_update(self) -> None:
-        if self.worker is not None and self.worker.isRunning():
+        if self._is_any_worker_running():
             QtWidgets.QMessageBox.warning(self, "Aktualizacja", "Najpierw przerwij albo zakoncz aktualne zadanie.")
             return
         if self.update_check_result is not None and self.update_check_result.update_available:
@@ -924,7 +1377,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_update_check_finished(self, result: UpdateCheckResult, show_result: bool) -> None:
         self.update_check_running = False
         self.update_check_result = result
-        self.btn_update.setEnabled(not (self.worker is not None and self.worker.isRunning()))
+        self.btn_update.setEnabled(not self._is_any_worker_running())
         self.btn_update.set_update_available(bool(result.ok and result.update_available))
         if result.ok and result.update_available:
             self.btn_update.setToolTip("Dostepna jest aktualizacja programu.")
@@ -971,6 +1424,9 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.quit()
 
     def start_job(self) -> None:
+        if self.stt_worker is not None and self.stt_worker.isRunning():
+            QtWidgets.QMessageBox.warning(self, "STT trwa", "Najpierw zakoncz albo przerwij aktualne zadanie STT.")
+            return
         engine_id = self.selected_engine_id()
         if not engine_id:
             QtWidgets.QMessageBox.warning(self, "Brak TTS", "Wybierz zainstalowany silnik TTS.")
@@ -1000,6 +1456,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_output_dir = None
         self.btn_open_output.setEnabled(False)
         self._set_queue_controls_enabled(False)
+        self._set_stt_controls_enabled(False)
+        self.btn_stt_stop.setEnabled(False)
         self.worker = PipelineWorker(
             files,
             engine_id,
@@ -1030,6 +1488,61 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_stop.setEnabled(False)
         self.log("Przerwanie: zatrzymuje aktualny proces TTS")
 
+    def start_stt_job(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            QtWidgets.QMessageBox.warning(self, "TTS trwa", "Najpierw zakoncz albo przerwij aktualne zadanie TTS.")
+            return
+        if self.stt_queue.count() == 0:
+            QtWidgets.QMessageBox.warning(self, "Brak plikow", "Dodaj pliki audio lub wideo do kolejki STT.")
+            return
+        files = [Path(self.stt_queue.item(i).text()) for i in range(self.stt_queue.count())]
+        errors = self.validate_stt_queue_files(files)
+        if errors:
+            show_scrollable_text(self, "Kolejka STT", "Popraw problemy w kolejce STT przed startem:", "\n".join(errors))
+            return
+        settings = self.selected_stt_settings()
+        self.last_stt_output_dir = None
+        self.btn_stt_open_output.setEnabled(False)
+        self._set_stt_controls_enabled(False)
+        self._set_queue_controls_enabled(False)
+        self.stt_progress_bar.setRange(0, 0)
+        self.stt_progress_label.setText("STT: start")
+        self.stt_worker = SttWorker(files, self.paths, settings)
+        self.stt_worker.message.connect(self.on_stt_worker_message)
+        self.stt_worker.diagnostic.connect(self.log_diagnostic)
+        self.stt_worker.progress.connect(self.on_stt_progress)
+        self.stt_worker.output_ready.connect(self.on_stt_output_ready)
+        self.stt_worker.failed.connect(self.on_stt_failed)
+        self.stt_worker.finished_ok.connect(self.on_stt_finished)
+        self.on_stt_progress(0, len(files))
+        self.stt_worker.start()
+
+    def stop_stt_job(self) -> None:
+        if self.stt_worker is None:
+            return
+        self.stt_worker.requestInterruption()
+        self.btn_stt_stop.setEnabled(False)
+        self.log_stt("STT: zatrzymuje aktualny proces")
+
+    def validate_stt_queue_files(self, files: list[Path]) -> list[str]:
+        errors: list[str] = []
+        if find_ffmpeg(self.paths) is None:
+            errors.append(missing_ffmpeg_message())
+        if find_ffprobe(self.paths) is None:
+            errors.append(missing_ffprobe_message())
+        for path in files:
+            if not path.exists():
+                errors.append(f"Brak pliku: {path}")
+                continue
+            if not path.is_file():
+                errors.append(f"To nie jest plik: {path}")
+                continue
+            if path.suffix.lower() not in SUPPORTED_STT_INPUT_EXTENSIONS:
+                errors.append(f"Nieobslugiwany typ pliku STT: {path.name}")
+        if len(errors) > 12:
+            errors = errors[:12] + [f"... oraz {len(errors) - 12} kolejnych problemow"]
+        return errors
+
     def on_worker_message(self, message: str) -> None:
         self.log(message)
         if self.engine_status_refreshed_during_job:
@@ -1039,12 +1552,59 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine_status_refreshed_during_job = True
         self.refresh_engines(clear_cache=False, log_selection=False, controls_enabled=False, store_selection=False)
 
+    def on_stt_worker_message(self, message: str) -> None:
+        self.log_stt(message)
+
+    def on_stt_progress(self, done: int, total: int) -> None:
+        total = max(1, int(total))
+        done = max(0, min(int(done), total))
+        self.stt_progress_bar.setRange(0, total)
+        self.stt_progress_bar.setValue(done)
+        self.stt_progress_bar.setFormat("%v/%m")
+        if done >= total:
+            self.stt_progress_label.setText(f"STT: gotowe {done}/{total}")
+        else:
+            self.stt_progress_label.setText(f"STT: plik {done + 1}/{total}")
+
+    def on_stt_output_ready(self, folder: str) -> None:
+        self.last_stt_output_dir = Path(folder)
+        self.btn_stt_open_output.setEnabled(self.last_stt_output_dir.exists())
+
+    def on_stt_failed(self, message: str) -> None:
+        self.log_stt(f"BLAD STT: {message}")
+        self.btn_stt_stop.setEnabled(False)
+        self._set_stt_controls_enabled(True)
+        self._set_queue_controls_enabled(True)
+        self._refresh_stt_whisper_cpp_runtime_controls()
+        self.stt_progress_label.setText("STT: przerwano")
+        self.stt_progress_bar.setRange(0, 1)
+        self.stt_progress_bar.setValue(0)
+        self.stt_worker = None
+
+    def on_stt_finished(self, message: str) -> None:
+        self.log_stt(message)
+        self.btn_stt_stop.setEnabled(False)
+        self._set_stt_controls_enabled(True)
+        self._set_queue_controls_enabled(True)
+        self._refresh_stt_whisper_cpp_runtime_controls()
+        self.stt_progress_label.setText("STT: gotowe")
+        self.stt_progress_bar.setRange(0, 1)
+        self.stt_progress_bar.setValue(0)
+        self.stt_worker = None
+
     def open_last_output(self) -> None:
         if self.last_output_dir is None or not self.last_output_dir.exists():
             QtWidgets.QMessageBox.warning(self, "Wynik", "Brak folderu wyniku do otwarcia.")
             self.btn_open_output.setEnabled(False)
             return
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(self.last_output_dir)))
+
+    def open_last_stt_output(self) -> None:
+        if self.last_stt_output_dir is None or not self.last_stt_output_dir.exists():
+            QtWidgets.QMessageBox.warning(self, "Wynik STT", "Brak folderu wyniku STT do otwarcia.")
+            self.btn_stt_open_output.setEnabled(False)
+            return
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(self.last_stt_output_dir)))
 
     def validate_selected_engine_config(self, engine_id: str) -> list[str]:
         config_path = self.engine_manager.ensure_engine_config(engine_id)
@@ -1145,6 +1705,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log(f"BLAD: {message}")
         self.btn_stop.setEnabled(False)
         self._set_queue_controls_enabled(True)
+        self._set_stt_controls_enabled(True)
         self.refresh_engines(log_selection=False)
         self.progress_label.setText("Przerwano")
         self.tts_progress_label.setText("TTS: -")
@@ -1157,6 +1718,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log(message)
         self.btn_stop.setEnabled(False)
         self._set_queue_controls_enabled(True)
+        self._set_stt_controls_enabled(True)
         self.refresh_engines(log_selection=False)
         self.progress_label.setText("Gotowe")
         self.tts_progress_label.setText("TTS: -")
@@ -1190,8 +1752,229 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_restore_audio_defaults.setEnabled(enabled)
         self._update_start_button(enabled)
 
+    def _set_stt_controls_enabled(self, enabled: bool) -> None:
+        self.btn_stt_add.setEnabled(enabled)
+        self.btn_stt_remove.setEnabled(enabled)
+        self.btn_stt_clear.setEnabled(enabled)
+        self.btn_stt_sort.setEnabled(enabled)
+        self.stt_engine_combo.setEnabled(enabled)
+        self.stt_model_combo.setEnabled(enabled)
+        self.stt_language_combo.setEnabled(enabled)
+        self.stt_device_combo.setEnabled(enabled)
+        settings = self.config_store.stt_settings()
+        engine = str(self.stt_engine_combo.currentData() or "faster_whisper")
+        preferred_compute = settings.whisperx_compute_type if engine == "whisperx" else settings.compute_type
+        self._refresh_stt_compute_options(preferred_compute)
+        self.stt_compute_combo.setEnabled(enabled and self.stt_compute_combo.count() > 1)
+        self.stt_accuracy_combo.setEnabled(enabled)
+        self.stt_vad_checkbox.setEnabled(enabled)
+        self.stt_vad_sensitivity_combo.setEnabled(enabled and self.stt_vad_checkbox.isChecked())
+        self.stt_whisper_cpp_runtime_combo.setEnabled(enabled)
+        self.stt_whisper_cpp_device_combo.setEnabled(enabled)
+        self.stt_whisper_cpp_threads_combo.setEnabled(enabled)
+        self.stt_postprocess_checkbox.setEnabled(enabled)
+        self.stt_save_audio_checkbox.setEnabled(enabled)
+        self.stt_save_report_checkbox.setEnabled(enabled)
+        self.stt_save_log_checkbox.setEnabled(enabled)
+        self.btn_stt_start.setEnabled(enabled)
+        self.btn_stt_stop.setEnabled(not enabled)
+        self._refresh_stt_engine_settings_visibility()
+
+    def _is_any_worker_running(self) -> bool:
+        return bool(
+            (self.worker is not None and self.worker.isRunning())
+            or (self.stt_worker is not None and self.stt_worker.isRunning())
+        )
+
     def selected_aac_bitrate(self) -> str:
         return sanitize_aac_bitrate(self.aac_quality_combo.currentData())
+
+    def selected_stt_settings(self) -> SttSettings:
+        engine = str(self.stt_engine_combo.currentData() or "faster_whisper")
+        stored_settings = self.config_store.stt_settings()
+        device = self.selected_stt_device()
+        compute_type = str(self.stt_compute_combo.currentData() or "int8")
+        faster_device = device if engine == "faster_whisper" else stored_settings.device
+        faster_compute_type = compute_type if engine == "faster_whisper" else stored_settings.compute_type
+        whisperx_device = device if engine == "whisperx" else stored_settings.whisperx_device
+        whisperx_compute_type = compute_type if engine == "whisperx" else stored_settings.whisperx_compute_type
+        return SttSettings(
+            engine=engine,
+            model=str(self.stt_model_combo.currentData() or "small"),
+            language=str(self.stt_language_combo.currentData() or "auto"),
+            device=faster_device,
+            compute_type=faster_compute_type,
+            accuracy=str(self.stt_accuracy_combo.currentData() or "standard"),
+            vad_enabled=self.stt_vad_checkbox.isChecked(),
+            vad_sensitivity=str(self.stt_vad_sensitivity_combo.currentData() or "standard"),
+            whisper_cpp_runtime=str(self.stt_whisper_cpp_runtime_combo.currentData() or "cpu"),
+            whisper_cpp_device=str(self.stt_whisper_cpp_device_combo.currentData() or "auto"),
+            whisper_cpp_threads=int(self.stt_whisper_cpp_threads_combo.currentData() or 0),
+            whisperx_device=whisperx_device,
+            whisperx_compute_type=whisperx_compute_type,
+            postprocess_enabled=self.stt_postprocess_checkbox.isChecked(),
+            save_prepared_audio=self.stt_save_audio_checkbox.isChecked(),
+            save_report=self.stt_save_report_checkbox.isChecked(),
+            save_log=self.stt_save_log_checkbox.isChecked(),
+        )
+
+    def selected_stt_device(self) -> str:
+        return str(self.stt_device_combo.currentData() or "cpu")
+
+    def _on_stt_engine_changed(self) -> None:
+        engine = str(self.stt_engine_combo.currentData() or "faster_whisper")
+        self.config_store.set_stt_engine(engine)
+        self._load_stt_controls_for_engine(engine)
+        self._refresh_stt_engine_settings_visibility()
+
+    def _on_stt_model_changed(self) -> None:
+        self.config_store.set_stt_model(str(self.stt_model_combo.currentData() or "small"))
+
+    def _on_stt_language_changed(self) -> None:
+        self.config_store.set_stt_language(str(self.stt_language_combo.currentData() or "auto"))
+
+    def _on_stt_device_changed(self) -> None:
+        device = self.selected_stt_device()
+        engine = str(self.stt_engine_combo.currentData() or "faster_whisper")
+        if engine == "whisperx":
+            self.config_store.set_stt_whisperx_device(device)
+            self._refresh_stt_compute_options(self.config_store.stt_settings().whisperx_compute_type)
+        elif engine == "faster_whisper":
+            self.config_store.set_stt_device(device)
+            self._refresh_stt_compute_options(self.config_store.stt_settings().compute_type)
+
+    def _on_stt_compute_type_changed(self) -> None:
+        value = str(self.stt_compute_combo.currentData() or "int8")
+        engine = str(self.stt_engine_combo.currentData() or "faster_whisper")
+        if engine == "whisperx":
+            self.config_store.set_stt_whisperx_compute_type(value)
+        elif engine == "faster_whisper":
+            self.config_store.set_stt_compute_type(value)
+
+    def _on_stt_accuracy_changed(self) -> None:
+        self.config_store.set_stt_accuracy(str(self.stt_accuracy_combo.currentData() or "standard"))
+
+    def _on_stt_vad_enabled_changed(self, checked: bool) -> None:
+        self.config_store.set_stt_vad_enabled(checked)
+        self.stt_vad_sensitivity_combo.setEnabled(checked and self.btn_stt_start.isEnabled())
+
+    def _on_stt_vad_sensitivity_changed(self) -> None:
+        self.config_store.set_stt_vad_sensitivity(str(self.stt_vad_sensitivity_combo.currentData() or "standard"))
+
+    def _on_stt_postprocess_enabled_changed(self, checked: bool) -> None:
+        self.config_store.set_stt_postprocess_enabled(checked)
+
+    def _on_stt_whisper_cpp_runtime_changed(self) -> None:
+        self.config_store.set_stt_whisper_cpp_runtime(str(self.stt_whisper_cpp_runtime_combo.currentData() or "cpu"))
+        self._refresh_stt_whisper_cpp_runtime_controls()
+
+    def _on_stt_whisper_cpp_device_changed(self) -> None:
+        self.config_store.set_stt_whisper_cpp_device(str(self.stt_whisper_cpp_device_combo.currentData() or "auto"))
+
+    def _on_stt_whisper_cpp_threads_changed(self) -> None:
+        self.config_store.set_stt_whisper_cpp_threads(int(self.stt_whisper_cpp_threads_combo.currentData() or 0))
+
+    def _on_stt_save_prepared_audio_changed(self, checked: bool) -> None:
+        self.config_store.set_stt_save_prepared_audio(checked)
+
+    def _on_stt_save_report_changed(self, checked: bool) -> None:
+        self.config_store.set_stt_save_report(checked)
+
+    def _on_stt_save_log_changed(self, checked: bool) -> None:
+        self.config_store.set_stt_save_log(checked)
+
+    def _refresh_stt_compute_options(self, preferred_value: str | None = None) -> None:
+        device = self.selected_stt_device() if hasattr(self, "stt_device_combo") else "cpu"
+        options = whisper_qc_compute_type_options_for_device(device)
+        labels = whisper_qc_compute_type_labels_for_options(options)
+        current = str(preferred_value or self.stt_compute_combo.currentData() or "int8")
+        if current not in options:
+            current = options[0]
+        self.stt_compute_combo.blockSignals(True)
+        self.stt_compute_combo.clear()
+        for label, value in zip(labels, options):
+            self.stt_compute_combo.addItem(label, value)
+        self._set_combo_data(self.stt_compute_combo, current)
+        self.stt_compute_combo.setEnabled(len(options) > 1)
+        self.stt_compute_combo.blockSignals(False)
+        engine = str(self.stt_engine_combo.currentData() or "faster_whisper")
+        if engine == "whisperx":
+            self.config_store.set_stt_whisperx_compute_type(current)
+        elif engine == "faster_whisper":
+            self.config_store.set_stt_compute_type(current)
+
+    def _load_stt_controls_for_engine(self, engine: str) -> None:
+        if not hasattr(self, "stt_model_combo"):
+            return
+        settings = self.config_store.stt_settings()
+        combo_values: tuple[tuple[QtWidgets.QComboBox, str | int], ...] = (
+            (self.stt_model_combo, settings.model),
+            (self.stt_language_combo, settings.language),
+            (self.stt_accuracy_combo, settings.accuracy),
+            (self.stt_vad_sensitivity_combo, settings.vad_sensitivity),
+            (self.stt_whisper_cpp_runtime_combo, settings.whisper_cpp_runtime),
+            (self.stt_whisper_cpp_device_combo, settings.whisper_cpp_device),
+            (self.stt_whisper_cpp_threads_combo, settings.whisper_cpp_threads),
+        )
+        for combo, value in combo_values:
+            combo.blockSignals(True)
+            self._set_combo_data(combo, value)
+            combo.blockSignals(False)
+        checkboxes: tuple[tuple[QtWidgets.QCheckBox, bool], ...] = (
+            (self.stt_vad_checkbox, settings.vad_enabled),
+            (self.stt_save_audio_checkbox, settings.save_prepared_audio),
+            (self.stt_save_report_checkbox, settings.save_report),
+            (self.stt_save_log_checkbox, settings.save_log),
+            (self.stt_postprocess_checkbox, settings.postprocess_enabled),
+        )
+        for checkbox, checked in checkboxes:
+            checkbox.blockSignals(True)
+            checkbox.setChecked(checked)
+            checkbox.blockSignals(False)
+        self._load_stt_device_controls_for_engine(engine)
+        self._refresh_stt_whisper_cpp_runtime_controls()
+
+    def _load_stt_device_controls_for_engine(self, engine: str) -> None:
+        if not hasattr(self, "stt_device_combo"):
+            return
+        settings = self.config_store.stt_settings()
+        if engine == "whisperx":
+            device = settings.whisperx_device
+            compute_type = settings.whisperx_compute_type
+        else:
+            device = settings.device
+            compute_type = settings.compute_type
+        self.stt_device_combo.blockSignals(True)
+        self._set_combo_data(self.stt_device_combo, device)
+        self.stt_device_combo.blockSignals(False)
+        self._refresh_stt_compute_options(compute_type)
+
+    def _refresh_stt_engine_settings_visibility(self) -> None:
+        if not hasattr(self, "stt_engine_combo"):
+            return
+        engine = str(self.stt_engine_combo.currentData() or "faster_whisper")
+        is_faster_whisper = engine == "faster_whisper"
+        is_whisperx = engine == "whisperx"
+        self.stt_faster_whisper_box.setVisible(is_faster_whisper or is_whisperx)
+        self.stt_faster_whisper_box.setTitle("Ustawienia WhisperX" if is_whisperx else "Ustawienia faster-whisper")
+        self.stt_vad_checkbox.setVisible(is_faster_whisper)
+        self.stt_vad_sensitivity_label.setVisible(is_faster_whisper)
+        self.stt_vad_sensitivity_combo.setVisible(is_faster_whisper)
+        self.stt_whisperx_note.setVisible(is_whisperx)
+        self.stt_whisper_cpp_box.setVisible(engine == "whisper_cpp")
+        self._refresh_stt_whisper_cpp_runtime_controls()
+
+    def _refresh_stt_whisper_cpp_runtime_controls(self) -> None:
+        if not hasattr(self, "stt_whisper_cpp_runtime_combo"):
+            return
+        enabled = self.btn_stt_start.isEnabled() if hasattr(self, "btn_stt_start") else True
+        runtime = str(self.stt_whisper_cpp_runtime_combo.currentData() or "cpu")
+        is_cuda = runtime == "cuda"
+        self.stt_whisper_cpp_device_combo.setEnabled(enabled and is_cuda)
+        if hasattr(self, "stt_whisper_cpp_runtime_status"):
+            ready = whisper_cpp_runtime_ready(self.paths, runtime)
+            status = "Runtime: gotowy" if ready else "Runtime: pobierze sie przy pierwszym uzyciu"
+            self.stt_whisper_cpp_runtime_status.setText(status)
 
     def selected_engine_keep_lektor_assets(self, engine_id: str) -> bool:
         try:
@@ -1330,6 +2113,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.logger.info(str(message or ""))
         compacted = compact_app_log_message(message)
         self.log_view.appendPlainText(compacted)
+
+    def log_stt(self, message: str) -> None:
+        self.logger.info(str(message or ""))
+        compacted = compact_app_log_message(message)
+        self.stt_log_view.appendPlainText(compacted)
 
     def log_diagnostic(self, message: str) -> None:
         self.logger.info("DIAGNOSTYKA\n%s", str(message or "").rstrip())

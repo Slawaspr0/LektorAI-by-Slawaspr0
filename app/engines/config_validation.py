@@ -26,6 +26,7 @@ def validate_engine_config(engine_id: str, config: dict[str, Any]) -> list[str]:
     elif engine_id == "edge":
         errors.extend(_validate_edge(config))
     errors.extend(_validate_device(config))
+    errors.extend(_validate_whisper_qc_runtime_options(config))
     return errors
 
 
@@ -90,6 +91,8 @@ def _validate_schema_values(engine_id: str, config: dict[str, Any]) -> list[str]
         elif field.field_type == "bool" and not isinstance(value, bool):
             errors.append(f"{label}: wartosc musi byc true/false.")
         elif field.field_type == "choice":
+            if field.key in {"device", "whisper_qc_device", "whisper_qc_compute_type"}:
+                continue
             if str(value or "").strip() not in field.options:
                 allowed = ", ".join(field.options)
                 errors.append(f"{label}: wybierz jedna z opcji: {allowed}.")
@@ -142,6 +145,17 @@ def _validate_device(config: dict[str, Any]) -> list[str]:
     if device == "auto" or device == "cpu" or re.fullmatch(r"cuda(:\d+)?", device):
         return []
     return ["Urzadzenie: wpisz auto, cpu, cuda albo cuda:N."]
+
+
+def _validate_whisper_qc_runtime_options(config: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    device = str(config.get("whisper_qc_device", "") or "").strip()
+    if device and device != "cpu" and not re.fullmatch(r"cuda:\d+", device):
+        errors.append("Urzadzenie kontroli mowy: wybierz cpu albo cuda:N.")
+    compute_type = str(config.get("whisper_qc_compute_type", "") or "").strip()
+    if compute_type and compute_type not in {"int8", "float16", "float32", "int8_float16"}:
+        errors.append("Tryb kontroli mowy: wybierz int8, float16, float32 albo int8_float16.")
+    return errors
 
 
 def _validate_optional_audio(config: dict[str, Any], key: str, label: str, allowed_suffixes: tuple[str, ...], suffix_label: str) -> list[str]:

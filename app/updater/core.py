@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from app.core.download import download_file_with_progress
 from app.core.version import APP_NAME, APP_VERSION
 
 
@@ -161,7 +162,7 @@ def apply_update(
             zip_path = temp_dir / "update.zip"
             extracted_dir = temp_dir / "extracted"
             write(f"Pobieranie: {remote.zip_url}")
-            download_file(remote.zip_url, zip_path, timeout_s=timeout_s)
+            download_file(remote.zip_url, zip_path, timeout_s=timeout_s, progress=write)
             write("Rozpakowywanie aktualizacji")
             with zipfile.ZipFile(zip_path, "r") as archive:
                 archive.extractall(extracted_dir)
@@ -175,10 +176,19 @@ def apply_update(
     return 0
 
 
-def download_file(url: str, target: Path, timeout_s: float = 20.0) -> None:
-    request = urllib.request.Request(str(url), headers={"User-Agent": f"{APP_NAME} updater"}, method="GET")
-    with urllib.request.urlopen(request, timeout=timeout_s) as response, target.open("wb") as output:
-        shutil.copyfileobj(response, output)
+def download_file(
+    url: str,
+    target: Path,
+    timeout_s: float = 20.0,
+    progress=None,
+) -> None:
+    download_file_with_progress(
+        url,
+        target,
+        label="Aktualizacja: pobieranie plikow",
+        progress=progress,
+        timeout_s=timeout_s,
+    )
 
 
 def find_update_source_root(extracted_dir: Path) -> Path:

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from app.engines.config_schema import faster_whisper_device_kwargs, whisper_qc_effective_compute_type
 from app.stt.faster_whisper_runtime import (
     faster_whisper_missing_message,
     import_faster_whisper_for_cache,
@@ -56,12 +57,17 @@ def transcribe_audio_with_faster_whisper(audio_path: Path, settings: dict, cache
     model_name = str(settings.get("whisper_qc_model", "small") or "small").strip() or "small"
     language = str(settings.get("whisper_qc_language", "pl") or "pl").strip() or "pl"
     device = str(settings.get("whisper_qc_device", "cpu") or "cpu").strip() or "cpu"
-    compute_type = str(settings.get("whisper_qc_compute_type", "int8") or "int8").strip() or "int8"
+    compute_type = whisper_qc_effective_compute_type(device, str(settings.get("whisper_qc_compute_type", "int8") or "int8"))
     cache_dir.mkdir(parents=True, exist_ok=True)
     key = (model_name, device, compute_type, str(cache_dir))
     model = _WHISPER_MODELS.get(key)
     if model is None:
-        model = WhisperModel(model_name, device=device, compute_type=compute_type, download_root=str(cache_dir))
+        model = WhisperModel(
+            model_name,
+            **faster_whisper_device_kwargs(device),
+            compute_type=compute_type,
+            download_root=str(cache_dir),
+        )
         _WHISPER_MODELS[key] = model
     segments, _info = model.transcribe(
         str(audio_path),

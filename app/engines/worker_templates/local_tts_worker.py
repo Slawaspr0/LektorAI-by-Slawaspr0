@@ -30,7 +30,7 @@ def configure_worker_stdio() -> None:
 configure_worker_stdio()
 
 
-_WHISPER_MODELS: dict[tuple[str, str, str, str], Any] = {}
+_WHISPER_MODELS: dict[tuple[str, str, str, str, str], Any] = {}
 _AUTO_DEVICE = ""
 _OMNIVOICE_MODEL = None
 _OMNIVOICE_MODEL_KEY = ""
@@ -517,18 +517,26 @@ def transcribe_with_faster_whisper(path: Path, settings: dict[str, Any]) -> str:
     language = str(settings.get("whisper_qc_language", "pl") or "pl").strip() or "pl"
     device = str(settings.get("whisper_qc_device", "cpu") or "cpu").strip() or "cpu"
     compute_type = str(settings.get("whisper_qc_compute_type", "int8") or "int8").strip() or "int8"
+    whisper_device, whisper_device_index = faster_whisper_device_args(device)
     cache_dir = common_whisper_cache_dir()
     cache_dir.mkdir(parents=True, exist_ok=True)
-    key = (model_name, device, compute_type, str(cache_dir))
+    key = (model_name, whisper_device, str(whisper_device_index), compute_type, str(cache_dir))
     model = _WHISPER_MODELS.get(key)
     if model is None:
-        print(f"whisper qc: sprawdzanie modelu {model_name} na {device}")
+        device_label = faster_whisper_device_label(whisper_device, whisper_device_index)
+        print(f"whisper qc: sprawdzanie modelu {model_name} na {device_label}")
         if has_whisper_model_cache(cache_dir, model_name):
             print(f"whisper qc: model w cache {model_name}")
-            print(f"whisper qc: ladowanie modelu {model_name} na {device}")
+            print(f"whisper qc: ladowanie modelu {model_name} na {device_label}")
         else:
-            print(f"whisper qc: pobieranie modelu {model_name} na {device}")
-        model = WhisperModel(model_name, device=device, compute_type=compute_type, download_root=str(cache_dir))
+            print(f"whisper qc: pobieranie modelu {model_name} na {device_label}")
+        model = WhisperModel(
+            model_name,
+            device=whisper_device,
+            device_index=whisper_device_index,
+            compute_type=compute_type,
+            download_root=str(cache_dir),
+        )
         _WHISPER_MODELS[key] = model
     segments, _info = model.transcribe(
         str(path),
@@ -540,6 +548,22 @@ def transcribe_with_faster_whisper(path: Path, settings: dict[str, Any]) -> str:
         without_timestamps=True,
     )
     return " ".join(str(segment.text or "").strip() for segment in segments).strip()
+
+
+def faster_whisper_device_args(device: str) -> tuple[str, int]:
+    normalized = str(device or "cpu").strip().lower()
+    match = re.fullmatch(r"cuda:(\d+)", normalized)
+    if match:
+        return "cuda", int(match.group(1))
+    if normalized == "cuda":
+        return "cuda", 0
+    return "cpu", 0
+
+
+def faster_whisper_device_label(device: str, device_index: int) -> str:
+    if device == "cuda":
+        return f"cuda:{int(device_index)}"
+    return device
 
 
 def text_similarity(expected_text: str, transcript: str) -> float:

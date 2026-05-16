@@ -58,6 +58,38 @@ class AppPaths:
     def faster_whisper_cache_dir(self) -> Path:
         return self.faster_whisper_stt_dir / "cache"
 
+    @property
+    def whisper_cpp_stt_dir(self) -> Path:
+        return self.stt_dir("whisper_cpp")
+
+    @property
+    def whisper_cpp_runtime_bin_dir(self) -> Path:
+        return self.whisper_cpp_stt_dir / "bin"
+
+    @property
+    def whisper_cpp_runtime_metadata_path(self) -> Path:
+        return self.whisper_cpp_stt_dir / "runtime.json"
+
+    @property
+    def whisper_cpp_models_dir(self) -> Path:
+        return self.whisper_cpp_stt_dir / "models"
+
+    @property
+    def whisperx_stt_dir(self) -> Path:
+        return self.stt_dir("whisperx")
+
+    @property
+    def whisperx_venv_dir(self) -> Path:
+        return self.whisperx_stt_dir / "venv"
+
+    @property
+    def whisperx_python_path(self) -> Path:
+        return self.whisperx_venv_dir / "Scripts" / "python.exe"
+
+    @property
+    def whisperx_cache_dir(self) -> Path:
+        return self.whisperx_stt_dir / "cache"
+
 
 def build_paths(app_dir: Path) -> AppPaths:
     return AppPaths(app_dir=app_dir.resolve())
