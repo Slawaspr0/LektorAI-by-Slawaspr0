@@ -39,6 +39,7 @@ DEFAULT_STT_WHISPER_CPP_THREADS = 0
 DEFAULT_STT_WHISPERX_DEVICE = "cpu"
 DEFAULT_STT_WHISPERX_COMPUTE_TYPE = "int8"
 DEFAULT_STT_POSTPROCESS_ENABLED = True
+DEFAULT_STT_OPEN_WORKSPACE_ON_FINISH = False
 DEFAULT_STT_SAVE_PREPARED_AUDIO = False
 DEFAULT_STT_SAVE_REPORT = False
 DEFAULT_STT_SAVE_LOG = False
@@ -56,6 +57,7 @@ DEFAULT_STT_ENGINE_CONFIGS: dict[str, dict[str, Any]] = {
         "vad_enabled": DEFAULT_STT_VAD_ENABLED,
         "vad_sensitivity": DEFAULT_STT_VAD_SENSITIVITY,
         "postprocess_enabled": DEFAULT_STT_POSTPROCESS_ENABLED,
+        "open_workspace_on_finish": DEFAULT_STT_OPEN_WORKSPACE_ON_FINISH,
         "save_prepared_audio": DEFAULT_STT_SAVE_PREPARED_AUDIO,
         "save_report": DEFAULT_STT_SAVE_REPORT,
         "save_log": DEFAULT_STT_SAVE_LOG,
@@ -70,6 +72,7 @@ DEFAULT_STT_ENGINE_CONFIGS: dict[str, dict[str, Any]] = {
         "vad_enabled": DEFAULT_STT_VAD_ENABLED,
         "vad_sensitivity": DEFAULT_STT_VAD_SENSITIVITY,
         "postprocess_enabled": DEFAULT_STT_POSTPROCESS_ENABLED,
+        "open_workspace_on_finish": DEFAULT_STT_OPEN_WORKSPACE_ON_FINISH,
         "save_prepared_audio": DEFAULT_STT_SAVE_PREPARED_AUDIO,
         "save_report": DEFAULT_STT_SAVE_REPORT,
         "save_log": DEFAULT_STT_SAVE_LOG,
@@ -83,6 +86,7 @@ DEFAULT_STT_ENGINE_CONFIGS: dict[str, dict[str, Any]] = {
         "vad_enabled": DEFAULT_STT_VAD_ENABLED,
         "vad_sensitivity": DEFAULT_STT_VAD_SENSITIVITY,
         "postprocess_enabled": DEFAULT_STT_POSTPROCESS_ENABLED,
+        "open_workspace_on_finish": DEFAULT_STT_OPEN_WORKSPACE_ON_FINISH,
         "save_prepared_audio": DEFAULT_STT_SAVE_PREPARED_AUDIO,
         "save_report": DEFAULT_STT_SAVE_REPORT,
         "save_log": DEFAULT_STT_SAVE_LOG,
@@ -120,6 +124,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "whisperx_compute_type": DEFAULT_STT_WHISPERX_COMPUTE_TYPE,
         "whisperx_device_user_set": False,
         "postprocess_enabled": DEFAULT_STT_POSTPROCESS_ENABLED,
+        "open_workspace_on_finish": DEFAULT_STT_OPEN_WORKSPACE_ON_FINISH,
         "save_prepared_audio": DEFAULT_STT_SAVE_PREPARED_AUDIO,
         "save_report": DEFAULT_STT_SAVE_REPORT,
         "save_log": DEFAULT_STT_SAVE_LOG,
@@ -204,6 +209,7 @@ class AppConfigStore:
             whisperx_device=whisperx_device,
             whisperx_compute_type=whisper_qc_effective_compute_type(whisperx_device, str(whisperx.get("compute_type", DEFAULT_STT_WHISPERX_COMPUTE_TYPE) or "")),
             postprocess_enabled=_coerce_bool(active.get("postprocess_enabled", DEFAULT_STT_POSTPROCESS_ENABLED), DEFAULT_STT_POSTPROCESS_ENABLED),
+            open_workspace_on_finish=_coerce_bool(active.get("open_workspace_on_finish", DEFAULT_STT_OPEN_WORKSPACE_ON_FINISH), DEFAULT_STT_OPEN_WORKSPACE_ON_FINISH),
             save_prepared_audio=_coerce_bool(active.get("save_prepared_audio", DEFAULT_STT_SAVE_PREPARED_AUDIO), DEFAULT_STT_SAVE_PREPARED_AUDIO),
             save_report=_coerce_bool(active.get("save_report", DEFAULT_STT_SAVE_REPORT), DEFAULT_STT_SAVE_REPORT),
             save_log=_coerce_bool(active.get("save_log", DEFAULT_STT_SAVE_LOG), DEFAULT_STT_SAVE_LOG),
@@ -265,6 +271,11 @@ class AppConfigStore:
         self.data.setdefault("stt", {})["postprocess_enabled"] = bool(value)
         self.save()
 
+    def set_stt_open_workspace_on_finish(self, value: bool) -> None:
+        self._active_stt_engine_config()["open_workspace_on_finish"] = bool(value)
+        self.data.setdefault("stt", {})["open_workspace_on_finish"] = bool(value)
+        self.save()
+
     def set_stt_whisper_cpp_runtime(self, value: str) -> None:
         runtime = sanitize_whisper_cpp_runtime(value)
         self._stt_engine_config("whisper_cpp")["runtime"] = runtime
@@ -315,6 +326,43 @@ class AppConfigStore:
     def set_stt_save_log(self, value: bool) -> None:
         self._active_stt_engine_config()["save_log"] = bool(value)
         self.data.setdefault("stt", {})["save_log"] = bool(value)
+        self.save()
+
+    def reset_stt_engine_defaults(self, engine: str | None = None) -> None:
+        stt = self.data.setdefault("stt", {})
+        if not isinstance(stt, dict):
+            stt = {}
+            self.data["stt"] = stt
+        active_engine = sanitize_stt_engine(stt.get("engine", DEFAULT_STT_ENGINE))
+        engine = sanitize_stt_engine(engine or active_engine)
+        configs = stt.setdefault("engine_configs", {})
+        if not isinstance(configs, dict):
+            configs = {}
+            stt["engine_configs"] = configs
+        config = _default_stt_engine_config(engine)
+        configs[engine] = config
+        if engine == active_engine:
+            stt["model"] = config["model"]
+            stt["language"] = config["language"]
+            stt["accuracy"] = config["accuracy"]
+            stt["vad_enabled"] = config["vad_enabled"]
+            stt["vad_sensitivity"] = config["vad_sensitivity"]
+            stt["postprocess_enabled"] = config["postprocess_enabled"]
+            stt["open_workspace_on_finish"] = config["open_workspace_on_finish"]
+            stt["save_prepared_audio"] = config["save_prepared_audio"]
+            stt["save_report"] = config["save_report"]
+            stt["save_log"] = config["save_log"]
+            if engine == "faster_whisper":
+                stt["device"] = config["device"]
+                stt["compute_type"] = config["compute_type"]
+            elif engine == "whisper_cpp":
+                stt["whisper_cpp_runtime"] = config["runtime"]
+                stt["whisper_cpp_device"] = config["device"]
+                stt["whisper_cpp_threads"] = config["threads"]
+            elif engine == "whisperx":
+                stt["whisperx_device"] = config["device"]
+                stt["whisperx_compute_type"] = config["compute_type"]
+                stt["whisperx_device_user_set"] = False
         self.save()
 
     def _active_stt_engine_config(self) -> dict[str, Any]:
@@ -490,6 +538,10 @@ def _normalize_config(data: dict[str, Any]) -> dict[str, Any]:
         stt.get("postprocess_enabled", DEFAULT_STT_POSTPROCESS_ENABLED),
         DEFAULT_STT_POSTPROCESS_ENABLED,
     )
+    stt["open_workspace_on_finish"] = _coerce_bool(
+        stt.get("open_workspace_on_finish", DEFAULT_STT_OPEN_WORKSPACE_ON_FINISH),
+        DEFAULT_STT_OPEN_WORKSPACE_ON_FINISH,
+    )
     stt["whisper_cpp_runtime"] = sanitize_whisper_cpp_runtime(
         stt.get("whisper_cpp_runtime", DEFAULT_STT_WHISPER_CPP_RUNTIME)
     )
@@ -562,6 +614,7 @@ def _legacy_stt_fields_are_customized(stt: dict[str, Any]) -> bool:
         "vad_enabled": DEFAULT_STT_VAD_ENABLED,
         "vad_sensitivity": DEFAULT_STT_VAD_SENSITIVITY,
         "postprocess_enabled": DEFAULT_STT_POSTPROCESS_ENABLED,
+        "open_workspace_on_finish": DEFAULT_STT_OPEN_WORKSPACE_ON_FINISH,
         "whisper_cpp_runtime": DEFAULT_STT_WHISPER_CPP_RUNTIME,
         "whisper_cpp_device": DEFAULT_STT_WHISPER_CPP_DEVICE,
         "whisper_cpp_threads": DEFAULT_STT_WHISPER_CPP_THREADS,
@@ -584,6 +637,7 @@ def _legacy_stt_engine_configs(stt: dict[str, Any]) -> dict[str, dict[str, Any]]
         "vad_enabled": stt.get("vad_enabled", DEFAULT_STT_VAD_ENABLED),
         "vad_sensitivity": stt.get("vad_sensitivity", DEFAULT_STT_VAD_SENSITIVITY),
         "postprocess_enabled": stt.get("postprocess_enabled", DEFAULT_STT_POSTPROCESS_ENABLED),
+        "open_workspace_on_finish": stt.get("open_workspace_on_finish", DEFAULT_STT_OPEN_WORKSPACE_ON_FINISH),
         "save_prepared_audio": stt.get("save_prepared_audio", DEFAULT_STT_SAVE_PREPARED_AUDIO),
         "save_report": stt.get("save_report", DEFAULT_STT_SAVE_REPORT),
         "save_log": stt.get("save_log", DEFAULT_STT_SAVE_LOG),
@@ -621,6 +675,10 @@ def _normalize_stt_engine_config(engine: str, config: dict[str, Any]) -> dict[st
     normalized["postprocess_enabled"] = _coerce_bool(
         normalized.get("postprocess_enabled", DEFAULT_STT_POSTPROCESS_ENABLED),
         DEFAULT_STT_POSTPROCESS_ENABLED,
+    )
+    normalized["open_workspace_on_finish"] = _coerce_bool(
+        normalized.get("open_workspace_on_finish", DEFAULT_STT_OPEN_WORKSPACE_ON_FINISH),
+        DEFAULT_STT_OPEN_WORKSPACE_ON_FINISH,
     )
     normalized["save_prepared_audio"] = _coerce_bool(
         normalized.get("save_prepared_audio", DEFAULT_STT_SAVE_PREPARED_AUDIO),

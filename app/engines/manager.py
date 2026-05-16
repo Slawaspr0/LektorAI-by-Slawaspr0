@@ -210,6 +210,7 @@ class EngineManager:
             lines.append("PyTorch: nie wymagany przez ten silnik")
         lines.extend(
             [
+            f"Instalator pakietow: {spec.package_installer}",
             f"Requirements: {engine_dir / 'requirements.txt'}",
             f"Constraints: {engine_dir / 'constraints.txt'}",
             ]
@@ -262,11 +263,13 @@ class EngineManager:
             self._emit(progress, f"TTS {engine_id}: przygotowanie venv")
             self._ensure_venv(venv_dir, log)
             venv_python = self._venv_python(engine_dir)
+            install_env = self._install_env(engine_dir)
             self._emit(progress, f"TTS {engine_id}: instalacja narzedzi build")
             self._run_logged_step(
                 "Przygotowanie wheel/setuptools",
                 self._build_tools_install_command(venv_python),
                 log,
+                env=install_env,
             )
             if spec.torch_requirements:
                 self._emit(progress, f"TTS {engine_id}: instalacja PyTorch")
@@ -274,6 +277,7 @@ class EngineManager:
                     "Instalacja PyTorch CUDA",
                     self._torch_install_command(venv_python, spec, constraints_path),
                     log,
+                    env=install_env,
                 )
             else:
                 self._emit(progress, f"TTS {engine_id}: PyTorch nie jest wymagany")
@@ -281,15 +285,17 @@ class EngineManager:
             self._emit(progress, f"TTS {engine_id}: instalacja pakietow TTS")
             self._run_logged_step(
                 "Instalacja pakietow TTS",
-                self._requirements_install_command(venv_python, requirements_path, constraints_path),
+                self._package_install_command(venv_python, spec, requirements_path, constraints_path, engine_dir),
                 log,
+                env=self._package_install_env(spec, engine_dir, install_env, log),
             )
             if spec.no_deps_requirements:
                 self._emit(progress, f"TTS {engine_id}: instalacja pakietow dodatkowych")
                 self._run_logged_step(
                     "Instalacja pakietow TTS bez zaleznosci",
-                    self._no_deps_requirements_install_command(venv_python, no_deps_requirements_path),
+                    self._no_deps_package_install_command(venv_python, spec, no_deps_requirements_path, engine_dir),
                     log,
+                    env=self._package_install_env(spec, engine_dir, install_env, log),
                 )
             self._emit(progress, f"TTS {engine_id}: kontrola zaleznosci")
             self._run_pip_check(venv_python, spec, log)
@@ -708,7 +714,26 @@ class EngineManager:
         temp_dir.mkdir(parents=True, exist_ok=True)
         env["TEMP"] = str(temp_dir)
         env["TMP"] = str(temp_dir)
+        self._apply_pip_install_env(env)
         return env
+
+    def _install_env(self, engine_dir: Path) -> dict[str, str]:
+        env = dict(os.environ)
+        temp_dir = engine_dir / "temp" / "pip"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        env["TEMP"] = str(temp_dir)
+        env["TMP"] = str(temp_dir)
+        self._apply_pip_install_env(env)
+        return env
+
+    def _apply_pip_install_env(self, env: dict[str, str]) -> None:
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+        env["PIP_PROGRESS_BAR"] = "off"
+        compat_dir = Path(__file__).resolve().parent / "pip_compat"
+        current_pythonpath = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = str(compat_dir) if not current_pythonpath else str(compat_dir) + os.pathsep + current_pythonpath
 
     def _run_logged(self, command: list[str], log, env: dict[str, str] | None = None) -> None:
         log.write("> " + " ".join(command) + "\n")
@@ -781,6 +806,12 @@ class EngineManager:
             "-m",
             "pip",
             "install",
+            "--disable-pip-version-check",
+            "--retries",
+            "2",
+            "--timeout",
+            "30",
+            "--prefer-binary",
             "--index-url",
             spec.torch_index_url,
             *spec.torch_requirements,
@@ -789,13 +820,105 @@ class EngineManager:
         ]
 
     def _requirements_install_command(self, python_path: Path, requirements_path: Path, constraints_path: Path) -> list[str]:
-        return [str(python_path), "-m", "pip", "install", "-r", str(requirements_path), "-c", str(constraints_path)]
+        return [
+            str(python_path),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--retries",
+            "2",
+            "--timeout",
+            "30",
+            "--prefer-binary",
+            "-r",
+            str(requirements_path),
+            "-c",
+            str(constraints_path),
+        ]
+
+    def _package_install_command(self, python_path: Path, spec, requirements_path: Path, constraints_path: Path, engine_dir: Path) -> list[str]:
+        if spec.package_installer == "uv" and self._uv_available():
+            return self._uv_requirements_install_command(python_path, requirements_path, constraints_path)
+        return self._requirements_install_command(python_path, requirements_path, constraints_path)
 
     def _no_deps_requirements_install_command(self, python_path: Path, requirements_path: Path) -> list[str]:
-        return [str(python_path), "-m", "pip", "install", "--no-deps", "-r", str(requirements_path)]
+        return [
+            str(python_path),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--retries",
+            "2",
+            "--timeout",
+            "30",
+            "--prefer-binary",
+            "--no-deps",
+            "-r",
+            str(requirements_path),
+        ]
+
+    def _no_deps_package_install_command(self, python_path: Path, spec, requirements_path: Path, engine_dir: Path) -> list[str]:
+        if spec.package_installer == "uv" and self._uv_available():
+            return self._uv_no_deps_requirements_install_command(python_path, requirements_path)
+        return self._no_deps_requirements_install_command(python_path, requirements_path)
+
+    def _uv_requirements_install_command(self, python_path: Path, requirements_path: Path, constraints_path: Path) -> list[str]:
+        return [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(python_path),
+            "-r",
+            str(requirements_path),
+            "-c",
+            str(constraints_path),
+        ]
+
+    def _uv_no_deps_requirements_install_command(self, python_path: Path, requirements_path: Path) -> list[str]:
+        return [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(python_path),
+            "--no-deps",
+            "-r",
+            str(requirements_path),
+        ]
+
+    def _package_install_env(self, spec, engine_dir: Path, pip_env: dict[str, str], log) -> dict[str, str]:
+        if spec.package_installer == "uv" and self._uv_available():
+            env = dict(pip_env)
+            uv_cache_dir = engine_dir / "temp" / "uv-cache"
+            uv_cache_dir.mkdir(parents=True, exist_ok=True)
+            env["UV_CACHE_DIR"] = str(uv_cache_dir)
+            return env
+        if spec.package_installer == "uv":
+            log.write("Instalator uv nie jest dostepny, uzywam pip.\n")
+            log.flush()
+        return pip_env
+
+    def _uv_available(self) -> bool:
+        return shutil.which("uv") is not None
 
     def _build_tools_install_command(self, python_path: Path) -> list[str]:
-        return [str(python_path), "-m", "pip", "install", "wheel", "setuptools"]
+        return [
+            str(python_path),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--retries",
+            "2",
+            "--timeout",
+            "30",
+            "--prefer-binary",
+            "wheel",
+            "setuptools",
+        ]
 
     def _worker_env(self) -> dict[str, str]:
         env = dict(os.environ)

@@ -246,6 +246,18 @@ def primary_audio_channels(audio_streams: list[dict]) -> int:
         return 0
 
 
+def surround_label_for_channels(channels: object) -> str:
+    try:
+        channel_count = int(channels or 0)
+    except Exception:
+        channel_count = 0
+    if channel_count >= 8:
+        return "7.1"
+    if channel_count >= 6:
+        return "5.1"
+    return ""
+
+
 def audio_stream_summary(stream: dict | None) -> str:
     if not stream:
         return "brak danych audio"
@@ -368,6 +380,7 @@ def _run_command_capture_text(
     timeout: int,
     cancel_requested: Callable[[], bool] | None = None,
     output_callback: Callable[[str], None] | None = None,
+    env: dict[str, str] | None = None,
 ) -> CommandCaptureResult:
     process = subprocess.Popen(
         [
@@ -378,6 +391,7 @@ def _run_command_capture_text(
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=env,
     )
     assert process.stdout is not None
     output_queue: queue.Queue[str] = queue.Queue()
@@ -1027,12 +1041,14 @@ def mux_lektor_track(
         stage_prefix = output_video.stem
         source_audio_path = _stage_audio_path(stage_dir, stage_prefix, "tlo_zrodlowe", ".wav", keep_mixing_steps)
         pl_stereo_path = _stage_audio_path(stage_dir, stage_prefix, "pl_2_0", ".m4a", keep_mixing_steps)
-        pl_surround_path = _stage_audio_path(stage_dir, stage_prefix, "pl_5_1", ".m4a", keep_mixing_steps)
+        surround_label = surround_label_for_channels(primary_channels)
+        surround_suffix = f"pl_{surround_label.replace('.', '_')}" if surround_label else "pl_5_1"
+        pl_surround_path = _stage_audio_path(stage_dir, stage_prefix, surround_suffix, ".m4a", keep_mixing_steps)
         temp_stage_paths = [source_audio_path, pl_stereo_path, pl_surround_path]
         for path in temp_stage_paths:
             _unlink_if_exists(path)
         extract_command = extract_primary_audio_command(ffmpeg, video_path, source_audio_path)
-        create_surround_track = primary_channels >= 6
+        create_surround_track = bool(surround_label)
         create_stereo_track = not create_surround_track or bool(create_stereo_for_surround)
         prepared_tracks: list[Path] = []
         prepared_labels: list[str] = []
@@ -1055,6 +1071,7 @@ def mux_lektor_track(
                     background_lufs=background_lufs,
                     background_weight=background_weight,
                     bitrate=bitrate,
+                    channel_layout=surround_label,
                 )
                 if progress_callback is not None:
                     end = 0.45 if create_surround_track else 0.85
@@ -1084,9 +1101,9 @@ def mux_lektor_track(
                     surround_result = _run_command_capture_text(surround_command, timeout=3600, cancel_requested=cancel_requested)
                     if surround_result.returncode != 0:
                         tail = "\n".join((surround_result.output or "").splitlines()[-80:])
-                        raise RuntimeError(f"Nie udalo sie przygotowac sciezki PL 5.1.\n{tail}")
+                        raise RuntimeError(f"Nie udalo sie przygotowac sciezki PL {surround_label}.\n{tail}")
                 prepared_tracks.append(pl_surround_path)
-                prepared_labels.append("5.1")
+                prepared_labels.append(surround_label)
             remux_command = remux_with_prepared_lektor_audio_mkvmerge_command(
                 mkvmerge,
                 video_path,
@@ -1256,18 +1273,28 @@ def mix_lektor_surround_audio_command(
     background_lufs: int = DEFAULT_BACKGROUND_LUFS,
     background_weight: float = DEFAULT_BACKGROUND_WEIGHT,
     bitrate: str | int | None = DEFAULT_AAC_BITRATE,
+    channel_layout: str = "5.1",
 ) -> list[str]:
     bg_lufs = sanitize_lufs(background_lufs, DEFAULT_BACKGROUND_LUFS)
     bg_weight = sanitize_audio_weight(background_weight, DEFAULT_BACKGROUND_WEIGHT)
     lector_weight = sanitize_audio_weight(lektor_weight, DEFAULT_LEKTOR_WEIGHT)
     bg_gain, lector_gain = _overlay_mix_gains(bg_weight, lector_weight)
     limiter = _mix_limiter_filter()
+    layout = "7.1" if str(channel_layout).strip() == "7.1" else "5.1"
+    suffix = layout.replace(".", "_")
+    bg_label = f"bg{suffix.replace('_', '')}"
+    lector_label = f"lector{suffix.replace('_', '')}"
+    output_label = f"lektor_pl_{suffix}"
+    if layout == "7.1":
+        pan_filter = "pan=7.1|FL=0*c0|FR=0*c0|FC=c0|LFE=0*c0|BL=0*c0|BR=0*c0|SL=0*c0|SR=0*c0"
+    else:
+        pan_filter = "pan=5.1|FL=0*c0|FR=0*c0|FC=c0|LFE=0*c0|BL=0*c0|BR=0*c0"
     filter_complex = ";".join(
         [
-            f"[0:a:0]asetpts=PTS-STARTPTS,aresample={OUTPUT_AUDIO_SAMPLE_RATE},loudnorm=I={bg_lufs}:TP={LOUDNORM_TRUE_PEAK},aformat=channel_layouts=5.1,volume={bg_gain}[bg51]",
+            f"[0:a:0]asetpts=PTS-STARTPTS,aresample={OUTPUT_AUDIO_SAMPLE_RATE},loudnorm=I={bg_lufs}:TP={LOUDNORM_TRUE_PEAK},aformat=channel_layouts={layout},volume={bg_gain}[{bg_label}]",
             f"[1:a:0]asetpts=PTS-STARTPTS,aresample={OUTPUT_AUDIO_SAMPLE_RATE},aformat=channel_layouts=mono,volume={lector_gain}[lector_mono]",
-            "[lector_mono]pan=5.1|FL=0*c0|FR=0*c0|FC=c0|LFE=0*c0|BL=0*c0|BR=0*c0[lector51]",
-            f"[bg51][lector51]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,{limiter}[lektor_pl_5_1]",
+            f"[lector_mono]{pan_filter}[{lector_label}]",
+            f"[{bg_label}][{lector_label}]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,{limiter}[{output_label}]",
         ]
     )
     return [
@@ -1283,7 +1310,7 @@ def mix_lektor_surround_audio_command(
         "-filter_complex",
         filter_complex,
         "-map",
-        "[lektor_pl_5_1]",
+        f"[{output_label}]",
         "-c:a",
         "aac",
         "-ar",

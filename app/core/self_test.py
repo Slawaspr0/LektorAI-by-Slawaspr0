@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import wave
+import zipfile
 from array import array
 from datetime import datetime
 from pathlib import Path
@@ -107,8 +108,19 @@ from app.pipeline.whisper_qc import (
     text_similarity,
 )
 from app.stt.faster_whisper_runtime import (
+    faster_whisper_cuda_dll_dirs_for_package_dirs,
+    faster_whisper_device_needs_cuda,
     faster_whisper_package_dirs,
     faster_whisper_worker_env,
+)
+from app.stt.cuda_runtime import (
+    CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID,
+    CUDA_RUNTIME_PACKAGES,
+    CUDA_RUNTIME_WHISPER_CPP_ID,
+    cuda_runtime_dll_dir,
+    cuda_runtime_env,
+    cuda_runtime_ready,
+    ensure_cuda_runtime,
 )
 from app.updater.core import (
     SOURCE_ZIP_URL,
@@ -178,11 +190,13 @@ from app.stt.whisper_cpp_runtime import (
     sanitize_whisper_cpp_device,
     sanitize_whisper_cpp_runtime,
     whisper_cpp_model_file_name,
+    whisper_cpp_runtime_env,
 )
 from app.stt.whisperx_runtime import (
     build_whisperx_command,
     normalize_whisperx_compute_type,
     normalize_whisperx_model_name,
+    whisperx_runtime_env,
     whisperx_device_args,
 )
 from app.ui.main_window import (
@@ -237,6 +251,13 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(paths.app_packages_dir == app_dir.resolve() / "packages", "portable app packages dir mismatch")
     _assert(paths.cache_dir == app_dir.resolve() / "cache", "portable app cache dir mismatch")
     _assert(paths.runtime_stt_dir == app_dir.resolve() / "stt", "portable STT runtime dir mismatch")
+    _assert(paths.cuda_runtime_root_dir == app_dir.resolve() / "runtime" / "cuda", "portable CUDA runtime root mismatch")
+    _assert(paths.cuda_runtime_downloads_dir == app_dir.resolve() / "runtime" / "cuda" / "downloads", "portable CUDA runtime downloads mismatch")
+    _assert(
+        paths.cuda_runtime_pack_dir(CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID)
+        == app_dir.resolve() / "runtime" / "cuda" / CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID,
+        "portable CUDA 12 runtime dir mismatch",
+    )
     _assert(paths.stt_dir("faster_whisper") == app_dir.resolve() / "stt" / "faster_whisper", "portable faster-whisper STT dir mismatch")
     _assert(paths.whisper_cpp_stt_dir == app_dir.resolve() / "stt" / "whisper_cpp", "portable whisper.cpp STT dir mismatch")
     _assert(paths.whisper_cpp_runtime_bin_dir == app_dir.resolve() / "stt" / "whisper_cpp" / "bin", "portable whisper.cpp runtime dir mismatch")
@@ -269,6 +290,7 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(safe_relative_path("app/core/version.py") == Path("app/core/version.py"), "updater safe path mismatch")
     _assert(safe_relative_path("../config.json") is None, "updater should reject parent traversal")
     _assert(is_protected_update_path(Path("logs/app.log")), "updater should protect logs")
+    _assert(is_protected_update_path(Path("runtime/cuda/file.dll")), "updater should protect CUDA runtime")
     _assert(is_protected_update_path(Path("config.json")), "updater should protect config")
     _assert(not is_protected_update_path(Path("app/core/version.py")), "updater should allow app code updates")
     remote_update_probe = app_dir / "_self_test_update_remote.json"
@@ -344,7 +366,7 @@ def run_self_test(app_dir: Path) -> list[str]:
             ),
             (
                 ["--list-engines"],
-                ("Edge TTS", "Chatterbox", "OmniVoice", "Piper TTS", "Coqui XTTS-v2"),
+                ("Edge TTS", "Chatterbox", "OmniVoice", "Piper TTS", "Coqui XTTS-v2", "Supertonic"),
                 "START.py --list-engines",
             ),
             (
@@ -623,6 +645,7 @@ def run_self_test(app_dir: Path) -> list[str]:
             "cache",
             "logs",
             "stt",
+            "runtime",
             "ffmpeg.exe",
             "ffprobe.exe",
             "mkvmerge.exe",
@@ -696,11 +719,12 @@ def run_self_test(app_dir: Path) -> list[str]:
         messages.append("test package layout: OK")
 
     _assert("chatterbox_onnx_pl" not in INSTALL_SPECS, "archived Chatterbox ONNX PL should not be installable")
-    local_specs = {engine_id: get_install_spec(engine_id) for engine_id in ("chatterbox", "omnivoice", "piper", "coqui_xtts")}
+    local_specs = {engine_id: get_install_spec(engine_id) for engine_id in ("chatterbox", "omnivoice", "piper", "coqui_xtts", "supertonic")}
     for engine_id, spec in local_specs.items():
         _assert(spec.engine_id == engine_id, f"{engine_id} install spec id mismatch")
         _assert(spec.requirements, f"{engine_id} install spec has no requirements")
         _assert(spec.import_checks, f"{engine_id} install spec has no import checks")
+        _assert(spec.package_installer in {"pip", "uv"}, f"{engine_id} install spec has invalid package installer")
         _assert(
             not any("faster-whisper" in requirement for requirement in spec.requirements),
             f"{engine_id} should use shared STT faster-whisper instead of installing it into venv",
@@ -709,7 +733,7 @@ def run_self_test(app_dir: Path) -> list[str]:
             "faster_whisper" not in spec.import_checks,
             f"{engine_id} install import checks should not validate app-level faster_whisper",
         )
-        if engine_id not in {"piper"}:
+        if engine_id not in {"piper", "supertonic"}:
             _assert(spec.torch_requirements, f"{engine_id} torch install spec has no torch requirements")
             _assert(
                 any(requirement.startswith("torch") for requirement in spec.torch_requirements),
@@ -741,6 +765,7 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(local_specs["omnivoice"].torch_index_url == TORCH_CU128_INDEX, "omnivoice torch index mismatch")
     _assert("omnivoice==0.1.5" in local_specs["omnivoice"].requirements, "omnivoice should install pinned PyPI release")
     _assert("piper-tts==1.4.2" in local_specs["piper"].requirements, "piper should install pinned upstream PyPI release")
+    _assert("supertonic" in local_specs["supertonic"].requirements, "supertonic should install upstream PyPI release")
     _assert(local_specs["coqui_xtts"].torch_requirements == ("torch==2.8.0+cu126", "torchaudio==2.8.0+cu126"), "coqui XTTS should use a CUDA 12.6 torch pair")
     _assert(local_specs["coqui_xtts"].torch_index_url == TORCH_CU126_INDEX, "coqui XTTS torch index mismatch")
     coqui_variants = {variant.variant_id: variant for variant in list_install_variants("coqui_xtts")}
@@ -750,6 +775,7 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(coqui_variants["cu128"].spec.torch_requirements == ("torch==2.8.0+cu128", "torchaudio==2.8.0+cu128"), "coqui XTTS CU128 variant should use torch 2.8 CU128")
     _assert(not list_install_variants("omnivoice"), "omnivoice already uses CU128 and should not show torch variants")
     _assert(not list_install_variants("piper"), "piper should not show torch variants")
+    _assert(not list_install_variants("supertonic"), "supertonic should not show torch variants")
     _assert(
         any("coqui-tts" in requirement and "github.com/idiap/coqui-ai-TTS" in requirement for requirement in local_specs["coqui_xtts"].requirements),
         "coqui XTTS should install current upstream repo",
@@ -769,9 +795,10 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(any(state.definition.engine_id == "omnivoice" for state in states), "missing omnivoice definition")
     _assert(any(state.definition.engine_id == "piper" for state in states), "missing piper definition")
     _assert(any(state.definition.engine_id == "coqui_xtts" for state in states), "missing coqui XTTS definition")
+    _assert(any(state.definition.engine_id == "supertonic" for state in states), "missing Supertonic definition")
     _assert("f5_tts" not in engine_ids, "archived F5-TTS should not be listed as active engine")
     for state in states:
-        if state.definition.engine_id in {"chatterbox", "omnivoice", "piper", "coqui_xtts"}:
+        if state.definition.engine_id in {"chatterbox", "omnivoice", "piper", "coqui_xtts", "supertonic"}:
             install_checks = set(get_install_spec(state.definition.engine_id).import_checks)
             if state.definition.engine_id == "chatterbox":
                 _assert(
@@ -821,6 +848,76 @@ def run_self_test(app_dir: Path) -> list[str]:
         "missing mkvmerge diagnostic should show lookup hint",
     )
     _assert(not readonly_probe_dir.exists(), "diagnostic/list commands should not create app runtime dirs")
+    _assert(faster_whisper_device_needs_cuda("cuda"), "faster-whisper GPU runtime should detect cuda device")
+    _assert(faster_whisper_device_needs_cuda("cuda:1"), "faster-whisper GPU runtime should detect indexed cuda device")
+    _assert(not faster_whisper_device_needs_cuda("cpu"), "faster-whisper GPU runtime should not treat CPU as CUDA")
+    _assert(
+        CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID in CUDA_RUNTIME_PACKAGES,
+        "CUDA runtime should expose CUDA 12 CTranslate2/PyTorch pack",
+    )
+    _assert(
+        CUDA_RUNTIME_WHISPER_CPP_ID in CUDA_RUNTIME_PACKAGES,
+        "CUDA runtime should expose CUDA 13 whisper.cpp pack",
+    )
+    _assert(
+        CUDA_RUNTIME_PACKAGES[CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID].archive_name == "cuda12-ctranslate2-pytorch-win-x64.zip",
+        "CUDA 12 runtime archive name mismatch",
+    )
+    _assert(
+        CUDA_RUNTIME_PACKAGES[CUDA_RUNTIME_WHISPER_CPP_ID].archive_name == "cuda13-whispercpp-win-x64.zip",
+        "CUDA 13 runtime archive name mismatch",
+    )
+    cuda_install_probe_dir = app_dir / "_self_test_cuda_runtime_install"
+    cuda_install_paths = build_paths(cuda_install_probe_dir)
+    try:
+        local_releases_dir = cuda_install_probe_dir / "Releases"
+        local_releases_dir.mkdir(parents=True)
+        package = CUDA_RUNTIME_PACKAGES[CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID]
+        archive_path = local_releases_dir / package.archive_name
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            for dll_name in package.required_dlls:
+                archive.writestr(dll_name, "")
+        progress_lines: list[str] = []
+        installed_dir = ensure_cuda_runtime(
+            cuda_install_paths,
+            CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID,
+            progress=progress_lines.append,
+        )
+        _assert(installed_dir == cuda_runtime_dll_dir(cuda_install_paths, CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID), "CUDA runtime install dir mismatch")
+        _assert(cuda_runtime_ready(cuda_install_paths, CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID), "CUDA runtime local archive install should prepare DLLs")
+        _assert(any("lokalnej paczki" in line for line in progress_lines), "CUDA runtime should prefer local release archive")
+    finally:
+        _cleanup_tree(cuda_install_probe_dir)
+    fw_cuda_probe_dir = app_dir / "_self_test_fw_cuda_runtime"
+    fw_cuda_paths = build_paths(fw_cuda_probe_dir)
+    try:
+        cuda12_dir = cuda_runtime_dll_dir(fw_cuda_paths, CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID)
+        cuda12_dir.mkdir(parents=True)
+        for dll_name in ("cublas64_12.dll", "cublasLt64_12.dll", "cudnn64_9.dll", "cudart64_12.dll"):
+            (cuda12_dir / dll_name).write_text("", encoding="utf-8")
+        _assert(cuda_runtime_ready(fw_cuda_paths, CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID), "CUDA 12 runtime pack should be detected")
+        cuda_env = cuda_runtime_env(fw_cuda_paths, CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID)
+        _assert(str(cuda12_dir) in cuda_env.get("PATH", "").split(os.pathsep), "CUDA runtime env should prepend CUDA 12 DLL dir")
+
+        cublas_dir = fw_cuda_paths.faster_whisper_packages_dir / "nvidia" / "cublas" / "bin"
+        cudnn_dir = fw_cuda_paths.faster_whisper_packages_dir / "nvidia" / "cudnn" / "bin"
+        runtime_dir = fw_cuda_paths.faster_whisper_packages_dir / "nvidia" / "cuda_runtime" / "bin"
+        cublas_dir.mkdir(parents=True)
+        cudnn_dir.mkdir(parents=True)
+        runtime_dir.mkdir(parents=True)
+        (cublas_dir / "cublas64_12.dll").write_text("", encoding="utf-8")
+        (cudnn_dir / "cudnn64_9.dll").write_text("", encoding="utf-8")
+        (runtime_dir / "cudart64_12.dll").write_text("", encoding="utf-8")
+        dll_dirs = faster_whisper_cuda_dll_dirs_for_package_dirs((fw_cuda_paths.faster_whisper_packages_dir,))
+        _assert(dll_dirs == (cublas_dir, cudnn_dir, runtime_dir), "faster-whisper CUDA DLL dirs should be stable and ordered")
+        worker_env = faster_whisper_worker_env(fw_cuda_paths)
+        path_entries = worker_env.get("PATH", "").split(os.pathsep)
+        _assert(str(cuda12_dir) in path_entries, "faster-whisper worker PATH should include shared CUDA 12 runtime dir")
+        _assert(str(cublas_dir) in path_entries, "faster-whisper worker PATH should include cuBLAS DLL dir")
+        _assert(str(cudnn_dir) in path_entries, "faster-whisper worker PATH should include cuDNN DLL dir")
+        _assert(str(runtime_dir) in path_entries, "faster-whisper worker PATH should include CUDA runtime DLL dir")
+    finally:
+        _cleanup_tree(fw_cuda_probe_dir)
     messages.append("readonly diagnostics: OK")
 
     install_preview_dir = app_dir / "_self_test_install_preview"
@@ -839,6 +936,7 @@ def run_self_test(app_dir: Path) -> list[str]:
                 f"install preview missing constraint entries for {engine_id}",
             )
             _assert("Pakiety:" in joined, f"install preview missing requirements for {engine_id}")
+            _assert("Instalator pakietow:" in joined, f"install preview missing package installer for {engine_id}")
             _assert("faster-whisper" not in joined, f"install preview should not install faster-whisper inside {engine_id}")
             _assert("Pakiety bez zaleznosci:" not in joined, f"{engine_id} should not use no-deps install section")
             _assert("  faster_whisper" not in joined, f"install preview should not show app-level faster_whisper for {engine_id}")
@@ -850,6 +948,17 @@ def run_self_test(app_dir: Path) -> list[str]:
                 engine_dir / "constraints.txt",
             )
             _assert("-c" in torch_command and str(engine_dir / "constraints.txt") in torch_command, f"torch install command missing constraints for {engine_id}")
+        _assert(local_specs["supertonic"].package_installer == "uv", "supertonic should prefer uv installer")
+        supertonic_preview = "\n".join(install_preview_manager.local_install_preview("supertonic"))
+        _assert("Instalator pakietow: uv" in supertonic_preview, "supertonic preview should show uv installer")
+        supertonic_dir = install_preview_paths.engine_dir("supertonic")
+        uv_command = install_preview_manager._uv_requirements_install_command(
+            supertonic_dir / "venv" / "Scripts" / "python.exe",
+            supertonic_dir / "requirements.txt",
+            supertonic_dir / "constraints.txt",
+        )
+        _assert(uv_command[:3] == ["uv", "pip", "install"], "uv package install command should use uv pip install")
+        _assert("--python" in uv_command, "uv package install command should target engine venv")
         for engine_id in ("chatterbox", "coqui_xtts"):
             cu128_preview = "\n".join(install_preview_manager.local_install_preview(engine_id, torch_variant="cu128"))
             _assert("PyTorch CU128" in cu128_preview, f"{engine_id} CU128 preview missing variant label")
@@ -870,6 +979,10 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert("PyTorch CUDA:" not in piper_preview, "piper install preview should not show torch section")
         _assert("PyTorch: nie wymagany" in piper_preview, "piper install preview should explain missing torch section")
         _assert("piper-tts==1.4.2" in piper_preview, "piper install preview missing piper package")
+        supertonic_preview = "\n".join(install_preview_manager.local_install_preview("supertonic"))
+        _assert("PyTorch CUDA:" not in supertonic_preview, "supertonic install preview should not show torch section")
+        _assert("PyTorch: nie wymagany" in supertonic_preview, "supertonic install preview should explain missing torch section")
+        _assert("supertonic" in supertonic_preview, "supertonic install preview missing supertonic package")
         build_tools_command = install_preview_manager._build_tools_install_command(Path("python.exe"))
         _assert("--upgrade" not in build_tools_command, "build tools install should not upgrade pip on every retry")
         _assert("wheel" in build_tools_command and "setuptools" in build_tools_command, "build tools command missing expected packages")
@@ -1132,7 +1245,7 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(prepared_items == ["install.log"], f"prepare local engine should not create user config: {prepared_items}")
         temp_manager.remove_engine_completely("chatterbox")
         temp_manager._ensure_venv = lambda _venv_dir, _log: None
-        temp_manager._run_logged = lambda _command, _log: None
+        temp_manager._run_logged = lambda _command, _log, env=None: None
         temp_manager._run_pip_check = lambda _python_path, _spec, _log: None
         temp_manager._run_import_checks = lambda _definition, _python_path, _log: None
         temp_manager.install_worker_script = lambda engine_id: (temp_paths.engine_dir(engine_id) / "worker.py")
@@ -1169,6 +1282,12 @@ def run_self_test(app_dir: Path) -> list[str]:
         venv_env = temp_manager._venv_creation_env(engine_dir / "venv")
         _assert(venv_env["TEMP"].startswith(str(engine_dir)), "venv TEMP should stay inside engine dir")
         _assert(venv_env["TMP"].startswith(str(engine_dir)), "venv TMP should stay inside engine dir")
+        _assert("pip_compat" in venv_env.get("PYTHONPATH", ""), "venv pip bootstrap should load pip compatibility patch")
+        install_env = temp_manager._install_env(engine_dir)
+        _assert(install_env["TEMP"].startswith(str(engine_dir)), "pip install TEMP should stay inside engine dir")
+        _assert(install_env["TMP"].startswith(str(engine_dir)), "pip install TMP should stay inside engine dir")
+        _assert(install_env["PYTHONIOENCODING"] == "utf-8", "pip install env should force UTF-8 stdio")
+        _assert("pip_compat" in install_env.get("PYTHONPATH", ""), "pip install env should load pip compatibility patch")
         worker_env = temp_manager._worker_env()
         stt_env = faster_whisper_worker_env(temp_paths)
         _assert(worker_env.get("PYTHONIOENCODING") == "utf-8", "worker env should force UTF-8 stdio")
@@ -1521,6 +1640,20 @@ def run_self_test(app_dir: Path) -> list[str]:
             bitrate="384k",
         )
     )
+    surround_71_stage_text = " ".join(
+        str(part)
+        for part in mix_lektor_surround_audio_command(
+            Path("ffmpeg.exe"),
+            Path("source_audio.wav"),
+            Path("lektor.m4a"),
+            Path("pl_7_1.m4a"),
+            lektor_weight=2.3,
+            background_lufs=-18,
+            background_weight=1.6,
+            bitrate="384k",
+            channel_layout="7.1",
+        )
+    )
     _assert("aformat=channel_layouts=stereo" in stereo_stage_text, "stereo mix stage should downmix background before adding lektor")
     _assert("volume=1" in stereo_stage_text and "volume=0.5897" in stereo_stage_text, "stereo mix stage should scale background and lektor predictably")
     _assert(stereo_stage_text.count("asetpts=PTS-STARTPTS") >= 2, "stereo mix stage should reset audio PTS")
@@ -1530,6 +1663,9 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert("-c:a aac" in stereo_stage_text and "-b:a 384k" in stereo_stage_text, "stereo mix stage should encode prepared PL audio")
     _assert("pan=5.1|FL=0*c0|FR=0*c0|FC=c0" in surround_stage_text, "surround mix should place lektor only in center channel")
     _assert("FL=0.70*c0" not in surround_stage_text and "FR=0.70*c0" not in surround_stage_text, "surround mix should not spread lektor to front left/right")
+    _assert("aformat=channel_layouts=7.1" in surround_71_stage_text, "7.1 surround mix should preserve 7.1 layout")
+    _assert("pan=7.1|FL=0*c0|FR=0*c0|FC=c0" in surround_71_stage_text, "7.1 surround mix should place lektor only in center channel")
+    _assert("BL=0*c0|BR=0*c0" in surround_71_stage_text and "SL=0*c0|SR=0*c0" in surround_71_stage_text, "7.1 surround mix should keep lektor out of side and back channels")
     mkvmerge_remux_text = " ".join(
         str(part)
         for part in remux_with_prepared_lektor_audio_mkvmerge_command(
@@ -1550,16 +1686,22 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(validate_engine_config("omnivoice", defaults["omnivoice"]) == [], "omnivoice default config should be valid")
     _assert(validate_engine_config("piper", defaults["piper"]) == [], "piper default config should be valid")
     _assert(validate_engine_config("coqui_xtts", defaults["coqui_xtts"]) == [], "coqui XTTS default config should be valid")
+    _assert(validate_engine_config("supertonic", defaults["supertonic"]) == [], "Supertonic default config should be valid")
     openai_config = dict(defaults["openai"])
     openai_config["api_key"] = "test-key"
     _assert(validate_engine_config("openai", openai_config) == [], "openai configured default should be valid")
     _assert("chatterbox_onnx_pl" not in defaults, "archived Chatterbox ONNX PL should not have active defaults")
     _assert(fields_for("chatterbox_onnx_pl") == (), "archived Chatterbox ONNX PL should not expose config fields")
     _assert(visible_fields_for("chatterbox_onnx_pl") == (), "archived Chatterbox ONNX PL should not expose visible config fields")
-    for engine_id in ("edge", "openai", "chatterbox", "omnivoice", "piper", "coqui_xtts"):
+    for engine_id in ("edge", "openai", "chatterbox", "omnivoice", "piper", "coqui_xtts", "supertonic"):
         field_map = {field.key: field for field in fields_for(engine_id)}
         field_labels = {field.key: field.label for field in fields_for(engine_id)}
-        if engine_id in {"edge", "chatterbox", "omnivoice", "piper", "coqui_xtts"}:
+        _assert(defaults[engine_id].get("open_workspace_on_finish") is False, f"{engine_id} open workspace default should be disabled")
+        _assert(
+            field_labels.get("open_workspace_on_finish") == "Otworz folder po pracy",
+            f"{engine_id} open workspace label should be user friendly",
+        )
+        if engine_id in {"edge", "chatterbox", "omnivoice", "piper", "coqui_xtts", "supertonic"}:
             _assert("audio_qc_enabled" not in field_labels, f"{engine_id} Audio QC should not be exposed in TTS settings")
             _assert("audio_qc_retry_attempts" not in field_labels, f"{engine_id} Audio QC retry should not be exposed in TTS settings")
         else:
@@ -1608,7 +1750,7 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(defaults[engine_id].get("save_audio_mix_steps") is False, f"{engine_id} should not save audio mix steps by default")
         if "audio_qc_enabled" in defaults[engine_id]:
             _assert(defaults[engine_id].get("audio_qc_enabled") is False, f"{engine_id} Audio QC should be disabled by default")
-        expected_whisper_enabled = engine_id in {"edge", "chatterbox", "omnivoice", "piper", "coqui_xtts"}
+        expected_whisper_enabled = engine_id in {"edge", "chatterbox", "omnivoice", "piper", "coqui_xtts", "supertonic"}
         _assert(
             defaults[engine_id].get("whisper_qc_enabled") is expected_whisper_enabled,
             f"{engine_id} Whisper QC default mismatch",
@@ -1715,6 +1857,29 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(defaults["coqui_xtts"].get("whisper_qc_retry_attempts") == 4, "coqui XTTS Whisper QC retry default mismatch")
     _assert(defaults["coqui_xtts"].get("whisper_qc_model") == "small", "coqui XTTS Whisper QC model default mismatch")
     _assert(defaults["coqui_xtts"].get("whisper_qc_min_similarity") == 0.93, "coqui XTTS Whisper QC similarity default mismatch")
+    supertonic_fields = {field.key: field for field in fields_for("supertonic")}
+    supertonic_visible_keys = {field.key for field in visible_fields_for("supertonic")}
+    _assert(defaults["supertonic"].get("voice") == "M5", "Supertonic default voice mismatch")
+    _assert(defaults["supertonic"].get("speed") == 1.05, "Supertonic default speed mismatch")
+    _assert(defaults["supertonic"].get("total_steps") == 12, "Supertonic default total steps mismatch")
+    _assert(defaults["supertonic"].get("max_chunk_length") == 360, "Supertonic default chunk length mismatch")
+    _assert(defaults["supertonic"].get("supertonic_trim_edges") is True, "Supertonic silence edge trim should be enabled by default")
+    _assert(defaults["supertonic"].get("open_workspace_on_finish") is False, "Supertonic should not open workspace by default")
+    _assert(defaults["supertonic"].get("save_quality_report") is False, "Supertonic quality report should be disabled by default")
+    _assert(defaults["supertonic"].get("save_run_reports") is False, "Supertonic run reports should be disabled by default")
+    _assert(supertonic_fields["voice"].field_type == "choice", "Supertonic voice should be a dropdown")
+    _assert("M1" in supertonic_fields["voice"].options and "F5" in supertonic_fields["voice"].options, "Supertonic voice options mismatch")
+    _assert(supertonic_fields["speed"].minimum == 0.5 and supertonic_fields["speed"].maximum == 2.0, "Supertonic speed range mismatch")
+    _assert(supertonic_fields["total_steps"].minimum == 2 and supertonic_fields["total_steps"].maximum == 12, "Supertonic steps range mismatch")
+    _assert(supertonic_fields["max_chunk_length"].label == "Dlugosc fragmentu tekstu", "Supertonic chunk length label should mention text")
+    _assert("supertonic_trim_edges" in supertonic_visible_keys, "Supertonic silence edge trim should be visible")
+    _assert(supertonic_fields["supertonic_trim_edges"].label == "Wycinanie ciszy", "Supertonic trim label should be user friendly")
+    _assert("silence_duration" not in supertonic_visible_keys, "Supertonic silence duration should stay hidden")
+    _assert(defaults["supertonic"].get("whisper_qc_enabled") is True, "Supertonic Whisper QC should be enabled by default")
+    _assert(defaults["supertonic"].get("whisper_qc_retry_attempts") == 5, "Supertonic Whisper QC retry default mismatch")
+    _assert(defaults["supertonic"].get("whisper_qc_model") == "small", "Supertonic Whisper QC model default mismatch")
+    _assert(defaults["supertonic"].get("whisper_qc_device") == "cpu", "Supertonic Whisper QC device default mismatch")
+    _assert(defaults["supertonic"].get("whisper_qc_min_similarity") == 0.95, "Supertonic Whisper QC similarity default mismatch")
     messages.append("config validation: OK")
 
     for engine_id in ("edge", "openai"):
@@ -1727,7 +1892,7 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(not any(option.endswith(".en") or option.startswith("distil-") for option in whisper_field.options), f"{engine_id} Whisper QC should only list multilingual Polish-capable models")
         _assert(whisper_field.label == "Model", f"{engine_id} Whisper QC model label should be concise")
         _assert(whisper_field.tooltip == "Do wyboru rozne modele dla kontroli mowy.", f"{engine_id} Whisper QC tooltip should be concise")
-    for engine_id in ("chatterbox", "omnivoice", "piper", "coqui_xtts"):
+    for engine_id in ("chatterbox", "omnivoice", "piper", "coqui_xtts", "supertonic"):
         field_keys = {field.key for field in fields_for(engine_id)}
         _assert("whisper_qc_enabled" in field_keys, f"{engine_id} missing Whisper QC toggle")
         _assert("whisper_qc_model" in field_keys, f"{engine_id} missing Whisper QC model")
@@ -1777,6 +1942,8 @@ def run_self_test(app_dir: Path) -> list[str]:
     piper_whisper_summary = _quality_controls_summary("piper", {"whisper_qc_enabled": True, "whisper_qc_retry_attempts": "4"}, ffmpeg_present=True)
     _assert(_quality_chain_label(piper_whisper_summary) == "TTS -> Whisper QC x4 -> final", "piper punctuation Whisper QC chain label mismatch")
     _assert(piper_whisper_summary["whisper_qc_retry_attempts"] == 4, "piper punctuation Whisper QC should advertise retry attempts")
+    supertonic_whisper_summary = _quality_controls_summary("supertonic", {"whisper_qc_enabled": True, "whisper_qc_retry_attempts": "5"}, ffmpeg_present=True)
+    _assert(_quality_chain_label(supertonic_whisper_summary) == "TTS -> Whisper QC x5 -> final", "Supertonic Whisper QC chain label mismatch")
     coqui_summary = _quality_controls_summary("coqui_xtts", {"whisper_qc_enabled": True, "whisper_qc_retry_attempts": "3"}, ffmpeg_present=True)
     _assert(_quality_chain_label(coqui_summary) == "TTS -> Wycinanie koncowej ciszy -> Whisper QC x3 -> final", "coqui XTTS quality chain label mismatch")
     raw_coqui_summary = _quality_controls_summary("coqui_xtts", {"xtts_trim_trailing_silence": False, "whisper_qc_enabled": False}, ffmpeg_present=True)
@@ -1842,6 +2009,8 @@ def run_self_test(app_dir: Path) -> list[str]:
     worker_template = _load_module(app_dir / "app" / "engines" / "worker_templates" / "local_tts_worker.py", "_lektorai_worker_template_self_test")
     piper_retry_variants = worker_template.retry_text_variants("piper", "Test?", 5)
     _assert(piper_retry_variants == ["Test?", "Test.", "Test,", "Test!", "Test?"], f"Piper retry variants should match Edge punctuation strategy: {piper_retry_variants}")
+    supertonic_retry_variants = worker_template.retry_text_variants("supertonic", "Test?", 5)
+    _assert(supertonic_retry_variants == ["Test?", "Test.", "Test,", "Test!", "Test?"], f"Supertonic retry variants should match Edge punctuation strategy: {supertonic_retry_variants}")
     messages.append("Whisper QC scoring: OK")
 
     srt_path = app_dir / "_self_test_sample.srt"
@@ -2452,6 +2621,11 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert("tts_models/multilingual/multi-dataset/xtts_v2" in worker_template_text, "worker template should use XTTS-v2 model")
         _assert("COQUI_TOS_AGREED" in worker_template_text, "worker template should accept Coqui XTTS TOS non-interactively")
         _assert("trim_xtts_trailing_silence_np" in worker_template_text, "worker template should trim Coqui XTTS trailing silence")
+        _assert("synthesize_supertonic" in worker_template_text, "worker template should support Supertonic")
+        _assert("supertonic-3" in worker_template_text, "worker template should use Supertonic 3 model")
+        _assert('"lang": "pl"' in worker_template_text, "worker template should hardcode Polish Supertonic language")
+        _assert("supertonic_trim_edges" in worker_template_text, "worker template should support Supertonic silence edge trimming")
+        _assert("trim_supertonic_silence_edges_np" in worker_template_text, "worker template should trim Supertonic silence on both edges")
         _assert("synthesize_f5_tts" not in worker_template_text, "archived F5-TTS should not be active in worker template")
         _assert('language="pl"' in worker_template_text, "worker template should hardcode Polish where model API supports it")
         _assert("pobieranie/ladowanie" not in worker_template_text, "worker template should not use ambiguous model activity logs")
@@ -2577,6 +2751,7 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(engine_short_code("omnivoice") == "OMV", "omnivoice short code mismatch")
     _assert(engine_short_code("coqui_xtts") == "XTTS", "coqui short code mismatch")
     _assert(engine_short_code("piper") == "PIP", "piper short code mismatch")
+    _assert(engine_short_code("supertonic") == "SPT", "Supertonic short code mismatch")
     _assert(engine_short_code("edge") == "EDG", "edge short code mismatch")
     _assert(engine_short_code("openai") == "OAI", "openai short code mismatch")
     stem = next_output_stem(workspace, source_path, "edge", created_at=run_time)
@@ -2948,6 +3123,7 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(default_stt.whisperx_device == "cpu", "default WhisperX device should be CPU")
         _assert(default_stt.whisperx_compute_type == "int8", "default WhisperX compute type should be int8")
         _assert(default_stt.postprocess_enabled is True, "default STT postprocessing should be enabled")
+        _assert(default_stt.open_workspace_on_finish is False, "default STT open workspace should be disabled")
         _assert(default_stt.save_prepared_audio is False, "default STT prepared audio diagnostic should be disabled")
         _assert(default_stt.save_report is False, "default STT report diagnostic should be disabled")
         _assert(default_stt.save_log is False, "default STT log diagnostic should be disabled")
@@ -2959,6 +3135,7 @@ def run_self_test(app_dir: Path) -> list[str]:
         config_store.set_stt_vad_enabled(False)
         config_store.set_stt_vad_sensitivity("strong")
         config_store.set_stt_postprocess_enabled(False)
+        config_store.set_stt_open_workspace_on_finish(True)
         config_store.set_stt_save_prepared_audio(True)
         config_store.set_stt_save_report(True)
         config_store.set_stt_save_log(True)
@@ -2971,6 +3148,7 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(stt_settings.vad_enabled is False, "STT VAD enabled setter mismatch")
         _assert(stt_settings.vad_sensitivity == "strong", "STT VAD sensitivity setter mismatch")
         _assert(stt_settings.postprocess_enabled is False, "STT postprocessing setter mismatch")
+        _assert(stt_settings.open_workspace_on_finish is True, "STT open workspace setter mismatch")
         _assert(stt_settings.save_prepared_audio is True, "STT prepared audio diagnostic setter mismatch")
         _assert(stt_settings.save_report is True, "STT report diagnostic setter mismatch")
         _assert(stt_settings.save_log is True, "STT log diagnostic setter mismatch")
@@ -2986,9 +3164,11 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(whisperx_defaults.model == "small", "WhisperX should keep an independent model setting")
         _assert(whisperx_defaults.whisperx_device == "cpu", "WhisperX should default to CPU independently")
         _assert(whisperx_defaults.postprocess_enabled is True, "WhisperX postprocessing should default to enabled")
+        _assert(whisperx_defaults.open_workspace_on_finish is False, "WhisperX open workspace should default to disabled")
         _assert(whisperx_defaults.save_report is False, "WhisperX diagnostics should default to disabled")
         config_store.set_stt_model("medium")
         config_store.set_stt_postprocess_enabled(False)
+        config_store.set_stt_open_workspace_on_finish(True)
         config_store.set_stt_save_report(True)
         config_store.set_stt_whisperx_device("cuda:1")
         config_store.set_stt_engine("faster_whisper")
@@ -2996,14 +3176,40 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(faster_again.model == "large-v3", "faster-whisper model should not be changed by WhisperX")
         _assert(faster_again.device == "cpu", "faster-whisper device should stay independent from WhisperX")
         _assert(faster_again.postprocess_enabled is False, "faster-whisper postprocessing should stay independent from WhisperX")
+        _assert(faster_again.open_workspace_on_finish is True, "faster-whisper open workspace should stay independent from WhisperX")
         _assert(faster_again.save_report is True, "faster-whisper diagnostics should stay independent from WhisperX")
+        config_store.reset_stt_engine_defaults("faster_whisper")
+        faster_reset = config_store.stt_settings()
+        _assert(faster_reset.model == "small", "faster-whisper reset should restore model")
+        _assert(faster_reset.postprocess_enabled is True, "faster-whisper reset should restore postprocessing")
+        _assert(faster_reset.open_workspace_on_finish is False, "faster-whisper reset should restore open workspace")
+        _assert(faster_reset.save_report is False, "faster-whisper reset should restore diagnostics")
+        config_store.set_stt_engine("whisperx")
+        config_store.set_stt_model("medium")
+        config_store.set_stt_whisperx_device("cuda:1")
+        config_store.reset_stt_engine_defaults("whisperx")
+        whisperx_reset = config_store.stt_settings()
+        _assert(whisperx_reset.model == "small", "WhisperX reset should restore model")
+        _assert(whisperx_reset.whisperx_device == "cpu", "WhisperX reset should restore device")
+        _assert(whisperx_reset.whisperx_compute_type == "int8", "WhisperX reset should restore compute type")
+        _assert(whisperx_reset.open_workspace_on_finish is False, "WhisperX reset should restore open workspace")
         config_store.set_stt_engine("whisper_cpp")
         whisper_cpp_defaults = config_store.stt_settings()
         _assert(whisper_cpp_defaults.model == "small", "whisper.cpp should keep an independent model setting")
         _assert(whisper_cpp_defaults.whisper_cpp_runtime == "cpu", "whisper.cpp should default to CPU runtime")
         _assert(whisper_cpp_defaults.whisper_cpp_device == "auto", "whisper.cpp CUDA device should default to auto")
         _assert(whisper_cpp_defaults.postprocess_enabled is True, "whisper.cpp postprocessing should default to enabled")
+        _assert(whisper_cpp_defaults.open_workspace_on_finish is False, "whisper.cpp open workspace should default to disabled")
         _assert(whisper_cpp_defaults.save_report is False, "whisper.cpp diagnostics should default to disabled")
+        config_store.set_stt_model("large-v3")
+        config_store.set_stt_whisper_cpp_runtime("cuda")
+        config_store.set_stt_whisper_cpp_threads(12)
+        config_store.reset_stt_engine_defaults("whisper_cpp")
+        whisper_cpp_reset = config_store.stt_settings()
+        _assert(whisper_cpp_reset.model == "small", "whisper.cpp reset should restore model")
+        _assert(whisper_cpp_reset.whisper_cpp_runtime == "cpu", "whisper.cpp reset should restore runtime")
+        _assert(whisper_cpp_reset.whisper_cpp_threads == 0, "whisper.cpp reset should restore threads")
+        _assert(whisper_cpp_reset.open_workspace_on_finish is False, "whisper.cpp reset should restore open workspace")
         config_store.set_stt_accuracy("bad")
         config_store.set_stt_vad_sensitivity("bad")
         _assert(config_store.stt_settings().accuracy == "standard", "STT should sanitize unknown accuracy")
@@ -3183,13 +3389,16 @@ def run_self_test(app_dir: Path) -> list[str]:
     try:
         video_path = stt_output_probe_dir / "Film testowy.mkv"
         audio_path = stt_output_probe_dir / "Glos.wav"
+        dts_path = stt_output_probe_dir / "Glos.dts"
         subtitle_path = stt_output_probe_dir / "Napisy.srt"
         stt_output_probe_dir.mkdir(parents=True, exist_ok=True)
         video_path.write_text("", encoding="utf-8")
         audio_path.write_text("", encoding="utf-8")
+        dts_path.write_text("", encoding="utf-8")
         subtitle_path.write_text("", encoding="utf-8")
         _assert(is_stt_input_file(video_path), "STT should accept video input")
         _assert(is_stt_input_file(audio_path), "STT should accept audio input")
+        _assert(is_stt_input_file(dts_path), "STT should accept DTS audio input")
         _assert(not is_stt_input_file(subtitle_path), "STT should not accept subtitle input")
         first_stem = next_stt_output_stem(stt_output_probe_dir, video_path)
         _assert(first_stem.endswith("_Film_testowy_STT_FW"), "STT output stem should include source and engine")
@@ -3228,6 +3437,19 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(set(WHISPER_CPP_RUNTIME_PACKAGES) == {"cpu", "cuda"}, "whisper.cpp runtime variants mismatch")
     _assert(sanitize_whisper_cpp_runtime("CUDA") == "cuda", "whisper.cpp runtime sanitize mismatch")
     _assert(sanitize_whisper_cpp_device("cuda:1") == "cuda:1", "whisper.cpp device sanitize mismatch")
+    cpp_cuda_probe_dir = app_dir / "_self_test_cpp_cuda_runtime"
+    cpp_cuda_paths = build_paths(cpp_cuda_probe_dir)
+    try:
+        cuda13_dir = cuda_runtime_dll_dir(cpp_cuda_paths, CUDA_RUNTIME_WHISPER_CPP_ID)
+        cuda13_dir.mkdir(parents=True)
+        for dll_name in ("cublas64_13.dll", "cublasLt64_13.dll", "cudart64_13.dll"):
+            (cuda13_dir / dll_name).write_text("", encoding="utf-8")
+        cpp_cuda_env = whisper_cpp_runtime_env(cpp_cuda_paths, "cuda")
+        _assert(str(cuda13_dir) in cpp_cuda_env.get("PATH", "").split(os.pathsep), "whisper.cpp CUDA env should include CUDA 13 runtime dir")
+        cpp_cpu_env = whisper_cpp_runtime_env(cpp_cuda_paths, "cpu", base_env={"PATH": "base"})
+        _assert(cpp_cpu_env.get("PATH") == "base", "whisper.cpp CPU env should not add CUDA runtime dir")
+    finally:
+        _cleanup_tree(cpp_cuda_probe_dir)
     cpp_command = build_whisper_cpp_command(
         exe_path=Path("whisper-cli.exe"),
         model_path=Path("models") / "ggml-small.bin",
@@ -3262,6 +3484,19 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(normalize_whisperx_compute_type("float16", "cpu") == "int8", "WhisperX CPU should avoid float16")
     _assert(normalize_whisperx_compute_type("float16", "cuda") == "float16", "WhisperX CUDA should keep float16")
     _assert(normalize_whisperx_model_name("turbo") == "large-v3-turbo", "WhisperX turbo alias mismatch")
+    whisperx_cuda_probe_dir = app_dir / "_self_test_whisperx_cuda_runtime"
+    whisperx_cuda_paths = build_paths(whisperx_cuda_probe_dir)
+    try:
+        whisperx_cuda12_dir = cuda_runtime_dll_dir(whisperx_cuda_paths, CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID)
+        whisperx_cuda12_dir.mkdir(parents=True)
+        for dll_name in CUDA_RUNTIME_PACKAGES[CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID].required_dlls:
+            (whisperx_cuda12_dir / dll_name).write_text("", encoding="utf-8")
+        whisperx_gpu_env = whisperx_runtime_env(whisperx_cuda_paths, "cuda:1", {"PATH": "BASE"})
+        _assert(str(whisperx_cuda12_dir) in whisperx_gpu_env.get("PATH", "").split(os.pathsep), "WhisperX GPU env should include shared CUDA 12 runtime dir")
+        whisperx_cpu_env = whisperx_runtime_env(whisperx_cuda_paths, "cpu", {"PATH": "BASE"})
+        _assert(str(whisperx_cuda12_dir) not in whisperx_cpu_env.get("PATH", "").split(os.pathsep), "WhisperX CPU env should not include CUDA runtime dir")
+    finally:
+        _cleanup_tree(whisperx_cuda_probe_dir)
     whisperx_command = build_whisperx_command(
         python_path=Path("python.exe"),
         input_wav=Path("audio.wav"),

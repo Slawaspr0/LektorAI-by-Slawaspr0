@@ -35,6 +35,7 @@ class EngineInstallSpec:
     allowed_pip_check_prefixes: tuple[str, ...] = ()
     import_checks: tuple[str, ...] = ()
     torch_index_url: str = TORCH_CU126_INDEX
+    package_installer: str = "pip"
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,14 @@ INSTALL_SPECS: dict[str, EngineInstallSpec] = {
         ),
         constraints=(),
         import_checks=("piper", "soundfile"),
+    ),
+    "supertonic": EngineInstallSpec(
+        engine_id="supertonic",
+        torch_requirements=(),
+        requirements=("supertonic",),
+        constraints=(),
+        import_checks=("supertonic",),
+        package_installer="uv",
     ),
     "coqui_xtts": EngineInstallSpec(
         engine_id="coqui_xtts",

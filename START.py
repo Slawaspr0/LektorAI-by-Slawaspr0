@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 APP_NAME = "LektorAI by Slawaspr0"
-APP_VERSION = "v1.3"
+APP_VERSION = "v1.4"
 APP_DIR = Path(__file__).resolve().parent
 APP_PACKAGES_DIR = APP_DIR / "packages"
 if APP_PACKAGES_DIR.is_dir() and str(APP_PACKAGES_DIR) not in sys.path:
@@ -169,7 +169,7 @@ def _usage() -> str:
         "  START.py --list-engines          lista silnikow TTS\n"
         "  START.py --engine-install-plan ID pokazuje plan instalacji lokalnego TTS\n"
         "  START.py --engine-install-plan ID --torch-cuda cu128 pokazuje plan dla wariantu PyTorch\n"
-        "  START.py --install-engine ID     instaluje lokalny TTS: chatterbox, omnivoice, piper, coqui_xtts\n"
+        "  START.py --install-engine ID     instaluje lokalny TTS: chatterbox, omnivoice, piper, coqui_xtts, supertonic\n"
         "  START.py --install-engine ID --torch-cuda cu128 instaluje wariant PyTorch dla nowszych kart\n"
         "  START.py --update-worker ID      aktualizuje worker.py lokalnego TTS\n"
         "  START.py --remove-engine ID      usuwa caly folder lokalnego TTS\n"

@@ -27,7 +27,7 @@ UPDATE_INFO_FALLBACK_URLS = (
 SOURCE_ZIP_URL = "https://github.com/Slawaspr0/LektorAI-by-Slawaspr0/archive/refs/heads/main.zip"
 LOCAL_UPDATE_FILE = "update.json"
 
-PROTECTED_ROOTS = {"engines", "stt", "cache", "logs", "temp", "packages", "__pycache__"}
+PROTECTED_ROOTS = {"engines", "stt", "runtime", "cache", "logs", "temp", "packages", "__pycache__"}
 PROTECTED_FILES = {"config.json", "ffmpeg.exe", "ffprobe.exe", "mkvmerge.exe", "ffmpeg", "ffprobe", "mkvmerge"}
 
 

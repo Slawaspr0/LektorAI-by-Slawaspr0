@@ -33,6 +33,19 @@ EDGE_POLISH_VOICE_LABELS: tuple[str, ...] = ("Marek", "Zofia")
 PIPER_POLISH_VOICES: tuple[str, ...] = ("pl_PL-gosia-medium", "pl_PL-darkman-medium", "pl_PL-mc_speech-medium")
 PIPER_POLISH_VOICE_LABELS: tuple[str, ...] = ("Gosia", "Darkman", "McSpeech")
 COQUI_BUILTIN_SPEAKERS: tuple[str, ...] = ("Anna", "Craig Gutsy", "Ana Florence")
+SUPERTONIC_VOICES: tuple[str, ...] = ("M1", "M2", "M3", "M4", "M5", "F1", "F2", "F3", "F4", "F5")
+SUPERTONIC_VOICE_LABELS: tuple[str, ...] = (
+    "M1",
+    "M2",
+    "M3",
+    "M4",
+    "M5",
+    "F1",
+    "F2",
+    "F3",
+    "F4",
+    "F5",
+)
 EDGE_RATE_MIN = -100
 EDGE_RATE_MAX = 100
 EDGE_PITCH_MIN = -50
@@ -123,6 +136,13 @@ DIAGNOSTIC_OUTPUT_FIELDS: tuple[ConfigField, ...] = (
     ConfigField("save_audio_mix_steps", "Etapy miksowania audio", "bool", "Zachowuje posrednie pliki audio powstajace podczas laczenia lektora z tlem."),
 )
 
+OPEN_WORKSPACE_FIELD = ConfigField(
+    "open_workspace_on_finish",
+    "Otworz folder po pracy",
+    "bool",
+    "Po zakonczeniu otwiera folder roboczy LektorAI z wynikiem.",
+)
+
 
 CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
     "edge": (
@@ -132,6 +152,7 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
         ConfigField("edge_apply_segment_fade", "Przytnij i wygladz brzegi", "bool", "Po wlaczeniu przycina poczatek i koniec pliku lektora o podane przez uzytkownika wartosci."),
         ConfigField("edge_trim_start_ms", "Utnij poczatek (ms)", "int", "Ile milisekund uciac z poczatku pliku lektora.", 0, 1000, 1),
         ConfigField("edge_trim_end_ms", "Utnij koniec (ms)", "int", "Ile milisekund uciac z konca pliku lektora.", 0, 2000, 1),
+        OPEN_WORKSPACE_FIELD,
         *DIAGNOSTIC_OUTPUT_FIELDS,
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
         ConfigField("whisper_qc_retry_attempts", "Liczba prob", "int", WHISPER_QC_RETRY_TOOLTIP, 1, 5, 1),
@@ -147,6 +168,7 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
         ConfigField("instructions", "Instrukcja glosu", "str", "Instrukcja stylu mowy dla modelu TTS, np. spokojny polski lektor."),
         ConfigField("audio_qc_enabled", "Wlacz kontrole audio", "bool", "Wlacza techniczna kontrole pliku audio: cisza, dlugosc segmentu, glosny poczatek lub koniec, clipping i podobne artefakty."),
         ConfigField("audio_qc_retry_attempts", "Liczba prob kontroli audio", "int", "Maksymalna liczba prob generowania segmentu, jesli kontrola audio wykryje podejrzany wynik.", 1, 5, 1),
+        OPEN_WORKSPACE_FIELD,
         *DIAGNOSTIC_OUTPUT_FIELDS,
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
         ConfigField("whisper_qc_retry_attempts", "Liczba prob", "int", WHISPER_QC_RETRY_TOOLTIP, 1, 5, 1),
@@ -191,6 +213,7 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
             0.05,
         ),
         ConfigField("seed", "Seed", "int", "Opcjonalne ziarno losowosci. Stala wartosc pomaga powtarzalnosci, puste pole zostawia domyslne zachowanie.", 0, 2147483647, 1, visible=False),
+        OPEN_WORKSPACE_FIELD,
         *DIAGNOSTIC_OUTPUT_FIELDS,
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
         ConfigField("whisper_qc_retry_attempts", "Liczba prob", "int", WHISPER_QC_RETRY_TOOLTIP, 1, 5, 1),
@@ -234,6 +257,7 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
         ConfigField("preprocess_prompt", "Przygotuj probke", "bool", "Ukryte ustawienie techniczne. W LektorAI domyslnie wylaczone, bo uzytkownik ma dostarczyc gotowa, dobra probke glosu.", visible=False),
         ConfigField("postprocess_output", "Wyczysc wynik", "bool", "Ukryte ustawienie techniczne. W LektorAI domyslnie wylaczone, bo fabryczne usuwanie ciszy OmniVoice potrafi ucinac koncowki slow.", visible=False),
         ConfigField("omnivoice_trim_edges", "Wycinanie ciszy na brzegach", "bool", "Po wlaczeniu program ostroznie wykrywa poczatek i koniec mowy, usuwa nadmiar ciszy/szumu tylko z brzegow segmentu i zostawia zapas, zeby nie uciac lektora."),
+        OPEN_WORKSPACE_FIELD,
         *DIAGNOSTIC_OUTPUT_FIELDS,
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
         ConfigField("whisper_qc_retry_attempts", "Liczba prob", "int", WHISPER_QC_RETRY_TOOLTIP, 1, 5, 1),
@@ -272,6 +296,52 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
             0.01,
         ),
         ConfigField("speaker_id", "Speaker ID", "int", "Ukryte ustawienie techniczne dla modeli wielomowcowych. Polskie glosy Piper sa jednomowcowe, wiec zostaje 0.", 0, 999, 1, visible=False),
+        OPEN_WORKSPACE_FIELD,
+        *DIAGNOSTIC_OUTPUT_FIELDS,
+        ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
+        ConfigField("whisper_qc_retry_attempts", "Liczba prob", "int", WHISPER_QC_RETRY_TOOLTIP, 1, 5, 1),
+        ConfigField("whisper_qc_model", "Model", "choice", "Do wyboru rozne modele dla kontroli mowy.", options=WHISPER_QC_MODELS),
+        ConfigField("whisper_qc_device", "Urzadzenie", "choice", WHISPER_QC_DEVICE_TOOLTIP, options=WHISPER_QC_DEVICE_OPTIONS),
+        ConfigField("whisper_qc_compute_type", "Tryb pracy", "choice", WHISPER_QC_COMPUTE_TOOLTIP, options=WHISPER_QC_COMPUTE_TYPES, option_labels=WHISPER_QC_COMPUTE_TYPE_LABELS),
+        ConfigField("whisper_qc_min_similarity", "Zgodnosc tekstu", "float", "Minimalna zgodnosc lektora z tekstem. 0,62 to inaczej minimalna zgodnosc 62%.", 0.0, 1.0, 0.01),
+    ),
+    "supertonic": (
+        ConfigField("voice", "Glos lektora", "choice", "Glos wbudowany Supertonic. Model pobiera sie dopiero przy pierwszym uzyciu.", options=SUPERTONIC_VOICES, option_labels=SUPERTONIC_VOICE_LABELS),
+        ConfigField(
+            "speed",
+            "Predkosc",
+            "float",
+            "Zakres 0.5-2.0, domyslnie 1.05. Wyzsza wartosc przyspiesza mowe, nizsza spowalnia.",
+            0.5,
+            2.0,
+            0.01,
+        ),
+        ConfigField(
+            "total_steps",
+            "Kroki jakosci",
+            "int",
+            "Zakres 2-12, domyslnie 8. Wiecej krokow zwykle daje lepsza jakosc, ale trwa dluzej.",
+            2,
+            12,
+            1,
+        ),
+        ConfigField(
+            "max_chunk_length",
+            "Dlugosc fragmentu tekstu",
+            "int",
+            "Maksymalna dlugosc dluzszej kwestii przed podzialem na mniejsze fragmenty, podana w znakach tekstu.",
+            80,
+            500,
+            10,
+        ),
+        ConfigField("silence_duration", "Pauza miedzy fragmentami", "float", "Ukryte ustawienie przerw przy dluzszych kwestiach.", 0.0, 1.0, 0.05, visible=False),
+        ConfigField(
+            "supertonic_trim_edges",
+            "Wycinanie ciszy",
+            "bool",
+            "Po wlaczeniu program usuwa nadmiar ciszy z poczatku i konca segmentu Supertonic, zostawiajac krotki zapas przy mowie.",
+        ),
+        OPEN_WORKSPACE_FIELD,
         *DIAGNOSTIC_OUTPUT_FIELDS,
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
         ConfigField("whisper_qc_retry_attempts", "Liczba prob", "int", WHISPER_QC_RETRY_TOOLTIP, 1, 5, 1),
@@ -348,6 +418,7 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
             0.01,
         ),
         ConfigField("xtts_trim_trailing_silence", "Wycinanie koncowej ciszy", "bool", "Po wlaczeniu program usuwa dluga cisze z konca segmentu XTTS, zostawia okolo 120 ms zapasu i dodaje krotkie wygladzenie, zeby nie uciac lektora."),
+        OPEN_WORKSPACE_FIELD,
         *DIAGNOSTIC_OUTPUT_FIELDS,
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
         ConfigField("whisper_qc_retry_attempts", "Liczba prob", "int", WHISPER_QC_RETRY_TOOLTIP, 1, 5, 1),

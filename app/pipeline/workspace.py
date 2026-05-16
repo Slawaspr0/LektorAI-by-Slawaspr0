@@ -12,6 +12,7 @@ ENGINE_SHORT_CODES = {
     "omnivoice": "OMV",
     "coqui_xtts": "XTTS",
     "piper": "PIP",
+    "supertonic": "SPT",
     "edge": "EDG",
     "openai": "OAI",
 }

@@ -25,6 +25,17 @@ class AppPaths:
         return self.app_dir / "stt"
 
     @property
+    def cuda_runtime_root_dir(self) -> Path:
+        return self.app_dir / "runtime" / "cuda"
+
+    @property
+    def cuda_runtime_downloads_dir(self) -> Path:
+        return self.cuda_runtime_root_dir / "downloads"
+
+    def cuda_runtime_pack_dir(self, package_id: str) -> Path:
+        return self.cuda_runtime_root_dir / str(package_id or "").strip()
+
+    @property
     def temp_dir(self) -> Path:
         return self.app_dir / "temp"
 

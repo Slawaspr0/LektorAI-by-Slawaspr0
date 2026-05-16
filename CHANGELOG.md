@@ -2,6 +2,12 @@
 
 W tym pliku beda zapisywane publiczne zmiany miedzy kolejnymi wersjami LektorAI by Slawaspr0.
 
+## v1.4
+
+- Dodano nowy model TTS: Supertonic.
+- Dodano kolorowe akcenty w menu.
+- Stworzono paczki z bibliotekami CUDA dla STT na GPU.
+
 ## v1.3
 
 - Dodano silniki STT: faster-whisper, whisper.cpp oraz WhisperX.

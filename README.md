@@ -2,7 +2,7 @@
 
 ![LektorAI by Slawaspr0](lektorAI_screen.jpg)
 
-**Wersja: v1.3**
+**Wersja: v1.4**
 
 LektorAI by Slawaspr0 to aplikacja do tworzenia polskiej ścieżki lektorskiej dla filmów i seriali. Program korzysta z wybranego silnika TTS, generuje głos lektora na podstawie napisów, składa go w jedną ścieżkę audio, miksuje z oryginalnym tłem filmu i dodaje do wynikowego pliku MKV.
 
@@ -70,13 +70,13 @@ Po pobraniu modeli lokalne silniki mogą działać bez ponownego pobierania dany
 
 Lokalne modele TTS i STT mogą korzystać z karty NVIDIA i CUDA. Program ma opcję wyboru urządzenia, np. `auto`, `cpu`, `cuda`, `cuda:0`, `cuda:1`.
 
-Silniki STT uruchamiane na CPU nie wymagają CUDA Toolkit. CUDA Toolkit jest potrzebny wtedy, gdy użytkownik chce uruchamiać STT na GPU.
+Silniki STT uruchamiane na CPU nie wymagają CUDA. Przy użyciu GPU program pobiera potrzebne biblioteki CUDA dla obsługiwanych modułów.
 
 W praktyce:
 
-- `whisper.cpp` wymaga CUDA Toolkit tylko przy użyciu wariantu CUDA,
-- `WhisperX` wymaga CUDA Toolkit przy użyciu GPU; przy CPU można go pominąć,
-- `faster-whisper` na CPU nie wymaga CUDA; przy użyciu GPU wymaga karty NVIDIA, aktualnego sterownika NVIDIA oraz CUDA Toolkit.
+- `faster-whisper`, Whisper QC i `WhisperX` korzystają ze wspólnej paczki CUDA Runtime pobieranej przez aplikację,
+- `whisper.cpp` w wariancie CUDA korzysta z osobnej paczki CUDA Runtime pobieranej przez aplikację,
+- do pracy na GPU nadal potrzebna jest karta NVIDIA i aktualny sterownik NVIDIA.
 
 ## Uruchomienie
 
@@ -99,7 +99,8 @@ Aktualne silniki TTS:
 - Chatterbox,
 - OmniVoice,
 - Piper TTS,
-- Coqui XTTS-v2.
+- Coqui XTTS-v2,
+- Supertonic.
 
 Aktualne silniki STT:
 
@@ -399,6 +400,7 @@ Szczególne podziękowania:
 - projektowi [OmniVoice TTS](https://github.com/k2-fsa/OmniVoice) za silnik TTS wykorzystywany w lokalnym generowaniu głosu,
 - projektowi [Piper TTS](https://github.com/OHF-Voice/piper1-gpl) za szybki lokalny silnik TTS,
 - projektowi [Coqui XTTS-v2 / Coqui AI TTS](https://github.com/idiap/coqui-ai-TTS) za lokalny silnik TTS z obsługą klonowania głosu,
+- projektowi [Supertonic](https://github.com/supertone-inc/supertonic) za lokalny silnik TTS,
 - projektowi [faster-whisper](https://github.com/SYSTRAN/faster-whisper) za silnik STT,
 - projektowi [whisper.cpp](https://github.com/ggml-org/whisper.cpp) za lokalny silnik STT,
 - projektowi [WhisperX](https://github.com/m-bain/whisperX) za silnik STT z dokładniejszym wyrównywaniem timestampów.

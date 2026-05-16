@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import os
 from pathlib import Path
 from typing import Callable
 
 from app.core.paths import AppPaths
+from app.stt.cuda_runtime import CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID, cuda_runtime_env, cuda_runtime_ready, ensure_cuda_runtime
 
 
 PYTORCH_CU128_INDEX = "https://download.pytorch.org/whl/cu128"
@@ -149,6 +151,27 @@ def whisperx_device_args(device: str) -> tuple[str, int]:
     if normalized.startswith("cuda:") and normalized.split(":", 1)[1].isdigit():
         return "cuda", int(normalized.split(":", 1)[1])
     return "cpu", 0
+
+
+def whisperx_device_needs_cuda(device: str) -> bool:
+    device_type, _ = whisperx_device_args(device)
+    return device_type == "cuda"
+
+
+def ensure_whisperx_gpu_runtime(paths: AppPaths, progress: Callable[[str], None] | None = None) -> None:
+    if cuda_runtime_ready(paths, CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID):
+        return
+    ensure_cuda_runtime(paths, CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID, progress=progress)
+    if not cuda_runtime_ready(paths, CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID):
+        raise RuntimeError("WhisperX GPU: nie znaleziono wymaganych bibliotek CUDA. Ustaw WhisperX na CPU albo sprobuj ponownie.")
+    _emit(progress, "WhisperX: biblioteki GPU gotowe")
+
+
+def whisperx_runtime_env(paths: AppPaths, device: str, base_env: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ if base_env is None else base_env)
+    if not whisperx_device_needs_cuda(device):
+        return env
+    return cuda_runtime_env(paths, CUDA_RUNTIME_CTRANSLATE2_PYTORCH_ID, env)
 
 
 def normalize_whisperx_compute_type(compute_type: str, device_type: str = "cpu") -> str:

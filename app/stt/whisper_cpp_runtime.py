@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 import zipfile
@@ -10,6 +11,7 @@ from typing import Callable
 
 from app.core.download import download_file_with_progress
 from app.core.paths import AppPaths
+from app.stt.cuda_runtime import CUDA_RUNTIME_WHISPER_CPP_ID, cuda_runtime_env, ensure_cuda_runtime
 
 
 WHISPER_CPP_RELEASE_TAG = "whispercpp-windows-x64-v1"
@@ -106,6 +108,13 @@ def ensure_whisper_cpp_runtime(
     if whisper_cpp_runtime_ready(paths, variant):
         executable = find_whisper_cpp_executable(paths)
         if executable is not None:
+            if variant == "cuda":
+                ensure_cuda_runtime(
+                    paths,
+                    CUDA_RUNTIME_WHISPER_CPP_ID,
+                    progress=progress,
+                    cancel_requested=cancel_requested,
+                )
             return executable
     package = WHISPER_CPP_RUNTIME_PACKAGES[variant]
     _emit(progress, f"whisper.cpp: przygotowanie runtime {package.label}")
@@ -116,8 +125,22 @@ def ensure_whisper_cpp_runtime(
     executable = find_whisper_cpp_executable(paths)
     if executable is None:
         raise RuntimeError("Nie udalo sie przygotowac whisper.cpp runtime.")
+    if variant == "cuda":
+        ensure_cuda_runtime(
+            paths,
+            CUDA_RUNTIME_WHISPER_CPP_ID,
+            progress=progress,
+            cancel_requested=cancel_requested,
+        )
     _emit(progress, f"whisper.cpp: runtime {package.label} gotowy")
     return executable
+
+
+def whisper_cpp_runtime_env(paths: AppPaths, variant: str, base_env: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ if base_env is None else base_env)
+    if sanitize_whisper_cpp_runtime(variant) != "cuda":
+        return env
+    return cuda_runtime_env(paths, CUDA_RUNTIME_WHISPER_CPP_ID, env)
 
 
 def whisper_cpp_runtime_ready(paths: AppPaths, variant: str = "cpu") -> bool:

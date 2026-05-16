@@ -33,6 +33,7 @@ from app.core.media_tools import (
     probe_media_duration,
     prepare_voice_sample,
     sanitize_lektor_delay_ms,
+    surround_label_for_channels,
     supported_voice_sample_extensions,
     trim_fixed_and_fade_wav_edges,
     voice_sample_sample_rate,
@@ -86,8 +87,8 @@ SIDECAR_SUFFIXES = (
     ".pl.forced",
 )
 
-DETERMINISTIC_RETRY_ENGINES = {"piper"}
-PUNCTUATION_RETRY_ENGINES = {"piper"}
+DETERMINISTIC_RETRY_ENGINES = {"piper", "supertonic"}
+PUNCTUATION_RETRY_ENGINES = {"piper", "supertonic"}
 
 EDGE_TRIM_FADE_MS = 12
 
@@ -425,9 +426,10 @@ def _run_tts_job_prepared(
         output_video_path = workspace / f"{output_stem}.mkv"
         audio_streams = source_audio_streams or probe_audio_streams(ffprobe, source_path)
         channel_count = primary_audio_channels(audio_streams)
-        create_surround_track = channel_count >= 6
+        surround_label = surround_label_for_channels(channel_count)
+        create_surround_track = bool(surround_label)
         create_stereo_track = (not create_surround_track) or bool(create_stereo_for_surround)
-        output_track_label = _audio_output_track_label(create_surround_track, create_stereo_track)
+        output_track_label = _audio_output_track_label(surround_label, create_stereo_track)
         primary_audio = audio_stream_summary(audio_streams[0] if audio_streams else None)
         progress(
             f"Miks audio: tlo {primary_audio} + lektor mono -> "
@@ -460,9 +462,9 @@ def _run_tts_job_prepared(
         )
         _emit_file_progress(progress, "mux", 1.0, "Dodawanie do MKV")
         output_audio_streams = probe_audio_streams(ffprobe, output_video_path)
-        progress(_format_output_audio_message(output_audio_streams, create_surround_track, create_stereo_track))
+        progress(_format_output_audio_message(output_audio_streams, surround_label, create_stereo_track))
         progress(f"Wideo wynikowe: {output_video_path.name}")
-        audio_mix_stage_files = _expected_audio_mix_stage_files(output_video_path, lektor_dir, create_surround_track, create_stereo_track)
+        audio_mix_stage_files = _expected_audio_mix_stage_files(output_video_path, lektor_dir, surround_label, create_stereo_track)
         if not diagnostics["save_audio_mix_steps"]:
             _unlink_if_file(lektor_m4a_path)
             lektor_m4a_path = None
@@ -562,6 +564,7 @@ def _run_tts_job_prepared(
                 "audio_tlo_zrodlowe": rel_path_if_exists(audio_mix_stage_files.get("source_audio"), workspace),
                 "audio_pl_2_0": rel_path_if_exists(audio_mix_stage_files.get("pl_2_0"), workspace),
                 "audio_pl_5_1": rel_path_if_exists(audio_mix_stage_files.get("pl_5_1"), workspace),
+                "audio_pl_7_1": rel_path_if_exists(audio_mix_stage_files.get("pl_7_1"), workspace),
                 "output_video": rel_path(output_video_path, workspace),
             },
         },
@@ -930,7 +933,7 @@ def _is_relative_to(path: Path, base: Path) -> bool:
 def _expected_audio_mix_stage_files(
     output_video_path: Path,
     lektor_dir: Path,
-    create_surround_track: bool,
+    surround_label: str,
     create_stereo_track: bool,
 ) -> dict[str, Path]:
     prefix = output_video_path.stem
@@ -939,8 +942,8 @@ def _expected_audio_mix_stage_files(
     }
     if create_stereo_track:
         result["pl_2_0"] = lektor_dir / f"{prefix}_pl_2_0.m4a"
-    if create_surround_track:
-        result["pl_5_1"] = lektor_dir / f"{prefix}_pl_5_1.m4a"
+    if surround_label:
+        result[f"pl_{surround_label.replace('.', '_')}"] = lektor_dir / f"{prefix}_pl_{surround_label.replace('.', '_')}.m4a"
     return result
 
 
@@ -2126,7 +2129,7 @@ def _ensure_whisper_qc_runtime_if_enabled(
     if not _bool_config(config.get("whisper_qc_enabled"), False):
         return
     _raise_if_cancelled(cancel_requested)
-    ensure_faster_whisper_runtime(paths, progress)
+    ensure_faster_whisper_runtime(paths, progress, device=str(config.get("whisper_qc_device", "cpu") or "cpu"))
     _raise_if_cancelled(cancel_requested)
     _ensure_common_whisper_cache(paths)
 
@@ -2261,21 +2264,21 @@ def _format_peak_dbfs(value: float) -> str:
     return f"{value:.1f} dBFS"
 
 
-def _audio_output_track_label(create_surround_track: bool, create_stereo_track: bool) -> str:
+def _audio_output_track_label(surround_label: str, create_stereo_track: bool) -> str:
     labels = []
     if create_stereo_track:
         labels.append("PL 2.0")
-    if create_surround_track:
-        labels.append("PL 5.1")
+    if surround_label:
+        labels.append(f"PL {surround_label}")
     return " + ".join(labels) if labels else "PL audio"
 
 
-def _format_output_audio_message(audio_streams: list[dict], create_surround_track: bool, create_stereo_track: bool = True) -> str:
+def _format_output_audio_message(audio_streams: list[dict], surround_label: str, create_stereo_track: bool = True) -> str:
     expected_labels = []
     if create_stereo_track:
         expected_labels.append("PL 2.0")
-    if create_surround_track:
-        expected_labels.append("PL 5.1")
+    if surround_label:
+        expected_labels.append(f"PL {surround_label}")
     expected_count = max(1, len(expected_labels))
     created = audio_streams[:expected_count]
     labels = []

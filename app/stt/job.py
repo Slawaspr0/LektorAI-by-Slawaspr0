@@ -30,15 +30,18 @@ from app.stt.whisper_cpp_runtime import (
     ensure_whisper_cpp_model,
     sanitize_whisper_cpp_device,
     sanitize_whisper_cpp_runtime,
+    whisper_cpp_runtime_env,
 )
 from app.stt.whisperx_runtime import (
     WHISPERX_PROGRESS_RE_TEXT,
     build_whisperx_command,
+    ensure_whisperx_gpu_runtime,
     ensure_whisperx_runtime,
+    whisperx_runtime_env,
 )
 
 
-AUDIO_EXTENSIONS = (".aac", ".ac3", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wma")
+AUDIO_EXTENSIONS = (".aac", ".ac3", ".dts", ".dtshd", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wma")
 SUPPORTED_STT_INPUT_EXTENSIONS = (*VIDEO_EXTENSIONS, *AUDIO_EXTENSIONS)
 _STT_WHISPER_MODELS: dict[tuple[str, str, str, str], object] = {}
 STT_ACCURACY_BEAM_SIZE = {
@@ -141,6 +144,7 @@ class SttSettings:
     whisperx_device: str = "cpu"
     whisperx_compute_type: str = "int8"
     postprocess_enabled: bool = True
+    open_workspace_on_finish: bool = False
     save_prepared_audio: bool = False
     save_report: bool = False
     save_log: bool = False
@@ -238,8 +242,9 @@ def run_faster_whisper_stt(
         events.append(message)
         _emit(progress, message)
 
+    device = str(settings.device or "cpu").strip() or "cpu"
     emit("STT: przygotowanie modulu faster-whisper")
-    ensure_faster_whisper_runtime(paths, progress=progress)
+    ensure_faster_whisper_runtime(paths, progress=progress, device=device)
     _raise_if_cancelled(cancel_requested)
 
     emit("STT: przygotowanie audio")
@@ -247,7 +252,6 @@ def run_faster_whisper_stt(
     extract_audio_for_stt(ffmpeg, source_path, temp_wav, channels, cancel_requested=cancel_requested)
     _raise_if_cancelled(cancel_requested)
 
-    device = str(settings.device or "cpu").strip() or "cpu"
     compute_type = whisper_qc_effective_compute_type(device, settings.compute_type)
     emit("STT: ladowanie modelu")
     model = load_stt_whisper_model(
@@ -463,19 +467,20 @@ def run_whisper_cpp_stt(
             timeout=7200,
             cancel_requested=cancel_requested,
             output_callback=on_whisper_cpp_output,
+            env=whisper_cpp_runtime_env(paths, runtime_variant),
         )
     except OSError as exc:
         if runtime_variant == "cuda":
             raise RuntimeError(
                 "Nie udalo sie uruchomic whisper.cpp CUDA. "
-                "Sprawdz, czy masz zainstalowany NVIDIA CUDA Toolkit 13.x albo wybierz runtime CPU."
+                "Sprawdz runtime CUDA w aplikacji albo wybierz runtime CPU."
             ) from exc
         raise
     except RuntimeError as exc:
         if runtime_variant == "cuda" and _looks_like_missing_cuda_runtime(str(exc)):
             raise RuntimeError(
                 "Nie udalo sie uruchomic whisper.cpp CUDA. "
-                "Sprawdz, czy masz zainstalowany NVIDIA CUDA Toolkit 13.x albo wybierz runtime CPU."
+                "Sprawdz runtime CUDA w aplikacji albo wybierz runtime CPU."
             ) from exc
         raise
     if result.returncode == 0 and last_transcription_progress < 100:
@@ -485,7 +490,7 @@ def run_whisper_cpp_stt(
         if runtime_variant == "cuda" and _looks_like_missing_cuda_runtime(result.output):
             raise RuntimeError(
                 "Nie udalo sie uruchomic whisper.cpp CUDA. "
-                "Sprawdz, czy masz zainstalowany NVIDIA CUDA Toolkit 13.x albo wybierz runtime CPU.\n"
+                "Sprawdz runtime CUDA w aplikacji albo wybierz runtime CPU.\n"
                 f"{tail}"
             )
         raise RuntimeError(f"whisper.cpp nie utworzyl napisow.\n{tail}")
@@ -633,8 +638,14 @@ def run_whisperx_stt(
         events.append(message)
         _emit(progress, message)
 
+    device = str(settings.whisperx_device or "cpu").strip() or "cpu"
+    compute_type = whisper_qc_effective_compute_type(device, settings.whisperx_compute_type)
+    language = str(settings.language or "auto").strip().lower()
+
     emit("STT: przygotowanie modulu WhisperX")
     python_path = ensure_whisperx_runtime(paths, progress=progress)
+    if device.startswith("cuda"):
+        ensure_whisperx_gpu_runtime(paths, progress=progress)
     _raise_if_cancelled(cancel_requested)
 
     emit("STT: przygotowanie audio")
@@ -642,9 +653,6 @@ def run_whisperx_stt(
     extract_audio_for_stt(ffmpeg, source_path, temp_wav, channels, cancel_requested=cancel_requested)
     _raise_if_cancelled(cancel_requested)
 
-    device = str(settings.whisperx_device or "cpu").strip() or "cpu"
-    compute_type = whisper_qc_effective_compute_type(device, settings.whisperx_compute_type)
-    language = str(settings.language or "auto").strip().lower()
     command = build_whisperx_command(
         python_path=python_path,
         input_wav=temp_wav,
@@ -679,12 +687,13 @@ def run_whisperx_stt(
             timeout=7200,
             cancel_requested=cancel_requested,
             output_callback=on_whisperx_output,
+            env=whisperx_runtime_env(paths, device),
         )
     except RuntimeError as exc:
         if device.startswith("cuda"):
             raise RuntimeError(
                 "Nie udalo sie uruchomic WhisperX na GPU. "
-                "Sprawdz, czy masz zainstalowany NVIDIA CUDA Toolkit 12.8 albo wybierz CPU.\n"
+                "Sprawdz biblioteki CUDA Runtime w aplikacji albo wybierz CPU.\n"
                 f"{exc}"
             ) from exc
         raise
@@ -695,7 +704,7 @@ def run_whisperx_stt(
         if device.startswith("cuda"):
             raise RuntimeError(
                 "WhisperX nie utworzyl napisow na GPU. "
-                "Sprawdz CUDA Toolkit 12.8 albo wybierz CPU.\n"
+                "Sprawdz biblioteki CUDA Runtime w aplikacji albo wybierz CPU.\n"
                 f"{tail}"
             )
         raise RuntimeError(f"WhisperX nie utworzyl napisow.\n{tail}")

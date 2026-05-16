@@ -38,9 +38,19 @@ _PIPER_VOICE = None
 _PIPER_VOICE_KEY = ""
 _COQUI_XTTS_MODEL = None
 _COQUI_XTTS_MODEL_KEY = ""
-DETERMINISTIC_RETRY_ENGINES = {"piper"}
-PUNCTUATION_RETRY_ENGINES = {"piper"}
+_SUPERTONIC_TTS = None
+_SUPERTONIC_TTS_KEY = ""
+_DLL_DIRECTORY_HANDLES: list[Any] = []
+DETERMINISTIC_RETRY_ENGINES = {"piper", "supertonic"}
+PUNCTUATION_RETRY_ENGINES = {"piper", "supertonic"}
 RETRY_TERMINAL_PUNCTUATION = ".,!?:;"
+ENV_DLL_DIRS = "LEKTORAI_STT_FASTER_WHISPER_DLL_DIRS"
+CUDA_DLL_SUBDIRS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("nvidia", "cublas", "bin"), ("cublas64_12.dll", "cublasLt64_12.dll")),
+    (("nvidia", "cudnn", "bin"), ("cudnn64_9.dll",)),
+    (("nvidia", "cuda_runtime", "bin"), ("cudart64_12.dll",)),
+    (("torch", "lib"), ("cublas64_12.dll", "cudnn64_9.dll", "cudart64_12.dll")),
+)
 
 
 def main() -> int:
@@ -258,6 +268,8 @@ def synthesize_once(engine_id: str, text: str, output_path: str, settings: dict[
         synthesize_piper(text, output_path, settings)
     elif engine_id == "coqui_xtts":
         synthesize_coqui_xtts(text, output_path, settings)
+    elif engine_id == "supertonic":
+        synthesize_supertonic(text, output_path, settings)
     else:
         raise RuntimeError(f"Unsupported engine: {engine_id}")
 
@@ -357,6 +369,8 @@ def setup_cache(engine_id: str) -> None:
         os.environ["COQUI_TOS_AGREED"] = "1"
         os.environ["TTS_HOME"] = str(coqui_dir)
         os.environ["XDG_DATA_HOME"] = str(coqui_dir)
+    if engine_id == "supertonic":
+        os.environ["HF_HOME"] = str(cache_dir)
 
 
 def has_local_model_cache() -> bool:
@@ -591,6 +605,7 @@ def ensure_faster_whisper_packages_available() -> None:
     legacy_dir = str(os.environ.get("LEKTORAI_APP_PACKAGES_DIR", "") or "").strip()
     if legacy_dir:
         package_dirs.append(legacy_dir)
+    ensure_faster_whisper_dll_search_path(tuple(Path(item) for item in package_dirs if item.strip()))
     for packages_dir in reversed(package_dirs):
         packages_path = Path(packages_dir)
         if not packages_path.is_dir():
@@ -598,6 +613,45 @@ def ensure_faster_whisper_packages_available() -> None:
         packages_text = str(packages_path)
         if packages_text not in sys.path:
             sys.path.insert(0, packages_text)
+
+
+def ensure_faster_whisper_dll_search_path(package_dirs: tuple[Path, ...]) -> None:
+    raw_dll_dirs = str(os.environ.get(ENV_DLL_DIRS, "") or "").strip()
+    dll_dirs = [Path(item) for item in raw_dll_dirs.split(os.pathsep) if item.strip()]
+    dll_dirs.extend(faster_whisper_cuda_dll_dirs_for_package_dirs(package_dirs))
+    seen: set[str] = set()
+    for dll_dir in dll_dirs:
+        if not dll_dir.is_dir():
+            continue
+        dll_text = str(dll_dir)
+        if dll_text in seen:
+            continue
+        seen.add(dll_text)
+        if dll_text not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = dll_text + os.pathsep + os.environ.get("PATH", "")
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if add_dll_directory is None:
+            continue
+        try:
+            _DLL_DIRECTORY_HANDLES.append(add_dll_directory(dll_text))
+        except OSError:
+            continue
+
+
+def faster_whisper_cuda_dll_dirs_for_package_dirs(package_dirs: tuple[Path, ...]) -> tuple[Path, ...]:
+    result: list[Path] = []
+    seen: set[str] = set()
+    for package_dir in package_dirs:
+        for relative_parts, dll_names in CUDA_DLL_SUBDIRS:
+            candidate = package_dir.joinpath(*relative_parts)
+            if not candidate.is_dir() or not any((candidate / dll_name).is_file() for dll_name in dll_names):
+                continue
+            candidate_text = str(candidate)
+            if candidate_text in seen:
+                continue
+            seen.add(candidate_text)
+            result.append(candidate)
+    return tuple(result)
 
 
 def has_whisper_model_cache(cache_dir: Path, model_name: str) -> bool:
@@ -872,6 +926,61 @@ def synthesize_piper(text: str, output_path: str, settings: dict[str, Any]) -> N
         _PIPER_VOICE.synthesize_wav(text, wav_file, syn_config=syn_config)
 
 
+def synthesize_supertonic(text: str, output_path: str, settings: dict[str, Any]) -> None:
+    global _SUPERTONIC_TTS, _SUPERTONIC_TTS_KEY
+    if not text.strip():
+        raise RuntimeError("Empty text")
+    from supertonic import TTS
+
+    voice = str(settings.get("voice", "M4") or "M4").strip().upper() or "M4"
+    if voice not in {"M1", "M2", "M3", "M4", "M5", "F1", "F2", "F3", "F4", "F5"}:
+        voice = "M4"
+    speed = bounded_float(settings.get("speed", 1.05), 0.5, 2.0)
+    total_steps = bounded_int(settings.get("total_steps", 8), 2, 12)
+    max_chunk_length = bounded_int(settings.get("max_chunk_length", 300), 80, 500)
+    silence_duration = bounded_float(settings.get("silence_duration", 0.3), 0.0, 1.0)
+    model_name = "supertonic-3"
+    models_dir = Path.cwd() / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    model_key = f"{model_name}|{models_dir}"
+    if _SUPERTONIC_TTS is None or _SUPERTONIC_TTS_KEY != model_key:
+        print(f"supertonic: sprawdzanie modelu {model_name}")
+        if any(path.is_file() for path in models_dir.rglob("*")):
+            print(f"supertonic: model w cache {model_name}")
+        else:
+            print(f"supertonic: pobieranie modelu {model_name} - prosze czekac")
+        print(f"supertonic: ladowanie modelu {model_name} - prosze czekac")
+        _SUPERTONIC_TTS = TTS(model=model_name, model_dir=str(models_dir), auto_download=True)
+        _SUPERTONIC_TTS_KEY = model_key
+
+    style = _SUPERTONIC_TTS.get_voice_style(voice_name=voice)
+    synth_kwargs = {
+        "text": text,
+        "voice_style": style,
+        "lang": "pl",
+        "total_steps": total_steps,
+        "speed": speed,
+        "max_chunk_length": max_chunk_length,
+        "silence_duration": silence_duration,
+    }
+    try:
+        wav, _duration = _SUPERTONIC_TTS.synthesize(**synth_kwargs)
+    except TypeError as exc:
+        if "total_steps" not in str(exc):
+            raise
+        synth_kwargs["total_step"] = synth_kwargs.pop("total_steps")
+        wav, _duration = _SUPERTONIC_TTS.synthesize(**synth_kwargs)
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _SUPERTONIC_TTS.save_audio(wav, str(output))
+    if bool(settings.get("supertonic_trim_edges", True)):
+        import soundfile as sf
+
+        wav_np, sample_rate = sf.read(str(output), dtype="float32", always_2d=False)
+        trimmed = trim_supertonic_silence_edges_np(wav_np, int(sample_rate))
+        sf.write(str(output), trimmed, int(sample_rate))
+
+
 def synthesize_coqui_xtts(text: str, output_path: str, settings: dict[str, Any]) -> None:
     global _COQUI_XTTS_MODEL, _COQUI_XTTS_MODEL_KEY
     if not text.strip():
@@ -1020,6 +1129,29 @@ def trim_omnivoice_silence_edges_np(wav, sample_rate: int):
         if end < data.size:
             trimmed[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
     return trimmed
+
+
+def trim_supertonic_silence_edges_np(wav, sample_rate: int):
+    import numpy as np
+
+    data = np.asarray(wav, dtype=np.float32)
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    data = data.reshape(-1)
+    if data.size <= 0 or sample_rate <= 0:
+        return data
+
+    data = trim_leading_low_energy(
+        data,
+        sample_rate,
+        max_trim_ms=900,
+        threshold_db=-44.0,
+        pre_roll_ms=50,
+        consecutive_frames=3,
+    )
+    data = trim_tail(data, sample_rate)
+    data = apply_short_fades(data, sample_rate, fade_ms=12)
+    return data
 
 
 def trim_tail(wav, sample_rate: int):

@@ -129,8 +129,63 @@ def polish_combo_box(combo: QtWidgets.QComboBox) -> QtWidgets.QComboBox:
     return combo
 
 
+MODE_TTS_NEON = "#8A00C4"
+MODE_STT_NEON = "#FF5C00"
+
+
+def mode_tabs_style() -> str:
+    return f"""
+            QTabWidget::pane {{
+                border: 0;
+            }}
+            QTabBar::tab {{
+                background: #2f2f2f;
+                color: #f3f3f3;
+                border: 2px solid #555555;
+                border-radius: 4px;
+                margin: 0 4px 0 0;
+                padding: 2px 10px;
+            }}
+            QTabBar::tab:first {{
+                border: 2px solid {MODE_TTS_NEON};
+            }}
+            QTabBar::tab:last {{
+                border: 2px solid {MODE_STT_NEON};
+            }}
+            QTabBar::tab:selected {{
+                background: #3a3a3a;
+            }}
+            """
+
+
+def mode_panel_style(name: str, color: str) -> str:
+    return f"""
+            #{name} {{
+                border: 2px solid {color};
+                border-radius: 4px;
+                background: transparent;
+            }}
+            """
+
+
+def draw_neon_ellipse(painter: QtGui.QPainter, rect: QtCore.QRect, color: str) -> None:
+    base = QtGui.QColor(color)
+    painter.save()
+    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+    for grow, width, alpha in ((5, 6, 55), (3, 4, 95), (1, 3, 150)):
+        glow = QtGui.QColor(base)
+        glow.setAlpha(alpha)
+        painter.setPen(QtGui.QPen(glow, width))
+        painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(rect.adjusted(-grow, -grow, grow, grow))
+    painter.setPen(QtGui.QPen(base, 2))
+    painter.setBrush(QtGui.QBrush(base))
+    painter.drawEllipse(rect)
+    painter.restore()
+
+
 class UpdateButton(QtWidgets.QPushButton):
-    UPDATE_NEON_GREEN = "#39ff14"
+    UPDATE_NEON_GREEN = "#2CFF05"
 
     def __init__(self, text: str) -> None:
         super().__init__(text)
@@ -153,13 +208,16 @@ class UpdateButton(QtWidgets.QPushButton):
             painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(border_rect, 4, 4)
         size = 9
-        margin = 7
+        margin = 9
         y = max(0, (self.height() - size) // 2)
         rect = QtCore.QRect(self.width() - size - margin, y, size, size)
         color = QtGui.QColor(self.UPDATE_NEON_GREEN) if self._update_available else self.palette().button().color()
-        painter.setPen(QtGui.QPen(QtGui.QColor("#151515"), 1))
-        painter.setBrush(QtGui.QBrush(color))
-        painter.drawEllipse(rect)
+        if self._update_available:
+            draw_neon_ellipse(painter, rect, self.UPDATE_NEON_GREEN)
+        else:
+            painter.setPen(QtGui.QPen(QtGui.QColor("#151515"), 1))
+            painter.setBrush(QtGui.QBrush(color))
+            painter.drawEllipse(rect)
 
 
 def compact_app_log_message(message: str, limit: int = 260) -> str:
@@ -316,6 +374,7 @@ class PipelineWorker(QtCore.QThread):
         background_weight: float,
         lektor_delay_ms: int,
         create_stereo_for_surround: bool,
+        open_workspace_on_finish: bool,
     ) -> None:
         super().__init__()
         self.files = files
@@ -328,6 +387,7 @@ class PipelineWorker(QtCore.QThread):
         self.background_weight = sanitize_audio_weight(background_weight, DEFAULT_BACKGROUND_WEIGHT)
         self.lektor_delay_ms = sanitize_lektor_delay_ms(lektor_delay_ms)
         self.create_stereo_for_surround = bool(create_stereo_for_surround)
+        self.open_workspace_on_finish = bool(open_workspace_on_finish)
         self.file_started_at: float | None = None
         self.tts_started_at: float | None = None
         self.current_segment_total = 0
@@ -554,6 +614,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker: PipelineWorker | None = None
         self.stt_worker: SttWorker | None = None
         self.tts_started_at: float | None = None
+        self.tts_output_dirs: list[Path] = []
+        self.stt_output_dirs: list[Path] = []
         self.engine_status_refreshed_during_job = False
         self.update_check_result: UpdateCheckResult | None = None
         self.update_check_running = False
@@ -586,17 +648,22 @@ class MainWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
+        root.setContentsMargins(6, 6, 6, 6)
         self.tabs = QtWidgets.QTabWidget()
+        self.tabs.setStyleSheet(mode_tabs_style())
         root.addWidget(self.tabs)
 
         tts_tab = QtWidgets.QWidget()
         tts_root = QtWidgets.QHBoxLayout(tts_tab)
-        self.tabs.addTab(tts_tab, "TTS")
+        tts_root.setContentsMargins(0, 3, 0, 0)
+        self.tabs.addTab(tts_tab, ">> TTS <<")
         self.main_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         self.main_splitter.setChildrenCollapsible(False)
         tts_root.addWidget(self.main_splitter)
 
-        left_panel = QtWidgets.QWidget()
+        left_panel = QtWidgets.QFrame()
+        left_panel.setObjectName("ttsFilesPanel")
+        left_panel.setStyleSheet(mode_panel_style("ttsFilesPanel", MODE_TTS_NEON))
         left = QtWidgets.QVBoxLayout(left_panel)
         self.queue = QueueListWidget()
         self.queue.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -629,7 +696,9 @@ class MainWindow(QtWidgets.QMainWindow):
         left.addLayout(queue_actions_bottom)
         self.main_splitter.addWidget(left_panel)
 
-        middle_panel = QtWidgets.QWidget()
+        middle_panel = QtWidgets.QFrame()
+        middle_panel.setObjectName("ttsSettingsPanel")
+        middle_panel.setStyleSheet(mode_panel_style("ttsSettingsPanel", MODE_TTS_NEON))
         middle = QtWidgets.QVBoxLayout(middle_panel)
         self.engine_combo = QtWidgets.QComboBox()
         self.engine_combo.currentIndexChanged.connect(self.on_engine_changed)
@@ -647,10 +716,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_log_cleanup.clicked.connect(self.open_log_cleanup)
         self.btn_update = UpdateButton("Aktualizacja")
         self.btn_update.clicked.connect(self.open_update)
-        self.btn_open_output = QtWidgets.QPushButton("Otworz wynik")
-        self.btn_open_output.setEnabled(False)
-        self.btn_open_output.clicked.connect(self.open_last_output)
-        self.last_output_dir: Path | None = None
         self.lektor_lufs_row, self.lektor_lufs_slider, self.lektor_lufs_value = self._create_slider_row(
             "Glosnosc lektora (LUFS)",
             -30,
@@ -695,11 +760,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.aac_quality_combo.setCurrentIndex(current_index if current_index >= 0 else self.aac_quality_combo.findData("256k"))
         self.aac_quality_combo.setToolTip("Jakosc finalnej sciezki lektora AAC dodawanej do MKV. Wyższy bitrate to wiekszy plik i mniejsza kompresja.")
         self.aac_quality_combo.currentIndexChanged.connect(self._on_aac_quality_changed)
-        self.create_stereo_for_surround_checkbox = QtWidgets.QCheckBox("Tworz dodatkowa sciezke stereo przy 5.1")
+        self.create_stereo_for_surround_checkbox = QtWidgets.QCheckBox("Tworz dodatkowa sciezke stereo przy surround")
         self.create_stereo_for_surround_checkbox.setChecked(self.config_store.create_stereo_for_surround())
         self.create_stereo_for_surround_checkbox.setToolTip(
-            "Gdy zrodlo ma audio 5.1, program utworzy dodatkowa sciezke PL 2.0 obok PL 5.1. "
-            "Wylacz, jesli potrzebujesz tylko sciezki PL 5.1."
+            "Gdy zrodlo ma audio surround, program utworzy dodatkowa sciezke PL 2.0 obok sciezki surround. "
+            "Wylacz, jesli potrzebujesz tylko sciezki PL surround."
         )
         self.create_stereo_for_surround_checkbox.toggled.connect(self._on_create_stereo_for_surround_toggled)
         lektor_delay_tooltip = (
@@ -756,7 +821,6 @@ class MainWindow(QtWidgets.QMainWindow):
         middle.addWidget(self.btn_diagnostics)
         middle.addWidget(self.btn_log_cleanup)
         middle.addWidget(self.btn_update)
-        middle.addWidget(self.btn_open_output)
         middle.addWidget(self.lektor_lufs_row)
         middle.addWidget(self.lektor_weight_row)
         middle.addWidget(self.background_lufs_row)
@@ -775,7 +839,9 @@ class MainWindow(QtWidgets.QMainWindow):
         middle.addWidget(self.btn_stop)
         self.main_splitter.addWidget(middle_panel)
 
-        right_panel = QtWidgets.QWidget()
+        right_panel = QtWidgets.QFrame()
+        right_panel.setObjectName("ttsLogsPanel")
+        right_panel.setStyleSheet(mode_panel_style("ttsLogsPanel", MODE_TTS_NEON))
         right = QtWidgets.QVBoxLayout(right_panel)
         self.log_view = QtWidgets.QPlainTextEdit()
         self.log_view.setReadOnly(True)
@@ -791,11 +857,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_stt_tab(self) -> None:
         stt_tab = QtWidgets.QWidget()
         root = QtWidgets.QHBoxLayout(stt_tab)
+        root.setContentsMargins(0, 3, 0, 0)
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
         root.addWidget(splitter)
 
-        left_panel = QtWidgets.QWidget()
+        left_panel = QtWidgets.QFrame()
+        left_panel.setObjectName("sttFilesPanel")
+        left_panel.setStyleSheet(mode_panel_style("sttFilesPanel", MODE_STT_NEON))
         left = QtWidgets.QVBoxLayout(left_panel)
         self.stt_queue = QueueListWidget()
         self.stt_queue.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -824,8 +893,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         settings = self.config_store.stt_settings()
         middle_panel = QtWidgets.QScrollArea()
+        middle_panel.setObjectName("sttSettingsPanel")
+        middle_panel.setStyleSheet(mode_panel_style("sttSettingsPanel", MODE_STT_NEON))
         middle_panel.setWidgetResizable(True)
-        middle_panel.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        middle_panel.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
         middle_content = QtWidgets.QWidget()
         middle = QtWidgets.QVBoxLayout(middle_content)
         middle.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetMinimumSize)
@@ -931,10 +1002,14 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.stt_postprocess_checkbox.toggled.connect(self._on_stt_postprocess_enabled_changed)
 
-        self.btn_stt_open_output = QtWidgets.QPushButton("Otworz wynik")
-        self.btn_stt_open_output.setEnabled(False)
-        self.btn_stt_open_output.clicked.connect(self.open_last_stt_output)
-        self.last_stt_output_dir: Path | None = None
+        self.stt_open_workspace_checkbox = QtWidgets.QCheckBox("Otworz folder po pracy")
+        self.stt_open_workspace_checkbox.setChecked(settings.open_workspace_on_finish)
+        self.stt_open_workspace_checkbox.setToolTip("Po zakonczeniu otwiera folder roboczy LektorAI z wynikiem.")
+        self.stt_open_workspace_checkbox.toggled.connect(self._on_stt_open_workspace_on_finish_changed)
+
+        self.btn_stt_restore_defaults = QtWidgets.QPushButton("Przywroc domyslne")
+        self.btn_stt_restore_defaults.setToolTip("Przywraca domyslne ustawienia wybranego silnika STT.")
+        self.btn_stt_restore_defaults.clicked.connect(self.restore_stt_defaults)
         self.stt_progress_label = QtWidgets.QLabel("STT: -")
         self.stt_progress_bar = QtWidgets.QProgressBar()
         self.stt_progress_bar.setRange(0, 1)
@@ -955,6 +1030,7 @@ class MainWindow(QtWidgets.QMainWindow):
         middle.addWidget(QtWidgets.QLabel("Jezyk"))
         middle.addWidget(self.stt_language_combo)
         middle.addWidget(self.stt_postprocess_checkbox)
+        middle.addWidget(self.stt_open_workspace_checkbox)
 
         self.stt_faster_whisper_box = QtWidgets.QGroupBox("Ustawienia faster-whisper")
         faster_whisper_layout = QtWidgets.QVBoxLayout(self.stt_faster_whisper_box)
@@ -995,7 +1071,7 @@ class MainWindow(QtWidgets.QMainWindow):
         diagnostics_layout.addWidget(self.stt_save_report_checkbox)
         diagnostics_layout.addWidget(self.stt_save_log_checkbox)
         middle.addWidget(diagnostics_box)
-        middle.addWidget(self.btn_stt_open_output)
+        middle.addWidget(self.btn_stt_restore_defaults)
         middle.addStretch(1)
         middle.addWidget(self.stt_progress_label)
         middle.addWidget(self.stt_progress_bar)
@@ -1003,7 +1079,9 @@ class MainWindow(QtWidgets.QMainWindow):
         middle.addWidget(self.btn_stt_stop)
         splitter.addWidget(middle_panel)
 
-        right_panel = QtWidgets.QWidget()
+        right_panel = QtWidgets.QFrame()
+        right_panel.setObjectName("sttLogsPanel")
+        right_panel.setStyleSheet(mode_panel_style("sttLogsPanel", MODE_STT_NEON))
         right = QtWidgets.QVBoxLayout(right_panel)
         self.stt_log_view = QtWidgets.QPlainTextEdit()
         self.stt_log_view.setReadOnly(True)
@@ -1014,7 +1092,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for index in range(3):
             splitter.setStretchFactor(index, 1)
         splitter.setSizes([420, 420, 420])
-        self.tabs.addTab(stt_tab, "STT")
+        self.tabs.addTab(stt_tab, ">> STT <<")
         self._load_stt_controls_for_engine(str(self.stt_engine_combo.currentData() or "faster_whisper"))
         self._refresh_stt_engine_settings_visibility()
 
@@ -1239,7 +1317,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self,
             "Wybierz pliki STT",
             self._file_dialog_start_dir(),
-            "Audio / wideo (*.mkv *.mp4 *.avi *.mov *.webm *.wmv *.m4v *.aac *.ac3 *.flac *.m4a *.mp3 *.ogg *.opus *.wav *.wma);;Wszystkie pliki (*)",
+            "Audio / wideo (*.mkv *.mp4 *.avi *.mov *.webm *.wmv *.m4v *.aac *.ac3 *.dts *.dtshd *.flac *.m4a *.mp3 *.ogg *.opus *.wav *.wma);;Wszystkie pliki (*)",
         )
         self.add_stt_file_paths(files)
 
@@ -1460,8 +1538,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine_status_refreshed_during_job = False
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.last_output_dir = None
-        self.btn_open_output.setEnabled(False)
+        self.tts_output_dirs = []
         self._set_queue_controls_enabled(False)
         self._set_stt_controls_enabled(False)
         self.btn_stt_stop.setEnabled(False)
@@ -1476,6 +1553,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.selected_background_weight(),
             self.selected_lektor_delay_ms(),
             self.selected_create_stereo_for_surround(),
+            self.selected_tts_open_workspace_on_finish(engine_id),
         )
         self.worker.message.connect(self.on_worker_message)
         self.worker.diagnostic.connect(self.log_diagnostic)
@@ -1508,8 +1586,7 @@ class MainWindow(QtWidgets.QMainWindow):
             show_scrollable_text(self, "Kolejka STT", "Popraw problemy w kolejce STT przed startem:", "\n".join(errors))
             return
         settings = self.selected_stt_settings()
-        self.last_stt_output_dir = None
-        self.btn_stt_open_output.setEnabled(False)
+        self.stt_output_dirs = []
         self._set_stt_controls_enabled(False)
         self._set_queue_controls_enabled(False)
         self.stt_progress_bar.setRange(0, 0)
@@ -1574,8 +1651,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.stt_progress_label.setText(f"STT: plik {done + 1}/{total}")
 
     def on_stt_output_ready(self, folder: str) -> None:
-        self.last_stt_output_dir = Path(folder)
-        self.btn_stt_open_output.setEnabled(self.last_stt_output_dir.exists())
+        output_dir = Path(folder)
+        workspace = output_dir.parent if output_dir.parent.name == "LektorAI" else output_dir
+        self.stt_output_dirs.append(workspace)
 
     def on_stt_failed(self, message: str) -> None:
         self.log_stt(f"BLAD STT: {message}")
@@ -1597,21 +1675,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stt_progress_label.setText("STT: gotowe")
         self.stt_progress_bar.setRange(0, 1)
         self.stt_progress_bar.setValue(0)
+        should_open = bool(self.stt_worker and self.stt_worker.settings.open_workspace_on_finish)
+        if should_open:
+            self._open_workspace_folders(self.stt_output_dirs, self.log_stt)
         self.stt_worker = None
 
-    def open_last_output(self) -> None:
-        if self.last_output_dir is None or not self.last_output_dir.exists():
-            QtWidgets.QMessageBox.warning(self, "Wynik", "Brak folderu wyniku do otwarcia.")
-            self.btn_open_output.setEnabled(False)
-            return
-        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(self.last_output_dir)))
-
-    def open_last_stt_output(self) -> None:
-        if self.last_stt_output_dir is None or not self.last_stt_output_dir.exists():
-            QtWidgets.QMessageBox.warning(self, "Wynik STT", "Brak folderu wyniku STT do otwarcia.")
-            self.btn_stt_open_output.setEnabled(False)
-            return
-        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(self.last_stt_output_dir)))
+    def restore_stt_defaults(self) -> None:
+        engine = str(self.stt_engine_combo.currentData() or "faster_whisper")
+        self.config_store.reset_stt_engine_defaults(engine)
+        self._load_stt_controls_for_engine(engine)
+        self._refresh_stt_engine_settings_visibility()
+        self.log(f"STT: przywrocono domyslne ustawienia ({engine})")
 
     def validate_selected_engine_config(self, engine_id: str) -> list[str]:
         config_path = self.engine_manager.ensure_engine_config(engine_id)
@@ -1705,8 +1779,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tts_progress_label.setText(label)
 
     def on_output_ready(self, folder: str) -> None:
-        self.last_output_dir = Path(folder)
-        self.btn_open_output.setEnabled(self.last_output_dir.exists())
+        self.tts_output_dirs.append(Path(folder))
 
     def on_pipeline_failed(self, message: str) -> None:
         self.log(f"BLAD: {message}")
@@ -1719,6 +1792,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tts_progress_bar.setRange(0, 1)
         self.tts_progress_bar.setValue(0)
         self.tts_started_at = None
+        should_open = bool(self.worker and self.worker.open_workspace_on_finish)
+        if should_open:
+            self._open_workspace_folders(self.tts_output_dirs, self.log)
         self.worker = None
 
     def on_pipeline_finished(self, message: str) -> None:
@@ -1780,9 +1856,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stt_whisper_cpp_device_combo.setEnabled(enabled)
         self.stt_whisper_cpp_threads_combo.setEnabled(enabled)
         self.stt_postprocess_checkbox.setEnabled(enabled)
+        self.stt_open_workspace_checkbox.setEnabled(enabled)
         self.stt_save_audio_checkbox.setEnabled(enabled)
         self.stt_save_report_checkbox.setEnabled(enabled)
         self.stt_save_log_checkbox.setEnabled(enabled)
+        self.btn_stt_restore_defaults.setEnabled(enabled)
         self.btn_stt_start.setEnabled(enabled)
         self.btn_stt_stop.setEnabled(not enabled)
         self._refresh_stt_engine_settings_visibility()
@@ -1820,6 +1898,7 @@ class MainWindow(QtWidgets.QMainWindow):
             whisperx_device=whisperx_device,
             whisperx_compute_type=whisperx_compute_type,
             postprocess_enabled=self.stt_postprocess_checkbox.isChecked(),
+            open_workspace_on_finish=self.stt_open_workspace_checkbox.isChecked(),
             save_prepared_audio=self.stt_save_audio_checkbox.isChecked(),
             save_report=self.stt_save_report_checkbox.isChecked(),
             save_log=self.stt_save_log_checkbox.isChecked(),
@@ -1870,6 +1949,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_stt_postprocess_enabled_changed(self, checked: bool) -> None:
         self.config_store.set_stt_postprocess_enabled(checked)
+
+    def _on_stt_open_workspace_on_finish_changed(self, checked: bool) -> None:
+        self.config_store.set_stt_open_workspace_on_finish(checked)
 
     def _on_stt_whisper_cpp_runtime_changed(self) -> None:
         self.config_store.set_stt_whisper_cpp_runtime(str(self.stt_whisper_cpp_runtime_combo.currentData() or "cpu"))
@@ -1933,6 +2015,7 @@ class MainWindow(QtWidgets.QMainWindow):
             (self.stt_save_report_checkbox, settings.save_report),
             (self.stt_save_log_checkbox, settings.save_log),
             (self.stt_postprocess_checkbox, settings.postprocess_enabled),
+            (self.stt_open_workspace_checkbox, settings.open_workspace_on_finish),
         )
         for checkbox, checked in checkboxes:
             checkbox.blockSignals(True)
@@ -1983,6 +2066,16 @@ class MainWindow(QtWidgets.QMainWindow):
             status = "Runtime: gotowy" if ready else "Runtime: pobierze sie przy pierwszym uzyciu"
             self.stt_whisper_cpp_runtime_status.setText(status)
 
+    def selected_tts_open_workspace_on_finish(self, engine_id: str) -> bool:
+        try:
+            config_path = self.engine_manager.ensure_engine_config(engine_id)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            if not isinstance(config, dict):
+                return False
+            return bool_config_value(config.get("open_workspace_on_finish"), False)
+        except Exception:
+            return False
+
     def selected_engine_keep_lektor_assets(self, engine_id: str) -> bool:
         try:
             config_path = self.engine_manager.ensure_engine_config(engine_id)
@@ -2001,6 +2094,26 @@ class MainWindow(QtWidgets.QMainWindow):
             return any(bool_config_value(config.get(key), False) for key in diagnostic_keys)
         except Exception:
             return False
+
+    def _open_workspace_folders(self, folders: list[Path], log_func) -> None:
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for folder in folders:
+            path = Path(folder)
+            if not path.exists():
+                continue
+            try:
+                key = str(path.resolve()).casefold()
+            except OSError:
+                key = str(path).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(path)
+        for folder in unique:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(folder)))
+        if unique:
+            log_func(f"Foldery robocze: otwarto {len(unique)}")
 
     def _on_aac_quality_changed(self) -> None:
         self.config_store.set_aac_bitrate(self.selected_aac_bitrate())

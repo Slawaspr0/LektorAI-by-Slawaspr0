@@ -104,6 +104,21 @@ under their own licenses. The XTTS-v2 model license may include
 non-commercial-use restrictions unless the user has separate commercial rights.
 
 
+Supertonic
+----------
+
+Supertonic is an external TTS engine by Supertone.
+
+Project: https://github.com/supertone-inc/supertonic
+Code license: MIT License.
+Supertonic 3 model license: OpenRAIL-M License.
+
+Supertonic is not owned by this project. If installed or used through LektorAI
+by Slawaspr0, it remains licensed by its original authors under its own
+licenses. The accompanying model may have its own license terms; review the
+current model license before redistribution, publication or commercial use.
+
+
 faster-whisper
 --------------
 
@@ -146,12 +161,22 @@ Speech recognition, alignment and diarization models used with WhisperX may
 have their own licenses and terms.
 
 
+CUDA Runtime packages
+---------------------
+
+LektorAI by Slawaspr0 may download and unpack CUDA runtime DLL packages used by
+selected STT modules on NVIDIA GPU. These packages may contain NVIDIA CUDA
+runtime libraries and related GPU dependencies. They are not owned by this
+project and are not relicensed by this MIT License. They remain subject to
+their original licenses and redistribution terms.
+
+
 External binaries and dependencies
 ----------------------------------
 
 LektorAI by Slawaspr0 may use external binaries and Python packages such as
-ffmpeg, ffprobe, mkvmerge, PyTorch, faster-whisper, whisper.cpp, WhisperX and
-other dependencies.
+ffmpeg, ffprobe, mkvmerge, PyTorch, faster-whisper, whisper.cpp, WhisperX,
+Supertonic and other dependencies.
 These components remain under their own licenses and are not relicensed by this
 MIT License.
 
