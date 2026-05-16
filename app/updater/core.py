@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import shutil
@@ -19,7 +20,10 @@ from app.core.download import download_file_with_progress
 from app.core.version import APP_NAME, APP_VERSION
 
 
-UPDATE_INFO_URL = "https://raw.githubusercontent.com/Slawaspr0/LektorAI-by-Slawaspr0/main/update.json"
+UPDATE_INFO_URL = "https://raw.githubusercontent.com/Slawaspr0/LektorAI-by-Slawaspr0/refs/heads/main/update.json"
+UPDATE_INFO_FALLBACK_URLS = (
+    "https://api.github.com/repos/Slawaspr0/LektorAI-by-Slawaspr0/contents/update.json?ref=main",
+)
 SOURCE_ZIP_URL = "https://github.com/Slawaspr0/LektorAI-by-Slawaspr0/archive/refs/heads/main.zip"
 LOCAL_UPDATE_FILE = "update.json"
 
@@ -83,24 +87,43 @@ def update_info_from_dict(data: dict[str, Any]) -> UpdateInfo:
 
 def check_for_updates(app_dir: Path, info_url: str = UPDATE_INFO_URL, timeout_s: float = 8.0) -> UpdateCheckResult:
     local = read_local_update_info(app_dir)
-    try:
-        remote = fetch_update_info(info_url, timeout_s=timeout_s)
-    except Exception as exc:
+    urls = [str(info_url)]
+    if str(info_url) == UPDATE_INFO_URL:
+        urls.extend(url for url in UPDATE_INFO_FALLBACK_URLS if url not in urls)
+    last_error = ""
+    last_remote: UpdateInfo | None = None
+    for url in urls:
+        try:
+            remote = fetch_update_info(url, timeout_s=timeout_s)
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+        last_remote = remote
+        available = is_update_available(local, remote)
+        if available:
+            return UpdateCheckResult(
+                ok=True,
+                update_available=True,
+                local=local,
+                remote=remote,
+                message=f"Dostepna aktualizacja: {remote.version}",
+            )
+    if last_remote is not None:
         return UpdateCheckResult(
-            ok=False,
+            ok=True,
             update_available=False,
             local=local,
-            remote=None,
-            message="Nie udalo sie sprawdzic aktualizacji.",
-            error=str(exc),
+            remote=last_remote,
+            message="Masz najnowsza wersje.",
         )
-    available = is_update_available(local, remote)
-    if available:
-        message = f"Dostepna aktualizacja: {remote.version}"
-    else:
-        message = "Masz najnowsza wersje."
-    return UpdateCheckResult(ok=True, update_available=available, local=local, remote=remote, message=message)
-
+    return UpdateCheckResult(
+        ok=False,
+        update_available=False,
+        local=local,
+        remote=None,
+        message="Nie udalo sie sprawdzic aktualizacji.",
+        error=last_error,
+    )
 
 def fetch_update_info(info_url: str, timeout_s: float = 8.0) -> UpdateInfo:
     request = urllib.request.Request(
@@ -110,7 +133,20 @@ def fetch_update_info(info_url: str, timeout_s: float = 8.0) -> UpdateInfo:
     )
     with urllib.request.urlopen(request, timeout=timeout_s) as response:
         payload = response.read(1024 * 1024)
-    return update_info_from_dict(json.loads(payload.decode("utf-8")))
+    data = json.loads(payload.decode("utf-8"))
+    return update_info_from_dict(decode_github_content_payload(data))
+
+
+def decode_github_content_payload(data: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    if str(data.get("encoding", "")).lower() == "base64" and isinstance(data.get("content"), str):
+        content = str(data.get("content", ""))
+        decoded = base64.b64decode(content, validate=False).decode("utf-8")
+        nested = json.loads(decoded)
+        if isinstance(nested, dict):
+            return nested
+    return data
 
 
 def is_update_available(local: UpdateInfo, remote: UpdateInfo) -> bool:
