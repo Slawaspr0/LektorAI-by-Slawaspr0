@@ -50,6 +50,21 @@ ffprobe.exe
 mkvmerge.exe
 ```
 
+FFmpeg polecam pobrać tutaj:
+
+[https://www.gyan.dev/ffmpeg/builds/ffmpeg-git-full.7z](https://www.gyan.dev/ffmpeg/builds/ffmpeg-git-full.7z)
+
+Po rozpakowaniu paczki FFmpeg potrzebne pliki znajdują się w folderze `bin`. Najważniejsze są:
+
+```text
+ffmpeg.exe
+ffprobe.exe
+```
+
+MKVToolNix, czyli program zawierający `mkvmerge.exe`, można pobrać tutaj:
+
+[https://mkvtoolnix.download/downloads.html#windows](https://mkvtoolnix.download/downloads.html#windows)
+
 Aplikacja szuka ich w tej kolejności:
 
 1. w systemowym `PATH`,
