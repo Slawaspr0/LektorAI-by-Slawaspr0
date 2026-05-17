@@ -17,6 +17,7 @@ from uuid import uuid4
 from app.core.dictionary import load_dictionary
 from app.core.media_tools import (
     BINARY_LOOKUP_HINT,
+    audio_stream_log_lines,
     audio_stream_summary,
     apply_short_audio_fade,
     convert_audio_to_wav,
@@ -33,6 +34,7 @@ from app.core.media_tools import (
     probe_media_duration,
     prepare_voice_sample,
     sanitize_lektor_delay_ms,
+    selected_background_audio_stream,
     surround_label_for_channels,
     supported_voice_sample_extensions,
     trim_fixed_and_fade_wav_edges,
@@ -436,7 +438,10 @@ def _run_tts_job_prepared(
         create_surround_track = bool(surround_label)
         create_stereo_track = (not create_surround_track) or bool(create_stereo_for_surround)
         output_track_label = _audio_output_track_label(surround_label, create_stereo_track)
-        primary_audio = audio_stream_summary(audio_streams[0] if audio_streams else None)
+        primary_audio_stream = selected_background_audio_stream(audio_streams)
+        primary_audio = audio_stream_summary(primary_audio_stream)
+        for line in audio_stream_log_lines(audio_streams):
+            progress(line)
         progress(
             f"Miks audio: tlo {primary_audio} + lektor mono -> "
             f"{output_track_label}"
@@ -549,7 +554,7 @@ def _run_tts_job_prepared(
             "diagnostic_keep": diagnostics,
             "audio_diagnostics": {
                 "source_duration_s": round(float(source_duration or 0.0), 3),
-                "source_primary_audio": audio_stream_summary(source_audio_streams[0] if source_audio_streams else None),
+                "source_primary_audio": audio_stream_summary(selected_background_audio_stream(source_audio_streams)),
                 "lektor_before_normalization": lektor_before_diagnostics or {},
                 "lektor_after_normalization": lektor_after_diagnostics or {},
                 "lektor_encoded_duration_s": round(float(lektor_encoded_duration or 0.0), 3),
@@ -757,7 +762,7 @@ def _build_run_analysis(
             "path": str(source_path),
             "name": source_path.name,
             "duration_s": round(float(source_duration or 0.0), 3),
-            "primary_audio": audio_stream_summary(source_audio_streams[0] if source_audio_streams else None),
+            "primary_audio": audio_stream_summary(selected_background_audio_stream(source_audio_streams)),
         },
         "subtitles": {
             "input_path": str(input_subtitle_path),
@@ -2241,8 +2246,8 @@ def _source_media_diagnostics(source_path: Path, paths: AppPaths) -> tuple[float
 
 def _format_source_media_message(duration_s: float | None, audio_streams: list[dict]) -> str:
     duration = _format_duration_seconds(duration_s) if duration_s else "nieznany czas"
-    audio = audio_stream_summary(audio_streams[0] if audio_streams else None)
-    return f"Zrodlo: {duration}, audio: {audio}"
+    audio = audio_stream_summary(selected_background_audio_stream(audio_streams))
+    return f"Zrodlo: {duration}, audio tlo: {audio}"
 
 
 def _safe_wav_diagnostics(path: Path | None) -> dict[str, int | float] | None:

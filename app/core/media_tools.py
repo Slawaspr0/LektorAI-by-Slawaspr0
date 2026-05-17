@@ -22,7 +22,10 @@ VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".webm", ".wmv", ".m4v"}
 POLISH_MARKERS = {"pl", "pol", "polish", "polski", "polskie"}
 TEXT_SUBTITLE_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text"}
 BITMAP_SUBTITLE_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"}
-BINARY_LOOKUP_HINT = "Dodaj ffmpeg.exe, ffprobe.exe i mkvmerge.exe do PATH albo umiesc je w folderze aplikacji obok START.py."
+BINARY_LOOKUP_HINT = (
+    "Program szuka ich w PATH albo w folderze aplikacji obok START.py. "
+    "Instrukcje pobierania znajdziesz w README na stronie GitHub projektu."
+)
 VOICE_SAMPLE_EXTENSIONS = (".wav", ".mp3", ".flac")
 VOICE_SAMPLE_RATE_BY_ENGINE = {
     "chatterbox": 24000,
@@ -237,11 +240,55 @@ def probe_audio_streams(ffprobe: Path, video_path: Path) -> list[dict]:
     return streams if isinstance(streams, list) else []
 
 
-def primary_audio_channels(audio_streams: list[dict]) -> int:
+def _stream_tags(stream: dict | None) -> dict:
+    if not stream:
+        return {}
+    tags = stream.get("tags", {})
+    return tags if isinstance(tags, dict) else {}
+
+
+def _metadata_tokens(value: object) -> set[str]:
+    text = str(value or "").strip().lower()
+    return set(re.findall(r"[a-z]+", text, flags=re.IGNORECASE))
+
+
+def audio_stream_looks_polish(stream: dict | None) -> bool:
+    tags = _stream_tags(stream)
+    language = str(tags.get("language", "") or "").strip().lower()
+    title = str(tags.get("title", "") or "").strip().lower()
+    return (
+        language in POLISH_MARKERS
+        or bool(POLISH_MARKERS & _metadata_tokens(language))
+        or bool(POLISH_MARKERS & _metadata_tokens(title))
+    )
+
+
+def select_background_audio_stream_index(audio_streams: list[dict]) -> int:
     if not audio_streams:
         return 0
+    if len(audio_streams) == 1:
+        return 0
+    for index, stream in enumerate(audio_streams):
+        if not audio_stream_looks_polish(stream):
+            return index
+    return 0
+
+
+def selected_background_audio_stream(audio_streams: list[dict]) -> dict | None:
+    if not audio_streams:
+        return None
+    index = select_background_audio_stream_index(audio_streams)
+    if 0 <= index < len(audio_streams):
+        return audio_streams[index]
+    return audio_streams[0]
+
+
+def primary_audio_channels(audio_streams: list[dict]) -> int:
+    stream = selected_background_audio_stream(audio_streams)
+    if not stream:
+        return 0
     try:
-        return max(0, int(audio_streams[0].get("channels") or 0))
+        return max(0, int(stream.get("channels") or 0))
     except Exception:
         return 0
 
@@ -271,6 +318,31 @@ def audio_stream_summary(stream: dict | None) -> str:
     if sample_rate:
         parts.append(sample_rate)
     return ", ".join(parts)
+
+
+def audio_stream_metadata_summary(stream: dict | None) -> str:
+    if not stream:
+        return "brak danych audio"
+    tags = _stream_tags(stream)
+    language = str(tags.get("language") or "").strip() or "brak"
+    title = str(tags.get("title") or "").strip() or "brak"
+    try:
+        container_index = int(stream.get("index"))
+        index_part = f"strumien {container_index}"
+    except Exception:
+        index_part = "strumien ?"
+    return f"{index_part}, {audio_stream_summary(stream)}, jezyk: {language}, tytul: {title}"
+
+
+def audio_stream_log_lines(audio_streams: list[dict]) -> list[str]:
+    if not audio_streams:
+        return ["Sciezki audio zrodla: brak"]
+    selected_index = select_background_audio_stream_index(audio_streams)
+    lines = ["Sciezki audio zrodla:"]
+    for index, stream in enumerate(audio_streams):
+        suffix = " (wybrana jako tlo)" if index == selected_index else ""
+        lines.append(f"- {index + 1}: {audio_stream_metadata_summary(stream)}{suffix}")
+    return lines
 
 
 def wav_audio_diagnostics(path: Path) -> dict[str, int | float]:
@@ -1032,6 +1104,7 @@ def mux_lektor_track(
     output_video.parent.mkdir(parents=True, exist_ok=True)
     audio_streams = probe_audio_streams(ffprobe, video_path)
     new_audio_index = len(audio_streams)
+    background_audio_index = select_background_audio_stream_index(audio_streams)
     primary_channels = primary_audio_channels(audio_streams)
     temp_output = _temporary_output_path(output_video, "mux_temp")
     _unlink_if_exists(temp_output)
@@ -1047,7 +1120,12 @@ def mux_lektor_track(
         temp_stage_paths = [source_audio_path, pl_stereo_path, pl_surround_path]
         for path in temp_stage_paths:
             _unlink_if_exists(path)
-        extract_command = extract_primary_audio_command(ffmpeg, video_path, source_audio_path)
+        extract_command = extract_primary_audio_command(
+            ffmpeg,
+            video_path,
+            source_audio_path,
+            audio_stream_index=background_audio_index,
+        )
         create_surround_track = bool(surround_label)
         create_stereo_track = not create_surround_track or bool(create_stereo_for_surround)
         prepared_tracks: list[Path] = []
@@ -1194,7 +1272,16 @@ def _run_stage_with_progress(
     )
 
 
-def extract_primary_audio_command(ffmpeg: Path, video_path: Path, output_audio: Path) -> list[str]:
+def extract_primary_audio_command(
+    ffmpeg: Path,
+    video_path: Path,
+    output_audio: Path,
+    audio_stream_index: int = 0,
+) -> list[str]:
+    try:
+        selected_audio_index = max(0, int(audio_stream_index))
+    except Exception:
+        selected_audio_index = 0
     return [
         str(ffmpeg),
         "-hide_banner",
@@ -1204,7 +1291,7 @@ def extract_primary_audio_command(ffmpeg: Path, video_path: Path, output_audio: 
         "-map_metadata",
         "-1",
         "-map",
-        "0:a:0",
+        f"0:a:{selected_audio_index}",
         "-vn",
         "-sn",
         "-dn",

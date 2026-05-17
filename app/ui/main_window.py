@@ -1610,10 +1610,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def validate_stt_queue_files(self, files: list[Path]) -> list[str]:
         errors: list[str] = []
+        missing_tools: list[str] = []
         if find_ffmpeg(self.paths) is None:
-            errors.append(missing_ffmpeg_message())
+            missing_tools.append("ffmpeg.exe")
         if find_ffprobe(self.paths) is None:
-            errors.append(missing_ffprobe_message())
+            missing_tools.append("ffprobe.exe")
+        if missing_tools:
+            errors.append(missing_media_tools_message(missing_tools))
         for path in files:
             if not path.exists():
                 errors.append(f"Brak pliku: {path}")
@@ -1725,12 +1728,15 @@ class MainWindow(QtWidgets.QMainWindow):
         ffprobe = find_ffprobe(self.paths)
         mkvmerge = find_mkvmerge(self.paths)
         has_video = any(is_video_file(path) for path in files)
+        missing_tools: list[str] = []
         if ffmpeg is None:
-            errors.append(missing_ffmpeg_message())
+            missing_tools.append("ffmpeg.exe")
         if has_video and ffprobe is None:
-            errors.append(missing_ffprobe_message())
+            missing_tools.append("ffprobe.exe")
         if has_video and mkvmerge is None:
-            errors.append(missing_mkvmerge_message())
+            missing_tools.append("mkvmerge.exe")
+        if missing_tools:
+            errors.append(missing_media_tools_message(missing_tools))
         for path in files:
             if not path.exists():
                 errors.append(f"Brak pliku: {path}")
@@ -2297,15 +2303,26 @@ def build_start_confirmation_text(
 
 
 def missing_ffmpeg_message() -> str:
-    return f"Brak ffmpeg. Bez ffmpeg aplikacja nie zlozy gotowej sciezki lektora. {BINARY_LOOKUP_HINT}"
+    return missing_media_tools_message(("ffmpeg.exe",))
 
 
 def missing_ffprobe_message() -> str:
-    return f"Brak ffprobe. Bez ffprobe aplikacja nie obsluzy poprawnie plikow wideo. {BINARY_LOOKUP_HINT}"
+    return missing_media_tools_message(("ffprobe.exe",))
 
 
 def missing_mkvmerge_message() -> str:
-    return f"Brak mkvmerge. Bez MKVToolNix aplikacja nie zapisze bezpiecznie kontenera MKV. {BINARY_LOOKUP_HINT}"
+    return missing_media_tools_message(("mkvmerge.exe",))
+
+
+def missing_media_tools_message(tool_names) -> str:
+    order = ("ffmpeg.exe", "ffprobe.exe", "mkvmerge.exe")
+    requested = {str(name).strip() for name in tool_names if str(name).strip()}
+    tools = [name for name in order if name in requested]
+    tools.extend(sorted(requested - set(tools)))
+    lines = ["Brakuje plikow potrzebnych do pracy z audio/wideo:", ""]
+    lines.extend(f"- {name}" for name in tools)
+    lines.extend(["", BINARY_LOOKUP_HINT])
+    return "\n".join(lines)
 
 
 def natural_path_key(path_text: str) -> list:

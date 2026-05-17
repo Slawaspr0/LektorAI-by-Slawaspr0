@@ -24,6 +24,7 @@ from app.core.media_tools import (
     MAX_LEKTOR_DELAY_MS,
     MIN_LEKTOR_DELAY_MS,
     OUTPUT_AUDIO_SAMPLE_RATE,
+    audio_stream_log_lines,
     audio_stream_summary,
     extract_primary_audio_command,
     find_binary,
@@ -37,10 +38,13 @@ from app.core.media_tools import (
     normalize_lektor_wav_command,
     prepare_voice_sample_command,
     probe_media_duration,
+    primary_audio_channels,
     remux_with_prepared_lektor_audio_mkvmerge_command,
     sanitize_aac_bitrate,
     sanitize_lektor_delay_ms,
     ffmpeg_command_with_progress,
+    select_background_audio_stream_index,
+    selected_background_audio_stream,
     select_subtitle_stream_index,
     select_text_subtitle_stream_index,
     supported_voice_sample_extensions,
@@ -218,6 +222,7 @@ from app.ui.main_window import (
     format_duration,
     is_sidecar_for_existing_video,
     missing_ffmpeg_message,
+    missing_media_tools_message,
     missing_mkvmerge_message,
     missing_ffprobe_message,
     natural_path_key,
@@ -568,8 +573,8 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(find_ffprobe(portable_bin_paths) == portable_bins_dir / ffprobe_name, "portable ffprobe root fallback mismatch")
         _assert(find_mkvmerge(portable_bin_paths) == portable_bins_dir / mkvmerge_name, "portable mkvmerge root fallback mismatch")
         find_binary.__globals__["shutil"].which = original_which
-        _assert("mkvmerge.exe" in BINARY_LOOKUP_HINT and "START.py" in BINARY_LOOKUP_HINT, "binary lookup hint mismatch")
-        _assert("PATH" in BINARY_LOOKUP_HINT and "bin/tools" not in BINARY_LOOKUP_HINT, "binary lookup hint should mention PATH and not bin/tools")
+        _assert("GitHub" in BINARY_LOOKUP_HINT and "README" in BINARY_LOOKUP_HINT and "START.py" in BINARY_LOOKUP_HINT, "binary lookup hint mismatch")
+        _assert("PATH" in BINARY_LOOKUP_HINT and "runtime" not in BINARY_LOOKUP_HINT and "bin/tools" not in BINARY_LOOKUP_HINT, "binary lookup hint should mention PATH and root app folder only")
     finally:
         try:
             find_binary.__globals__["shutil"].which = original_which
@@ -621,6 +626,48 @@ def run_self_test(app_dir: Path) -> list[str]:
         "default disposition should break equal subtitle score ties",
     )
     messages.append("subtitle stream scoring: OK")
+
+    audio_streams = [
+        {
+            "index": 1,
+            "codec_name": "ac3",
+            "channels": 2,
+            "channel_layout": "stereo",
+            "sample_rate": "48000",
+            "tags": {"language": "pol", "title": "Dubbing PL"},
+        },
+        {
+            "index": 2,
+            "codec_name": "dts",
+            "channels": 6,
+            "channel_layout": "5.1",
+            "sample_rate": "48000",
+            "tags": {"language": "eng", "title": "Original"},
+        },
+    ]
+    _assert(select_background_audio_stream_index(audio_streams) == 1, "audio background should skip Polish tracks when alternatives exist")
+    _assert(selected_background_audio_stream(audio_streams) is audio_streams[1], "selected audio stream helper mismatch")
+    _assert(primary_audio_channels(audio_streams) == 6, "selected background stream should drive surround detection")
+    audio_log = "\n".join(audio_stream_log_lines(audio_streams))
+    _assert(
+        "Dubbing PL" in audio_log and "Original" in audio_log and "wybrana jako tlo" in audio_log,
+        "audio stream log should show available metadata and selected track",
+    )
+    single_polish_audio = [
+        {"index": 1, "codec_name": "ac3", "channels": 2, "tags": {"language": "pol", "title": "Polski dubbing"}}
+    ]
+    _assert(select_background_audio_stream_index(single_polish_audio) == 0, "single audio track should be used even if tagged Polish")
+    title_marked_audio = [
+        {"index": 1, "codec_name": "ac3", "channels": 2, "tags": {"language": "und", "title": "Polski dubbing"}},
+        {"index": 2, "codec_name": "eac3", "channels": 6, "tags": {"language": "eng", "title": "Original"}},
+    ]
+    _assert(select_background_audio_stream_index(title_marked_audio) == 1, "Polish title should be treated as Polish audio metadata")
+    all_polish_audio = [
+        {"index": 1, "codec_name": "ac3", "channels": 2, "tags": {"language": "pol", "title": "PL"}},
+        {"index": 2, "codec_name": "eac3", "channels": 6, "tags": {"language": "pl-PL", "title": "Polski"}},
+    ]
+    _assert(select_background_audio_stream_index(all_polish_audio) == 0, "all-Polish audio should fall back to first track")
+    messages.append("audio stream selection: OK")
 
     sibling_test_dir = app_dir.parent / "TEST"
     sibling_final_dir = app_dir.parent / "FINAL"
@@ -1634,6 +1681,16 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(sanitize_lektor_delay_ms(5000) == MAX_LEKTOR_DELAY_MS, "lektor delay should clamp to maximum")
     extract_audio_text = " ".join(str(part) for part in extract_primary_audio_command(Path("ffmpeg.exe"), Path("film.mkv"), Path("source_audio.wav")))
     _assert("-map 0:a:0" in extract_audio_text and "-c:a pcm_s16le" in extract_audio_text, "primary audio extraction should decode the selected background stream to PCM")
+    extract_second_audio_text = " ".join(
+        str(part)
+        for part in extract_primary_audio_command(
+            Path("ffmpeg.exe"),
+            Path("film.mkv"),
+            Path("source_audio.wav"),
+            audio_stream_index=1,
+        )
+    )
+    _assert("-map 0:a:1" in extract_second_audio_text, "primary audio extraction should support selected background stream index")
     _assert("asetpts=PTS-STARTPTS" in extract_audio_text and "first_pts=0" not in extract_audio_text, "primary audio extraction should normalize timestamps without async padding")
     _assert(
         audio_stream_summary({"codec_name": "eac3", "channels": 6, "channel_layout": "5.1", "sample_rate": "48000"})
@@ -2996,6 +3053,11 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(BINARY_LOOKUP_HINT not in confirm, "preflight should not show binary hint when tools are present")
     confirm_missing_tools = build_start_confirmation_text("Edge TTS", 2, 1, True, "256k", 0, False, False, False)
     _assert(BINARY_LOOKUP_HINT in confirm_missing_tools, "preflight should show binary hint when tools are missing")
+    missing_tools_message = missing_media_tools_message(("mkvmerge.exe", "ffmpeg.exe", "ffprobe.exe"))
+    _assert("- ffmpeg.exe" in missing_tools_message, "missing tools message should list ffmpeg")
+    _assert("- ffprobe.exe" in missing_tools_message, "missing tools message should list ffprobe")
+    _assert("- mkvmerge.exe" in missing_tools_message, "missing tools message should list mkvmerge")
+    _assert("GitHub" in missing_tools_message and "README" in missing_tools_message, "missing tools message should point to GitHub README")
     _assert(BINARY_LOOKUP_HINT in missing_ffmpeg_message(), "ffmpeg validation message should show lookup hint")
     _assert(BINARY_LOOKUP_HINT in missing_ffprobe_message(), "ffprobe validation message should show lookup hint")
     _assert(BINARY_LOOKUP_HINT in missing_mkvmerge_message(), "mkvmerge validation message should show lookup hint")
