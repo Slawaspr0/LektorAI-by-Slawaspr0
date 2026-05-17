@@ -124,11 +124,15 @@ from app.stt.cuda_runtime import (
 )
 from app.updater.core import (
     SOURCE_ZIP_URL,
+    cache_busted_update_url,
     check_for_updates,
     is_protected_update_path,
     is_update_available,
+    read_update_info_from_zip,
     safe_relative_path,
     update_info_from_dict,
+    update_info_matches,
+    write_local_update_info,
 )
 from app.pipeline.tts_job import (
     _build_local_engine_request,
@@ -289,6 +293,39 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(is_update_available(local_update, newer_update), "updater should detect newer build with same app version")
     same_update = update_info_from_dict(json.loads(update_json.read_text(encoding="utf-8")))
     _assert(not is_update_available(local_update, same_update), "updater should not flag identical metadata")
+    _assert(update_info_matches(local_update, same_update), "updater metadata identity should match identical update info")
+    _assert(not update_info_matches(local_update, newer_update), "updater metadata identity should reject different build id")
+    cache_busted = cache_busted_update_url(SOURCE_ZIP_URL, "build 1")
+    _assert("lektorai_build=build+1" in cache_busted, "updater cache-busted URL should include build id")
+    update_zip_probe = app_dir / "_self_test_update_package.zip"
+    update_write_probe_dir = app_dir / "_self_test_update_write"
+    try:
+        with zipfile.ZipFile(update_zip_probe, "w") as archive:
+            archive.writestr(
+                "LektorAI-main/update.json",
+                json.dumps(
+                    {
+                        "app_name": APP_NAME,
+                        "version": APP_VERSION,
+                        "build_id": "123",
+                        "zip_url": SOURCE_ZIP_URL,
+                        "remove": [],
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        zip_update = read_update_info_from_zip(update_zip_probe)
+        _assert(zip_update is not None and zip_update.build_id == "123", "updater should read metadata from source ZIP")
+        update_write_probe_dir.mkdir(parents=True, exist_ok=True)
+        write_local_update_info(update_write_probe_dir, zip_update)
+        written_update = update_info_from_dict(json.loads((update_write_probe_dir / "update.json").read_text(encoding="utf-8")))
+        _assert(update_info_matches(zip_update, written_update), "updater should write remote metadata after update")
+    finally:
+        try:
+            update_zip_probe.unlink()
+        except OSError:
+            pass
+        _cleanup_tree(update_write_probe_dir)
     _assert(safe_relative_path("app/core/version.py") == Path("app/core/version.py"), "updater safe path mismatch")
     _assert(safe_relative_path("../config.json") is None, "updater should reject parent traversal")
     _assert(is_protected_update_path(Path("logs/app.log")), "updater should protect logs")

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -197,8 +198,7 @@ def apply_update(
             temp_dir = Path(temp_name)
             zip_path = temp_dir / "update.zip"
             extracted_dir = temp_dir / "extracted"
-            write(f"Pobieranie: {remote.zip_url}")
-            download_file(remote.zip_url, zip_path, timeout_s=timeout_s, progress=write)
+            download_update_archive(remote, zip_path, timeout_s=timeout_s, log=write)
             write("Rozpakowywanie aktualizacji")
             with zipfile.ZipFile(zip_path, "r") as archive:
                 archive.extractall(extracted_dir)
@@ -206,6 +206,7 @@ def apply_update(
             write(f"Kopiowanie plikow z: {source_root}")
             copy_update_tree(source_root, app_dir, write)
             remove_obsolete_paths(app_dir, remote.remove, write)
+            write_local_update_info(app_dir, remote)
         write("Aktualizacja zakonczona.")
     if restart:
         restart_application(app_dir)
@@ -225,6 +226,79 @@ def download_file(
         progress=progress,
         timeout_s=timeout_s,
     )
+
+
+def download_update_archive(remote: UpdateInfo, target: Path, timeout_s: float = 20.0, log=None) -> None:
+    urls = [remote.zip_url]
+    cache_busted = cache_busted_update_url(remote.zip_url, remote.build_id or remote.version)
+    if cache_busted not in urls:
+        urls.append(cache_busted)
+    last_error = ""
+    for attempt, url in enumerate(urls, start=1):
+        try:
+            if target.exists():
+                target.unlink()
+            _emit_update_log(log, f"Pobieranie: {url}")
+            download_file(url, target, timeout_s=timeout_s, progress=log)
+            package_info = read_update_info_from_zip(target)
+            if package_info is None:
+                last_error = "paczka nie zawiera update.json"
+                _emit_update_log(log, f"BLAD paczki aktualizacji: {last_error}")
+                continue
+            if update_info_matches(remote, package_info):
+                return
+            last_error = (
+                f"paczka ma metadane {package_info.version} / {package_info.build_id}, "
+                f"a oczekiwano {remote.version} / {remote.build_id}"
+            )
+            _emit_update_log(log, f"BLAD paczki aktualizacji: {last_error}")
+        except Exception as exc:
+            last_error = str(exc)
+            _emit_update_log(log, f"BLAD pobierania aktualizacji (proba {attempt}): {last_error}")
+    try:
+        target.unlink()
+    except OSError:
+        pass
+    raise RuntimeError(f"Pobrana paczka aktualizacji jest nieaktualna albo uszkodzona: {last_error}")
+
+
+def read_update_info_from_zip(zip_path: Path) -> UpdateInfo | None:
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        entries = [
+            entry for entry in archive.infolist()
+            if not entry.is_dir() and Path(entry.filename.replace("\\", "/")).name == LOCAL_UPDATE_FILE
+        ]
+        if not entries:
+            return None
+        with archive.open(entries[0], "r") as source:
+            data = json.loads(source.read(1024 * 1024).decode("utf-8"))
+    return update_info_from_dict(data)
+
+
+def update_info_matches(expected: UpdateInfo, actual: UpdateInfo) -> bool:
+    if normalize_version(expected.version) != normalize_version(actual.version):
+        return False
+    if expected.build_id:
+        return expected.build_id == actual.build_id
+    return True
+
+
+def cache_busted_update_url(url: str, build_id: str) -> str:
+    parsed = urllib.parse.urlsplit(str(url))
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    query.append(("lektorai_build", str(build_id or int(time.time()))))
+    return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query)))
+
+
+def write_local_update_info(app_dir: Path, info: UpdateInfo) -> None:
+    data = dict(info.raw or {})
+    data["app_name"] = info.app_name or APP_NAME
+    data["version"] = info.version or APP_VERSION
+    data["build_id"] = info.build_id
+    data["zip_url"] = info.zip_url or SOURCE_ZIP_URL
+    data["remove"] = list(info.remove)
+    target = Path(app_dir) / LOCAL_UPDATE_FILE
+    target.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def find_update_source_root(extracted_dir: Path) -> Path:
@@ -352,6 +426,11 @@ def restart_application(app_dir: Path) -> None:
 def update_log_path(app_dir: Path) -> Path:
     stamp = datetime.now().strftime("%Y.%m.%d.%H.%M.%S")
     return Path(app_dir) / "logs" / f"update_{stamp}.log"
+
+
+def _emit_update_log(log, message: str) -> None:
+    if log is not None:
+        log(message)
 
 
 def run_updater_cli(argv: list[str] | None = None) -> int:
