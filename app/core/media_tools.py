@@ -1227,6 +1227,7 @@ def mix_lektor_stereo_audio_command(
     background_lufs: int = DEFAULT_BACKGROUND_LUFS,
     background_weight: float = DEFAULT_BACKGROUND_WEIGHT,
     bitrate: str | int | None = DEFAULT_AAC_BITRATE,
+    channel_layout: str | None = None,
 ) -> list[str]:
     bg_lufs = sanitize_lufs(background_lufs, DEFAULT_BACKGROUND_LUFS)
     bg_weight = sanitize_audio_weight(background_weight, DEFAULT_BACKGROUND_WEIGHT)

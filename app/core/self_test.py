@@ -1671,6 +1671,20 @@ def run_self_test(app_dir: Path) -> list[str]:
             bitrate="384k",
         )
     )
+    stereo_with_layout_stage_text = " ".join(
+        str(part)
+        for part in mix_lektor_stereo_audio_command(
+            Path("ffmpeg.exe"),
+            Path("source_audio.wav"),
+            Path("lektor.m4a"),
+            Path("pl_2_0.m4a"),
+            lektor_weight=2.3,
+            background_lufs=-18,
+            background_weight=1.6,
+            bitrate="384k",
+            channel_layout="7.1",
+        )
+    )
     surround_stage_text = " ".join(
         str(part)
         for part in mix_lektor_surround_audio_command(
@@ -1705,6 +1719,7 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert("normalize=0" in stereo_stage_text and "alimiter=limit=0.9:level=false:latency=1" in stereo_stage_text, "stereo mix stage should keep limiter protection")
     _assert("duration=longest" in stereo_stage_text, "stereo mix stage should keep PL audio alive for the longest input")
     _assert("-c:a aac" in stereo_stage_text and "-b:a 384k" in stereo_stage_text, "stereo mix stage should encode prepared PL audio")
+    _assert("aformat=channel_layouts=stereo" in stereo_with_layout_stage_text, "stereo mix should accept surround layout hint and still output stereo")
     _assert("pan=5.1|FL=0*c0|FR=0*c0|FC=c0" in surround_stage_text, "surround mix should place lektor only in center channel")
     _assert("FL=0.70*c0" not in surround_stage_text and "FR=0.70*c0" not in surround_stage_text, "surround mix should not spread lektor to front left/right")
     _assert("aformat=channel_layouts=7.1" in surround_71_stage_text, "7.1 surround mix should preserve 7.1 layout")
