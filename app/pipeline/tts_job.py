@@ -62,6 +62,7 @@ from app.pipeline.subtitles import (
     apply_dictionary,
     load_srt,
     load_txt_as_segment,
+    normalize_tts_text,
     save_srt,
 )
 from app.pipeline.summary import rel_path, write_run_error, write_run_summary
@@ -264,15 +265,20 @@ def _run_tts_job_prepared(
     if not segments:
         raise RuntimeError("Brak tekstu do syntezy.")
 
-    cleaned_segments = [
-        SubtitleSegment(
-            index=segment.index,
-            start_ms=segment.start_ms,
-            end_ms=segment.end_ms,
-            text=apply_dictionary(segment.text, dictionary),
+    normalize_text = _bool_config(config.get("normalize_tts_text"), True)
+    cleaned_segments = []
+    for segment in segments:
+        text = apply_dictionary(segment.text, dictionary)
+        if normalize_text:
+            text = normalize_tts_text(text)
+        cleaned_segments.append(
+            SubtitleSegment(
+                index=segment.index,
+                start_ms=segment.start_ms,
+                end_ms=segment.end_ms,
+                text=text,
+            )
         )
-        for segment in segments
-    ]
     skipped_empty_segments = [segment for segment in cleaned_segments if not segment.text.strip()]
     empty_text_count = len(skipped_empty_segments)
     processed = [segment for segment in cleaned_segments if segment.text.strip()]

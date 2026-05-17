@@ -17,6 +17,55 @@ class SubtitleSegment:
     text: str
 
 
+_TTS_TEXT_TRANSLATION = str.maketrans(
+    {
+        "\u00ab": '"',
+        "\u00bb": '"',
+        "\u201e": '"',
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u201f": '"',
+        "\u2033": '"',
+        "\u201a": "'",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u2032": "'",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\u2212": "-",
+        "\u2026": "...",
+        "\u00a0": " ",
+        "\u2007": " ",
+        "\u202f": " ",
+        "\u200b": "",
+        "\u200c": "",
+        "\u200d": "",
+        "\ufeff": "",
+    }
+)
+
+_TTS_MOJIBAKE_REPLACEMENTS = (
+    ("â€ž", '"'),
+    ("â€œ", '"'),
+    ("â€", '"'),
+    ("â€™", "'"),
+    ("â€˜", "'"),
+    ("â€“", "-"),
+    ("â€”", "-"),
+    ("â€¦", "..."),
+    ("Ã¢â‚¬â„¢", "'"),
+)
+
+_TTS_BAD_ENCODING_ARTIFACTS = (
+    "\ufffd",
+    "Ã‚",
+    "Ãƒ",
+    "Ã…",
+    "Ä¹",
+)
+
+
 def apply_dictionary(text: str, dictionary: dict[str, str]) -> str:
     text = clean_subtitle_text(text)
     rules = sorted(dictionary.items(), key=lambda item: (-len(str(item[0])), str(item[0]).lower()))
@@ -47,6 +96,30 @@ def clean_subtitle_text(text: str) -> str:
 
 def normalize_subtitle_spacing(text: str) -> str:
     return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def normalize_tts_text(text: str) -> str:
+    text = html.unescape(str(text))
+    for source, replacement in _TTS_MOJIBAKE_REPLACEMENTS:
+        text = text.replace(source, replacement)
+    for artifact in _TTS_BAD_ENCODING_ARTIFACTS:
+        text = text.replace(artifact, "")
+    text = re.sub(r"\\+[NnHh]", " ", text)
+    text = re.sub(r"\{\\[^}]+\}", " ", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\[[^\]]*\]", " ", text)
+    text = re.sub(r"\((?:jap\.?|niem\.?|ang\.?|fr\.?|hiszp\.?|wlos\.?|ros\.?|po [^)]+)\)", " ", text, flags=re.IGNORECASE)
+    text = text.translate(_TTS_TEXT_TRANSLATION)
+    text = re.sub(r"^\s*[\-–—]\s*", "", text)
+    text = re.sub(r"^\s*[\w .'\-ĄĆĘŁŃÓŚŹŻąćęłńóśźż]{2,40}:\s*", "", text)
+    text = re.sub(r"\s*&\s*", " i ", text)
+    text = re.sub(r"(?:->|←|→|↑|↓|↔|⇒|⇐|⇑|⇓|➜|➡)", " ", text)
+    text = re.sub(r"[♪♫♬★•◆●■□▲▼♦♣♠♥✓✔✕✖]", " ", text)
+    text = re.sub(r"\s*(?:\.{3,})\s*$", "", text)
+    text = re.sub(r"\s*(?:\.{3,})\s*", ", ", text)
+    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
+    text = re.sub(r"([,.!?;:])(?=\S)", r"\1 ", text)
+    return normalize_subtitle_spacing(text)
 
 
 def load_srt(path: Path) -> list[SubtitleSegment]:

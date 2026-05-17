@@ -143,6 +143,13 @@ OPEN_WORKSPACE_FIELD = ConfigField(
     "Po zakonczeniu otwiera folder roboczy LektorAI z wynikiem.",
 )
 
+TTS_TEXT_CLEANUP_FIELD = ConfigField(
+    "normalize_tts_text",
+    "Czyszczenie tekstu",
+    "bool",
+    "Zamienia nietypowe znaki z napisow na bezpieczne odpowiedniki przed generowaniem mowy.",
+)
+
 
 CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
     "edge": (
@@ -152,6 +159,7 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
         ConfigField("edge_apply_segment_fade", "Przytnij i wygladz brzegi", "bool", "Po wlaczeniu przycina poczatek i koniec pliku lektora o podane przez uzytkownika wartosci."),
         ConfigField("edge_trim_start_ms", "Utnij poczatek (ms)", "int", "Ile milisekund uciac z poczatku pliku lektora.", 0, 1000, 1),
         ConfigField("edge_trim_end_ms", "Utnij koniec (ms)", "int", "Ile milisekund uciac z konca pliku lektora.", 0, 2000, 1),
+        TTS_TEXT_CLEANUP_FIELD,
         OPEN_WORKSPACE_FIELD,
         *DIAGNOSTIC_OUTPUT_FIELDS,
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
@@ -168,6 +176,7 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
         ConfigField("instructions", "Instrukcja glosu", "str", "Instrukcja stylu mowy dla modelu TTS, np. spokojny polski lektor."),
         ConfigField("audio_qc_enabled", "Wlacz kontrole audio", "bool", "Wlacza techniczna kontrole pliku audio: cisza, dlugosc segmentu, glosny poczatek lub koniec, clipping i podobne artefakty."),
         ConfigField("audio_qc_retry_attempts", "Liczba prob kontroli audio", "int", "Maksymalna liczba prob generowania segmentu, jesli kontrola audio wykryje podejrzany wynik.", 1, 5, 1),
+        TTS_TEXT_CLEANUP_FIELD,
         OPEN_WORKSPACE_FIELD,
         *DIAGNOSTIC_OUTPUT_FIELDS,
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
@@ -213,6 +222,7 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
             0.05,
         ),
         ConfigField("seed", "Seed", "int", "Opcjonalne ziarno losowosci. Stala wartosc pomaga powtarzalnosci, puste pole zostawia domyslne zachowanie.", 0, 2147483647, 1, visible=False),
+        TTS_TEXT_CLEANUP_FIELD,
         OPEN_WORKSPACE_FIELD,
         *DIAGNOSTIC_OUTPUT_FIELDS,
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
@@ -257,6 +267,7 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
         ConfigField("preprocess_prompt", "Przygotuj probke", "bool", "Ukryte ustawienie techniczne. W LektorAI domyslnie wylaczone, bo uzytkownik ma dostarczyc gotowa, dobra probke glosu.", visible=False),
         ConfigField("postprocess_output", "Wyczysc wynik", "bool", "Ukryte ustawienie techniczne. W LektorAI domyslnie wylaczone, bo fabryczne usuwanie ciszy OmniVoice potrafi ucinac koncowki slow.", visible=False),
         ConfigField("omnivoice_trim_edges", "Wycinanie ciszy na brzegach", "bool", "Po wlaczeniu program ostroznie wykrywa poczatek i koniec mowy, usuwa nadmiar ciszy/szumu tylko z brzegow segmentu i zostawia zapas, zeby nie uciac lektora."),
+        TTS_TEXT_CLEANUP_FIELD,
         OPEN_WORKSPACE_FIELD,
         *DIAGNOSTIC_OUTPUT_FIELDS,
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
@@ -296,6 +307,7 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
             0.01,
         ),
         ConfigField("speaker_id", "Speaker ID", "int", "Ukryte ustawienie techniczne dla modeli wielomowcowych. Polskie glosy Piper sa jednomowcowe, wiec zostaje 0.", 0, 999, 1, visible=False),
+        TTS_TEXT_CLEANUP_FIELD,
         OPEN_WORKSPACE_FIELD,
         *DIAGNOSTIC_OUTPUT_FIELDS,
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
@@ -341,6 +353,7 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
             "bool",
             "Po wlaczeniu program usuwa nadmiar ciszy z poczatku i konca segmentu Supertonic, zostawiajac krotki zapas przy mowie.",
         ),
+        TTS_TEXT_CLEANUP_FIELD,
         OPEN_WORKSPACE_FIELD,
         *DIAGNOSTIC_OUTPUT_FIELDS,
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),
@@ -418,6 +431,7 @@ CONFIG_SCHEMAS: dict[str, tuple[ConfigField, ...]] = {
             0.01,
         ),
         ConfigField("xtts_trim_trailing_silence", "Wycinanie koncowej ciszy", "bool", "Po wlaczeniu program usuwa dluga cisze z konca segmentu XTTS, zostawia okolo 120 ms zapasu i dodaje krotkie wygladzenie, zeby nie uciac lektora."),
+        TTS_TEXT_CLEANUP_FIELD,
         OPEN_WORKSPACE_FIELD,
         *DIAGNOSTIC_OUTPUT_FIELDS,
         ConfigField("whisper_qc_enabled", "Wlacz kontrole mowy", "bool", "Program sprawdza czy lektor powiedzial to co znajduje sie w napisach."),

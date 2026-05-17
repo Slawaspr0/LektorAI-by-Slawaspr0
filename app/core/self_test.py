@@ -99,6 +99,7 @@ from app.pipeline.subtitles import (
     apply_dictionary,
     clean_subtitle_text,
     load_srt,
+    normalize_tts_text,
     save_srt,
 )
 from app.pipeline.whisper_qc import (
@@ -1419,6 +1420,10 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(replaced == "bat man", f"dictionary apply mismatch: {replaced!r}")
     literal_replaced = apply_dictionary("Batman", {"batman": r"bat\man"})
     _assert(literal_replaced == r"bat\man", f"dictionary replacement should be literal: {literal_replaced!r}")
+    tts_normalized = normalize_tts_text("„Cześć” — powiedział…\u00a0OK")
+    _assert(tts_normalized == '"Cześć" - powiedział, OK', f"TTS text normalization mismatch: {tts_normalized!r}")
+    noisy_tts_text = normalize_tts_text(r"{\an8}<i>[muzyka]</i>\h JAN: „Cześć”… & patrz -> ★")
+    _assert(noisy_tts_text == '"Cześć", i patrz', f"TTS noisy text cleanup mismatch: {noisy_tts_text!r}")
     messages.append("subtitle cleanup/dictionary: OK")
 
     sanitized, skipped = sanitize_dictionary(
@@ -1739,6 +1744,11 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(
             field_labels.get("open_workspace_on_finish") == "Otworz folder po pracy",
             f"{engine_id} open workspace label should be user friendly",
+        )
+        _assert(defaults[engine_id].get("normalize_tts_text") is True, f"{engine_id} text cleanup default should be enabled")
+        _assert(
+            field_labels.get("normalize_tts_text") == "Czyszczenie tekstu",
+            f"{engine_id} text cleanup label should be user friendly",
         )
         if engine_id in {"edge", "chatterbox", "omnivoice", "piper", "coqui_xtts", "supertonic"}:
             _assert("audio_qc_enabled" not in field_labels, f"{engine_id} Audio QC should not be exposed in TTS settings")
