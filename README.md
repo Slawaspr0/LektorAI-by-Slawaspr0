@@ -125,6 +125,14 @@ Aktualne silniki STT:
 
 Lokalne silniki mają osobne środowiska i osobne foldery. Dzięki temu jeden model nie powinien psuć zależności drugiego modelu.
 
+## Wybór ścieżki audio w filmie
+
+Jeżeli film ma jedną ścieżkę audio, program użyje jej jako tła dla lektora.
+
+Jeżeli film ma kilka ścieżek audio, program wybierze pierwszą ścieżkę, która nie jest oznaczona jako polska. Dzięki temu przy plikach zawierających np. oryginalny dźwięk i polski dubbing lektor powinien zostać przygotowany na oryginalnej ścieżce.
+
+Przy plikach z wieloma ścieżkami audio warto zadbać o poprawne tagi języka w kontenerze MKV. Jeśli obca ścieżka jest błędnie oznaczona jako polska, program może potraktować ją jak polski dubbing.
+
 ## Jak przygotować materiał, żeby lektor brzmiał dobrze?
 
 Dwa elementy są najważniejsze:

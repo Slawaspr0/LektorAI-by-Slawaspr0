@@ -15,7 +15,7 @@ from app.core.dictionary import sanitize_dictionary, save_dictionary
 from app.core.config import AppConfigStore
 from app.core.diagnostics import collect_diagnostics
 from app.core.download import progress_percent_step_for_size
-from app.core.gpu_devices import build_device_choices
+from app.core.gpu_devices import build_device_choices, detect_cuda_devices
 from app.core.logging import app_log_path, broken_json_backup_path, engine_log_path, safe_name, setup_app_logger
 from app.core.log_cleanup import cleanup_logs, preview_log_cleanup
 from app.core.media_tools import (
@@ -32,6 +32,7 @@ from app.core.media_tools import (
     find_mkvmerge,
     find_ffprobe,
     encode_wav_to_aac_command,
+    mix_lektor_stereo_and_surround_audio_command,
     mix_lektor_stereo_audio_command,
     mix_lektor_surround_audio_command,
     normalize_lektor_wav,
@@ -74,6 +75,7 @@ from app.engines.voice_sample_rules import (
 )
 from app.engines.install_specs import INSTALL_SPECS, TORCH_CU126_INDEX, TORCH_CU128_INDEX, get_install_spec, list_install_variants
 from app.engines.manager import EngineManager, should_recreate_venv
+import app.engines.manager as engine_manager_module
 from app.engines.protocol import (
     EngineRequest,
     EngineResult,
@@ -144,6 +146,7 @@ from app.pipeline.tts_job import (
     _find_sidecar_subtitles,
     _format_builtin_qc_retry_message,
     _format_builtin_qc_selected_message,
+    _format_short_qc_retry_message,
     _edge_retry_text,
     _edge_retry_text_variants,
     _aggregate_segment_analysis,
@@ -161,7 +164,10 @@ from app.pipeline.tts_job import (
     _model_activity_message_for_worker_line,
     _quality_chain_label,
     _quality_controls_summary,
+    _should_encode_standalone_lektor_audio,
+    _should_run_final_audio_qc,
     _validated_worker_generated_audio,
+    PipelineTimings,
     local_worker_timeout_seconds,
     run_tts_job,
 )
@@ -793,6 +799,7 @@ def run_self_test(app_dir: Path) -> list[str]:
             "bin",
             "tools",
             "packages",
+            "napisy_testowe_wymowa_lektora_40.srt",
         }
         unexpected_test_items = sorted(
             child.name
@@ -806,6 +813,8 @@ def run_self_test(app_dir: Path) -> list[str]:
         messages.append("test package layout: OK")
 
     _assert("chatterbox_onnx_pl" not in INSTALL_SPECS, "archived Chatterbox ONNX PL should not be installable")
+    _assert("fish_speech" not in INSTALL_SPECS, "archived Fish Speech should not be installable")
+    _assert("vibevoice" not in INSTALL_SPECS, "archived VibeVoice should not be installable")
     local_specs = {engine_id: get_install_spec(engine_id) for engine_id in ("chatterbox", "omnivoice", "piper", "coqui_xtts", "supertonic")}
     for engine_id, spec in local_specs.items():
         _assert(spec.engine_id == engine_id, f"{engine_id} install spec id mismatch")
@@ -883,7 +892,9 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(any(state.definition.engine_id == "piper" for state in states), "missing piper definition")
     _assert(any(state.definition.engine_id == "coqui_xtts" for state in states), "missing coqui XTTS definition")
     _assert(any(state.definition.engine_id == "supertonic" for state in states), "missing Supertonic definition")
+    _assert("fish_speech" not in engine_ids, "archived Fish Speech should not be listed as active engine")
     _assert("f5_tts" not in engine_ids, "archived F5-TTS should not be listed as active engine")
+    _assert("vibevoice" not in engine_ids, "archived VibeVoice should not be listed as active engine")
     for state in states:
         if state.definition.engine_id in {"chatterbox", "omnivoice", "piper", "coqui_xtts", "supertonic"}:
             install_checks = set(get_install_spec(state.definition.engine_id).import_checks)
@@ -1044,8 +1055,10 @@ def run_self_test(app_dir: Path) -> list[str]:
             supertonic_dir / "requirements.txt",
             supertonic_dir / "constraints.txt",
         )
-        _assert(uv_command[:3] == ["uv", "pip", "install"], "uv package install command should use uv pip install")
+        _assert(uv_command[1:4] == ["-m", "uv", "pip"], "uv package install command should use engine python module")
         _assert("--python" in uv_command, "uv package install command should target engine venv")
+        uv_bootstrap_command = install_preview_manager._uv_bootstrap_command(supertonic_dir / "venv" / "Scripts" / "python.exe")
+        _assert(uv_bootstrap_command[-1] == "uv", "uv bootstrap command should install uv into engine venv")
         for engine_id in ("chatterbox", "coqui_xtts"):
             cu128_preview = "\n".join(install_preview_manager.local_install_preview(engine_id, torch_variant="cu128"))
             _assert("PyTorch CU128" in cu128_preview, f"{engine_id} CU128 preview missing variant label")
@@ -1070,6 +1083,7 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert("PyTorch CUDA:" not in supertonic_preview, "supertonic install preview should not show torch section")
         _assert("PyTorch: nie wymagany" in supertonic_preview, "supertonic install preview should explain missing torch section")
         _assert("supertonic" in supertonic_preview, "supertonic install preview missing supertonic package")
+        _cleanup_tree(install_preview_dir)
         build_tools_command = install_preview_manager._build_tools_install_command(Path("python.exe"))
         _assert("--upgrade" not in build_tools_command, "build tools install should not upgrade pip on every retry")
         _assert("wheel" in build_tools_command and "setuptools" in build_tools_command, "build tools command missing expected packages")
@@ -1585,7 +1599,6 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert(not omnivoice_mp3_errors, "omnivoice should accept MP3 voice samples")
         coqui_mp3_errors = validate_engine_config("coqui_xtts", {"speaker_wav_path": str(optional_mp3_probe)})
         _assert(not coqui_mp3_errors, "coqui XTTS should accept MP3 voice samples")
-        _assert(not coqui_mp3_errors, "coqui XTTS should accept MP3 voice samples")
     finally:
         for probe in (optional_audio_probe, optional_mp3_probe, optional_flac_probe):
             try:
@@ -1782,6 +1795,25 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert("aformat=channel_layouts=7.1" in surround_71_stage_text, "7.1 surround mix should preserve 7.1 layout")
     _assert("pan=7.1|FL=0*c0|FR=0*c0|FC=c0" in surround_71_stage_text, "7.1 surround mix should place lektor only in center channel")
     _assert("BL=0*c0|BR=0*c0" in surround_71_stage_text and "SL=0*c0|SR=0*c0" in surround_71_stage_text, "7.1 surround mix should keep lektor out of side and back channels")
+    combined_mix_text = " ".join(
+        str(part)
+        for part in mix_lektor_stereo_and_surround_audio_command(
+            Path("ffmpeg.exe"),
+            Path("source_audio.wav"),
+            Path("lektor.wav"),
+            Path("pl_2_0.m4a"),
+            Path("pl_7_1.m4a"),
+            lektor_weight=2.3,
+            background_lufs=-18,
+            background_weight=1.6,
+            bitrate="384k",
+            channel_layout="7.1",
+        )
+    )
+    _assert("pl_2_0.m4a" in combined_mix_text and "pl_7_1.m4a" in combined_mix_text, "combined mix should create stereo and surround outputs in one ffmpeg command")
+    _assert(combined_mix_text.count("-filter_complex") == 1, "combined mix should use one filter graph")
+    _assert("[lektor_pl_2_0]" in combined_mix_text and "[lektor_pl_7_1]" in combined_mix_text, "combined mix should expose both prepared track labels")
+    _assert("asplit=2" in combined_mix_text, "combined mix should split decoded streams instead of running two separate commands")
     mkvmerge_remux_text = " ".join(
         str(part)
         for part in remux_with_prepared_lektor_audio_mkvmerge_command(
@@ -1809,6 +1841,12 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert("chatterbox_onnx_pl" not in defaults, "archived Chatterbox ONNX PL should not have active defaults")
     _assert(fields_for("chatterbox_onnx_pl") == (), "archived Chatterbox ONNX PL should not expose config fields")
     _assert(visible_fields_for("chatterbox_onnx_pl") == (), "archived Chatterbox ONNX PL should not expose visible config fields")
+    _assert("fish_speech" not in defaults, "archived Fish Speech should not have active defaults")
+    _assert(fields_for("fish_speech") == (), "archived Fish Speech should not expose config fields")
+    _assert(visible_fields_for("fish_speech") == (), "archived Fish Speech should not expose visible config fields")
+    _assert("vibevoice" not in defaults, "archived VibeVoice should not have active defaults")
+    _assert(fields_for("vibevoice") == (), "archived VibeVoice should not expose config fields")
+    _assert(visible_fields_for("vibevoice") == (), "archived VibeVoice should not expose visible config fields")
     for engine_id in ("edge", "openai", "chatterbox", "omnivoice", "piper", "coqui_xtts", "supertonic"):
         field_map = {field.key: field for field in fields_for(engine_id)}
         field_labels = {field.key: field.label for field in fields_for(engine_id)}
@@ -1892,6 +1930,28 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert("RTX 3090" in gpu_choices.labels[2] and "24.0 GB" in gpu_choices.labels[2], "GPU choice labels should show card name and VRAM")
     stt_gpu_choices = build_device_choices(({"index": 1, "name": "NVIDIA RTX 3090", "total_memory": 25769803776},), include_auto=False)
     _assert(stt_gpu_choices.values == ("cpu", "cuda:1"), "STT choices should default to CPU without auto")
+    detector_calls: list[str] = []
+    fast_devices = detect_cuda_devices(
+        prefer_nvidia_smi=True,
+        torch_detector=lambda *_args, **_kwargs: detector_calls.append("torch") or (),
+        smi_detector=lambda **_kwargs: detector_calls.append("smi") or ({"index": 0, "name": "Fast GPU", "total_memory": 8589934592},),
+    )
+    _assert(fast_devices == ({"index": 0, "name": "Fast GPU", "total_memory": 8589934592},), "Fast GUI GPU detection should use nvidia-smi devices")
+    _assert(detector_calls == ["smi"], "Fast GUI GPU detection should not import torch when nvidia-smi works")
+    original_detect_cuda_devices = engine_manager_module.detect_cuda_devices
+    try:
+        manager_detector_calls: list[bool] = []
+
+        def fake_detect_cuda_devices(_python_path, **kwargs):
+            manager_detector_calls.append(bool(kwargs.get("prefer_nvidia_smi")))
+            return ({"index": 0, "name": "Fast GPU", "total_memory": 8589934592},)
+
+        engine_manager_module.detect_cuda_devices = fake_detect_cuda_devices
+        manager_choices = EngineManager(paths).torch_device_choices("chatterbox", include_auto=True)
+    finally:
+        engine_manager_module.detect_cuda_devices = original_detect_cuda_devices
+    _assert(manager_detector_calls == [True], "TTS settings GPU choices should use fast nvidia-smi-first detection")
+    _assert(manager_choices.values == ("auto", "cpu", "cuda:0"), "TTS settings GPU choices should include fast-detected GPU")
     for engine_id in ("chatterbox",):
         _assert("seed" in {field.key for field in fields_for(engine_id)}, f"{engine_id} seed should stay in config schema")
         _assert("seed" not in {field.key for field in visible_fields_for(engine_id)}, f"{engine_id} seed should be hidden from UI")
@@ -2103,6 +2163,19 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(
         local_piper_retry_message == "Whisper QC - segment 12/216, proba 2/5, score: 45",
         f"local Piper retry UI message mismatch: {local_piper_retry_message}",
+    )
+    builtin_short_retry_message = _format_short_qc_retry_message(
+        "Edge",
+        "kontrola mowy",
+        28,
+        40,
+        2,
+        5,
+        score=15,
+    )
+    _assert(
+        builtin_short_retry_message == "Whisper QC - segment 28/40, proba 2/5, score: 15",
+        f"built-in short retry UI message mismatch: {builtin_short_retry_message}",
     )
     builtin_selected_message = _format_builtin_qc_selected_message(
         "Edge",
@@ -2482,6 +2555,21 @@ def run_self_test(app_dir: Path) -> list[str]:
                 _assert(audio_qc.exists() is keep_technical_reports, "Audio QC report should follow technical reports option")
         finally:
             _cleanup_tree(report_cleanup_dir)
+        _assert(not _should_run_final_audio_qc({}, ffmpeg_present=True), "final Audio QC should be skipped when diagnostics are disabled")
+        _assert(_should_run_final_audio_qc({"save_run_reports": True}, ffmpeg_present=True), "final Audio QC should run for technical reports")
+        _assert(_should_run_final_audio_qc({"save_quality_report": True}, ffmpeg_present=True), "final Audio QC should run for quality report")
+        _assert(not _should_run_final_audio_qc({"save_run_reports": True}, ffmpeg_present=False), "final Audio QC should still require ffmpeg")
+        _assert(_should_encode_standalone_lektor_audio(Path("dialog.srt"), {}), "audio-only jobs should encode standalone lektor track")
+        _assert(not _should_encode_standalone_lektor_audio(Path("film.mkv"), {}), "video jobs should skip standalone M4A when mix steps are not saved")
+        _assert(_should_encode_standalone_lektor_audio(Path("film.mkv"), {"save_audio_mix_steps": True}), "video diagnostics should keep standalone M4A")
+        timings = PipelineTimings()
+        timings.add("TTS", 1.234)
+        timings.add("TTS", 0.766)
+        timings.add("Miks MKV", 2.0)
+        timing_lines = timings.summary_lines()
+        _assert(timings.as_dict()["TTS"] == 2.0, "pipeline timings should accumulate repeated stages")
+        _assert(timing_lines[0] == "Czasy etapow:", "pipeline timings should start with a compact header")
+        _assert(any("TTS: 2s" in line for line in timing_lines), "pipeline timings should format short seconds")
         result_path.write_text(
             json.dumps(
                 {
@@ -2747,6 +2835,13 @@ def run_self_test(app_dir: Path) -> list[str]:
         _assert('"lang": "pl"' in worker_template_text, "worker template should hardcode Polish Supertonic language")
         _assert("supertonic_trim_edges" in worker_template_text, "worker template should support Supertonic silence edge trimming")
         _assert("trim_supertonic_silence_edges_np" in worker_template_text, "worker template should trim Supertonic silence on both edges")
+        _assert("synthesize_vibevoice" not in worker_template_text, "archived VibeVoice should not be active in worker template")
+        _assert("microsoft/VibeVoice-Realtime-0.5B" not in worker_template_text, "archived VibeVoice model should not be active in worker template")
+        _assert("Sticzu/vibevoice-polish-voices" not in worker_template_text, "archived VibeVoice voices should not be active in worker template")
+        _assert("vibevoice_trim_edges" not in worker_template_text, "archived VibeVoice trim option should not be active in worker template")
+        _assert("synthesize_fish_speech" not in worker_template_text, "archived Fish Speech should not be active in worker template")
+        _assert("fishaudio/s2-pro" not in worker_template_text, "archived Fish Speech model should not be active in worker template")
+        _assert("ServeTTSRequest" not in worker_template_text, "archived Fish Speech inference engine should not be active in worker template")
         _assert("synthesize_f5_tts" not in worker_template_text, "archived F5-TTS should not be active in worker template")
         _assert('language="pl"' in worker_template_text, "worker template should hardcode Polish where model API supports it")
         _assert("pobieranie/ladowanie" not in worker_template_text, "worker template should not use ambiguous model activity logs")
@@ -3215,6 +3310,8 @@ def run_self_test(app_dir: Path) -> list[str]:
     _assert(should_show_vram_info_button("chatterbox"), "Chatterbox settings should show VRAM info")
     _assert(should_show_vram_info_button("omnivoice"), "OmniVoice settings should show VRAM info")
     _assert(should_show_vram_info_button("coqui_xtts"), "Coqui XTTS settings should show VRAM info")
+    _assert(not should_show_vram_info_button("vibevoice"), "archived VibeVoice settings should not show VRAM info")
+    _assert(not should_show_vram_info_button("fish_speech"), "archived Fish Speech settings should not show VRAM info")
     _assert(not should_show_vram_info_button("piper"), "Piper settings should not show VRAM info")
     _assert(not should_show_vram_info_button("edge"), "Edge settings should not show VRAM info")
     messages.append("settings dialog helpers: OK")

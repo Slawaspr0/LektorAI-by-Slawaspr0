@@ -47,11 +47,25 @@ def detect_torch_device_choices(
     return build_device_choices(detect_cuda_devices(python_executable, timeout_s=timeout_s), include_auto=include_auto)
 
 
-def detect_cuda_devices(python_executable: str | Path | None = None, *, timeout_s: int = 8) -> tuple[dict[str, Any], ...]:
-    devices = detect_torch_cuda_devices(python_executable, timeout_s=timeout_s)
+def detect_cuda_devices(
+    python_executable: str | Path | None = None,
+    *,
+    timeout_s: int = 8,
+    prefer_nvidia_smi: bool = False,
+    torch_detector=None,
+    smi_detector=None,
+) -> tuple[dict[str, Any], ...]:
+    torch_detector = torch_detector or detect_torch_cuda_devices
+    smi_detector = smi_detector or detect_nvidia_smi_cuda_devices
+    if prefer_nvidia_smi:
+        devices = smi_detector(timeout_s=timeout_s)
+        if devices:
+            return devices
+        return torch_detector(python_executable, timeout_s=timeout_s)
+    devices = torch_detector(python_executable, timeout_s=timeout_s)
     if devices:
         return devices
-    return detect_nvidia_smi_cuda_devices(timeout_s=timeout_s)
+    return smi_detector(timeout_s=timeout_s)
 
 
 def detect_torch_cuda_devices(python_executable: str | Path | None = None, *, timeout_s: int = 8) -> tuple[dict[str, Any], ...]:

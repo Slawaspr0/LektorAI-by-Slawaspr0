@@ -36,6 +36,9 @@ class EngineInstallSpec:
     import_checks: tuple[str, ...] = ()
     torch_index_url: str = TORCH_CU126_INDEX
     package_installer: str = "pip"
+    local_repo_folder: str = ""
+    editable_git_url: str = ""
+    editable_extra: str = ""
 
 
 @dataclass(frozen=True)

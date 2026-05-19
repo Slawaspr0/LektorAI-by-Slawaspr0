@@ -1139,7 +1139,29 @@ def mux_lektor_track(
                     tail = "\n".join((extract_result.output or "").splitlines()[-24:])
                     raise RuntimeError(f"Nie udalo sie wyciagnac sciezki audio tla.\n{tail}")
             mix_duration = probe_media_duration(ffprobe, video_path)
-            if create_stereo_track:
+            if create_stereo_track and create_surround_track:
+                combined_command = mix_lektor_stereo_and_surround_audio_command(
+                    ffmpeg,
+                    source_audio_path,
+                    lektor_audio,
+                    pl_stereo_path,
+                    pl_surround_path,
+                    lektor_weight=lektor_weight,
+                    background_lufs=background_lufs,
+                    background_weight=background_weight,
+                    bitrate=bitrate,
+                    channel_layout=surround_label,
+                )
+                if progress_callback is not None:
+                    _run_stage_with_progress(combined_command, mix_duration, progress_callback, 0.05, 0.85, timeout=3600, cancel_requested=cancel_requested)
+                else:
+                    combined_result = _run_command_capture_text(combined_command, timeout=3600, cancel_requested=cancel_requested)
+                    if combined_result.returncode != 0:
+                        tail = "\n".join((combined_result.output or "").splitlines()[-80:])
+                        raise RuntimeError(f"Nie udalo sie przygotowac sciezek PL 2.0 i PL {surround_label}.\n{tail}")
+                prepared_tracks.extend((pl_stereo_path, pl_surround_path))
+                prepared_labels.extend(("2.0", surround_label))
+            elif create_stereo_track:
                 stereo_command = mix_lektor_stereo_audio_command(
                     ffmpeg,
                     source_audio_path,
@@ -1161,7 +1183,7 @@ def mux_lektor_track(
                         raise RuntimeError(f"Nie udalo sie przygotowac sciezki PL 2.0.\n{tail}")
                 prepared_tracks.append(pl_stereo_path)
                 prepared_labels.append("2.0")
-            if create_surround_track:
+            elif create_surround_track:
                 surround_command = mix_lektor_surround_audio_command(
                     ffmpeg,
                     source_audio_path,
@@ -1406,6 +1428,79 @@ def mix_lektor_surround_audio_command(
         "-b:a",
         sanitize_aac_bitrate(bitrate),
         str(output_audio),
+    ]
+
+
+def mix_lektor_stereo_and_surround_audio_command(
+    ffmpeg: Path,
+    background_audio: Path,
+    lektor_m4a: Path,
+    stereo_output_audio: Path,
+    surround_output_audio: Path,
+    lektor_weight: float = DEFAULT_LEKTOR_WEIGHT,
+    background_lufs: int = DEFAULT_BACKGROUND_LUFS,
+    background_weight: float = DEFAULT_BACKGROUND_WEIGHT,
+    bitrate: str | int | None = DEFAULT_AAC_BITRATE,
+    channel_layout: str = "5.1",
+) -> list[str]:
+    bg_lufs = sanitize_lufs(background_lufs, DEFAULT_BACKGROUND_LUFS)
+    bg_weight = sanitize_audio_weight(background_weight, DEFAULT_BACKGROUND_WEIGHT)
+    lector_weight = sanitize_audio_weight(lektor_weight, DEFAULT_LEKTOR_WEIGHT)
+    bg_gain, lector_gain = _overlay_mix_gains(bg_weight, lector_weight)
+    limiter = _mix_limiter_filter()
+    layout = "7.1" if str(channel_layout).strip() == "7.1" else "5.1"
+    suffix = layout.replace(".", "_")
+    bg_label = f"bg{suffix.replace('_', '')}"
+    lector_label = f"lector{suffix.replace('_', '')}"
+    surround_output_label = f"lektor_pl_{suffix}"
+    if layout == "7.1":
+        pan_filter = "pan=7.1|FL=0*c0|FR=0*c0|FC=c0|LFE=0*c0|BL=0*c0|BR=0*c0|SL=0*c0|SR=0*c0"
+    else:
+        pan_filter = "pan=5.1|FL=0*c0|FR=0*c0|FC=c0|LFE=0*c0|BL=0*c0|BR=0*c0"
+    aac_bitrate = sanitize_aac_bitrate(bitrate)
+    filter_complex = ";".join(
+        [
+            f"[0:a:0]asetpts=PTS-STARTPTS,aresample={OUTPUT_AUDIO_SAMPLE_RATE},loudnorm=I={bg_lufs}:TP={LOUDNORM_TRUE_PEAK},volume={bg_gain},asplit=2[bg_for_stereo][bg_for_surround]",
+            f"[bg_for_stereo]aformat=channel_layouts=stereo[bg20]",
+            f"[bg_for_surround]aformat=channel_layouts={layout}[{bg_label}]",
+            f"[1:a:0]asetpts=PTS-STARTPTS,aresample={OUTPUT_AUDIO_SAMPLE_RATE},asplit=2[lector_for_stereo][lector_for_surround]",
+            f"[lector_for_stereo]aformat=channel_layouts=stereo,volume={lector_gain}[lector20]",
+            f"[lector_for_surround]aformat=channel_layouts=mono,volume={lector_gain}[lector_mono]",
+            f"[lector_mono]{pan_filter}[{lector_label}]",
+            f"[bg20][lector20]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,{limiter}[lektor_pl_2_0]",
+            f"[{bg_label}][{lector_label}]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,{limiter}[{surround_output_label}]",
+        ]
+    )
+    return [
+        str(ffmpeg),
+        "-hide_banner",
+        "-y",
+        "-i",
+        str(background_audio),
+        "-i",
+        str(lektor_m4a),
+        "-map_metadata",
+        "-1",
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[lektor_pl_2_0]",
+        "-c:a",
+        "aac",
+        "-ar",
+        str(OUTPUT_AUDIO_SAMPLE_RATE),
+        "-b:a",
+        aac_bitrate,
+        str(stereo_output_audio),
+        "-map",
+        f"[{surround_output_label}]",
+        "-c:a",
+        "aac",
+        "-ar",
+        str(OUTPUT_AUDIO_SAMPLE_RATE),
+        "-b:a",
+        aac_bitrate,
+        str(surround_output_audio),
     ]
 
 

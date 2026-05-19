@@ -7,6 +7,7 @@ import re
 import shutil
 import traceback
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -94,6 +95,36 @@ DETERMINISTIC_RETRY_ENGINES = {"piper", "supertonic"}
 PUNCTUATION_RETRY_ENGINES = {"piper", "supertonic"}
 
 EDGE_TRIM_FADE_MS = 12
+
+
+class PipelineTimings:
+    def __init__(self) -> None:
+        self._seconds: dict[str, float] = {}
+
+    @contextmanager
+    def measure(self, label: str):
+        started = perf_counter()
+        try:
+            yield
+        finally:
+            self.add(label, perf_counter() - started)
+
+    def add(self, label: str, seconds: float) -> None:
+        name = str(label or "").strip()
+        if not name:
+            return
+        self._seconds[name] = self._seconds.get(name, 0.0) + max(0.0, float(seconds))
+
+    def as_dict(self) -> dict[str, float]:
+        return {label: round(value, 3) for label, value in self._seconds.items()}
+
+    def summary_lines(self) -> list[str]:
+        if not self._seconds:
+            return []
+        lines = ["Czasy etapow:"]
+        for label, seconds in self._seconds.items():
+            lines.append(f"{label}: {_format_duration_seconds(seconds)}")
+        return lines
 
 
 def local_worker_timeout_seconds() -> int:
@@ -258,61 +289,64 @@ def _run_tts_job_prepared(
 ) -> TTSJobResult:
     _raise_if_cancelled(cancel_requested)
     diagnostics = _diagnostic_keep_flags(config, keep_lektor_assets)
-    source_duration, source_audio_streams = _source_media_diagnostics(source_path, paths)
-    if is_video_file(source_path):
-        progress(_format_source_media_message(source_duration, source_audio_streams))
-    input_subtitle_path = _prepare_input_subtitles(source_path, paths, lektor_dir, progress, cancel_requested=cancel_requested)
-    _raise_if_cancelled(cancel_requested)
-    segments = _load_segments(input_subtitle_path)
-    if not segments:
-        raise RuntimeError("Brak tekstu do syntezy.")
+    timings = PipelineTimings()
+    with timings.measure("Przygotowanie"):
+        source_duration, source_audio_streams = _source_media_diagnostics(source_path, paths)
+        if is_video_file(source_path):
+            progress(_format_source_media_message(source_duration, source_audio_streams))
+        input_subtitle_path = _prepare_input_subtitles(source_path, paths, lektor_dir, progress, cancel_requested=cancel_requested)
+        _raise_if_cancelled(cancel_requested)
+        segments = _load_segments(input_subtitle_path)
+        if not segments:
+            raise RuntimeError("Brak tekstu do syntezy.")
 
-    normalize_text = _bool_config(config.get("normalize_tts_text"), True)
-    cleaned_segments = []
-    for segment in segments:
-        text = apply_dictionary(segment.text, dictionary)
-        if normalize_text:
-            text = normalize_tts_text(text)
-        cleaned_segments.append(
-            SubtitleSegment(
-                index=segment.index,
-                start_ms=segment.start_ms,
-                end_ms=segment.end_ms,
-                text=text,
+        normalize_text = _bool_config(config.get("normalize_tts_text"), True)
+        cleaned_segments = []
+        for segment in segments:
+            text = apply_dictionary(segment.text, dictionary)
+            if normalize_text:
+                text = normalize_tts_text(text)
+            cleaned_segments.append(
+                SubtitleSegment(
+                    index=segment.index,
+                    start_ms=segment.start_ms,
+                    end_ms=segment.end_ms,
+                    text=text,
+                )
             )
-        )
-    skipped_empty_segments = [segment for segment in cleaned_segments if not segment.text.strip()]
-    empty_text_count = len(skipped_empty_segments)
-    processed = [segment for segment in cleaned_segments if segment.text.strip()]
-    if not processed:
-        raise RuntimeError("Brak tekstu do syntezy po oczyszczeniu napisow.")
-    if empty_text_count:
-        progress(f"Napisy: pominieto puste segmenty {empty_text_count}")
-    save_srt(subtitle_path, processed)
-    lektor_delay_ms = sanitize_lektor_delay_ms(lektor_delay_ms)
+        skipped_empty_segments = [segment for segment in cleaned_segments if not segment.text.strip()]
+        empty_text_count = len(skipped_empty_segments)
+        processed = [segment for segment in cleaned_segments if segment.text.strip()]
+        if not processed:
+            raise RuntimeError("Brak tekstu do syntezy po oczyszczeniu napisow.")
+        if empty_text_count:
+            progress(f"Napisy: pominieto puste segmenty {empty_text_count}")
+        save_srt(subtitle_path, processed)
+        lektor_delay_ms = sanitize_lektor_delay_ms(lektor_delay_ms)
 
     progress(f"{engine_id}: {len(processed)} segmentow")
     quality_controls = _quality_controls_summary(engine_id, config, ffmpeg_present=find_ffmpeg(paths) is not None)
     progress(f"Lancuch TTS: {_quality_chain_label(quality_controls)}")
     _emit_file_progress(progress, "tts", 0.0, "Generowanie segmentow TTS")
-    if engine_id == "edge":
-        generation = _generate_edge(processed, segments_dir, config, paths, lektor_dir, progress, cancel_requested)
-    elif engine_id == "openai":
-        generation = _generate_openai(processed, segments_dir, config, paths, lektor_dir, progress, cancel_requested)
-    else:
-        generation = _generate_local(
-            processed,
-            source_path,
-            engine_id,
-            segments_dir,
-            lektor_dir,
-            config,
-            dictionary,
-            paths,
-            manager,
-            progress,
-            cancel_requested,
-        )
+    with timings.measure("TTS"):
+        if engine_id == "edge":
+            generation = _generate_edge(processed, segments_dir, config, paths, lektor_dir, progress, cancel_requested)
+        elif engine_id == "openai":
+            generation = _generate_openai(processed, segments_dir, config, paths, lektor_dir, progress, cancel_requested)
+        else:
+            generation = _generate_local(
+                processed,
+                source_path,
+                engine_id,
+                segments_dir,
+                lektor_dir,
+                config,
+                dictionary,
+                paths,
+                manager,
+                progress,
+                cancel_requested,
+            )
     generated_segments = generation.generated_segments
     generation_seconds = generation.generation_seconds
     segment_analysis = generation.segment_analysis
@@ -330,21 +364,22 @@ def _run_tts_job_prepared(
 
     qc_warning_count = 0
     ffmpeg_for_qc = find_ffmpeg(paths)
-    if ffmpeg_for_qc is not None:
+    if _should_run_final_audio_qc(diagnostics, ffmpeg_present=ffmpeg_for_qc is not None):
         _emit_file_progress(progress, "audio_qc", 0.0, "Audio QC")
         progress("Audio QC: analiza segmentow")
-        qc_results = analyze_generated_segments(
-            ffmpeg_for_qc,
-            generated_segments,
-            processed,
-            lektor_dir / "audio_qc.csv",
-            lektor_dir / "temp_qc",
-            cancel_requested=cancel_requested,
-        )
+        with timings.measure("Audio QC"):
+            qc_results = analyze_generated_segments(
+                ffmpeg_for_qc,
+                generated_segments,
+                processed,
+                lektor_dir / "audio_qc.csv",
+                lektor_dir / "temp_qc",
+                cancel_requested=cancel_requested,
+            )
         qc_warning_count = sum(1 for result in qc_results if result.warnings)
         progress(summarize_audio_qc(qc_results))
         _emit_file_progress(progress, "audio_qc", 1.0, "Audio QC")
-    else:
+    elif ffmpeg_for_qc is None and (diagnostics.get("save_run_reports") or diagnostics.get("save_quality_report")):
         progress("Audio QC: pominieto, brak ffmpeg")
 
     lektor_wav_path: Path | None = None
@@ -367,14 +402,15 @@ def _run_tts_job_prepared(
         timeline_segments = apply_lektor_delay_to_segments(generated_segments, lektor_delay_ms)
         if lektor_delay_ms:
             progress(f"Synchronizacja: przesuniecie lektora {_format_signed_duration_ms(lektor_delay_ms)}")
-        timeline_stats = build_lektor_wav(
-            ffmpeg,
-            timeline_segments,
-            lektor_before_normalization_path,
-            lektor_dir / "temp_wav",
-            minimum_duration_s=minimum_timeline_duration,
-            cancel_requested=cancel_requested,
-        )
+        with timings.measure("Skladanie audio"):
+            timeline_stats = build_lektor_wav(
+                ffmpeg,
+                timeline_segments,
+                lektor_before_normalization_path,
+                lektor_dir / "temp_wav",
+                minimum_duration_s=minimum_timeline_duration,
+                cancel_requested=cancel_requested,
+            )
         if timeline_stats.shifted_count:
             progress(f"Synchronizacja: opozniono {timeline_stats.shifted_count} kwestii, max +{_format_duration_ms(timeline_stats.max_shift_ms)}")
         else:
@@ -386,40 +422,45 @@ def _run_tts_job_prepared(
         lektor_wav_path = lektor_dir / "lektor_po_normalizacji.wav"
         _emit_file_progress(progress, "normalization", 0.0, "Normalizacja sciezki lektora")
         progress(f"Normalizacja sciezki lektora: cel {int(lektor_lufs)} LUFS")
-        normalize_lektor_wav(
-            ffmpeg,
-            lektor_before_normalization_path,
-            lektor_wav_path,
-            lektor_lufs,
-            progress_callback=lambda ratio: _emit_file_progress(progress, "normalization", ratio, "Normalizacja sciezki lektora"),
-            cancel_requested=cancel_requested,
-        )
+        with timings.measure("Normalizacja"):
+            normalize_lektor_wav(
+                ffmpeg,
+                lektor_before_normalization_path,
+                lektor_wav_path,
+                lektor_lufs,
+                progress_callback=lambda ratio: _emit_file_progress(progress, "normalization", ratio, "Normalizacja sciezki lektora"),
+                cancel_requested=cancel_requested,
+            )
         lektor_after_diagnostics = _safe_wav_diagnostics(lektor_wav_path)
         if lektor_after_diagnostics:
             progress(f"Po normalizacji: {_format_wav_diagnostics(lektor_after_diagnostics)}")
-        lektor_m4a_path = lektor_dir / "lektor_sciezka_audio.m4a"
-        _emit_file_progress(progress, "encoding", 0.0, "Kodowanie AAC")
-        progress(f"Kodowanie sciezki lektora: AAC {aac_bitrate}, 48 kHz")
-        encode_wav_to_aac(
-            ffmpeg,
-            lektor_wav_path,
-            lektor_m4a_path,
-            aac_bitrate,
-            progress_callback=lambda ratio: _emit_file_progress(progress, "encoding", ratio, "Kodowanie AAC"),
-            duration_seconds=minimum_timeline_duration,
-            cancel_requested=cancel_requested,
-        )
-        _emit_file_progress(progress, "encoding", 1.0, "Kodowanie AAC")
-        encoded_lektor_m4a_path = lektor_m4a_path
-        ffprobe_for_encoded = find_ffprobe(paths)
-        if ffprobe_for_encoded is not None:
-            lektor_encoded_duration = probe_media_duration(ffprobe_for_encoded, lektor_m4a_path)
-            lektor_encoded_audio_streams = probe_audio_streams(ffprobe_for_encoded, lektor_m4a_path)
-            progress(
-                f"Audio lektora AAC: {_format_duration_seconds(lektor_encoded_duration)}, "
-                f"{audio_stream_summary(lektor_encoded_audio_streams[0] if lektor_encoded_audio_streams else None)}"
-            )
-        progress(f"Audio lektora: {lektor_m4a_path.name}")
+        if _should_encode_standalone_lektor_audio(source_path, diagnostics):
+            lektor_m4a_path = lektor_dir / "lektor_sciezka_audio.m4a"
+            _emit_file_progress(progress, "encoding", 0.0, "Kodowanie AAC")
+            progress(f"Kodowanie sciezki lektora: AAC {aac_bitrate}, 48 kHz")
+            with timings.measure("Kodowanie AAC"):
+                encode_wav_to_aac(
+                    ffmpeg,
+                    lektor_wav_path,
+                    lektor_m4a_path,
+                    aac_bitrate,
+                    progress_callback=lambda ratio: _emit_file_progress(progress, "encoding", ratio, "Kodowanie AAC"),
+                    duration_seconds=minimum_timeline_duration,
+                    cancel_requested=cancel_requested,
+                )
+            _emit_file_progress(progress, "encoding", 1.0, "Kodowanie AAC")
+            encoded_lektor_m4a_path = lektor_m4a_path
+            ffprobe_for_encoded = find_ffprobe(paths)
+            if ffprobe_for_encoded is not None:
+                lektor_encoded_duration = probe_media_duration(ffprobe_for_encoded, lektor_m4a_path)
+                lektor_encoded_audio_streams = probe_audio_streams(ffprobe_for_encoded, lektor_m4a_path)
+                progress(
+                    f"Audio lektora AAC: {_format_duration_seconds(lektor_encoded_duration)}, "
+                    f"{audio_stream_summary(lektor_encoded_audio_streams[0] if lektor_encoded_audio_streams else None)}"
+                )
+            progress(f"Audio lektora: {lektor_m4a_path.name}")
+        else:
+            progress("Audio lektora AAC: pominieto, wynikowy film uzywa sciezki WAV bezposrednio")
     else:
         progress("Sciezka lektora: pominieto, brak ffmpeg")
 
@@ -453,24 +494,25 @@ def _run_tts_job_prepared(
         progress("Remux MKV: MKVToolNix")
         progress(f"Dodawanie sciezki lektora do MKV: {output_track_label}")
         _emit_file_progress(progress, "mux", 0.0, "Dodawanie do MKV")
-        mux_lektor_track(
-            ffmpeg,
-            ffprobe,
-            source_path,
-            lektor_wav_path,
-            output_video_path,
-            f"{APP_NAME} {engine_id}",
-            lektor_weight=lektor_weight,
-            background_lufs=background_lufs,
-            background_weight=background_weight,
-            bitrate=aac_bitrate,
-            create_stereo_for_surround=create_stereo_for_surround,
-            diagnostic_dir=lektor_dir,
-            keep_mixing_steps=diagnostics["save_audio_mix_steps"],
-            mkvmerge=mkvmerge,
-            progress_callback=lambda ratio: _emit_file_progress(progress, "mux", ratio, "Dodawanie do MKV"),
-            cancel_requested=cancel_requested,
-        )
+        with timings.measure("Miks MKV"):
+            mux_lektor_track(
+                ffmpeg,
+                ffprobe,
+                source_path,
+                lektor_wav_path,
+                output_video_path,
+                f"{APP_NAME} {engine_id}",
+                lektor_weight=lektor_weight,
+                background_lufs=background_lufs,
+                background_weight=background_weight,
+                bitrate=aac_bitrate,
+                create_stereo_for_surround=create_stereo_for_surround,
+                diagnostic_dir=lektor_dir,
+                keep_mixing_steps=diagnostics["save_audio_mix_steps"],
+                mkvmerge=mkvmerge,
+                progress_callback=lambda ratio: _emit_file_progress(progress, "mux", ratio, "Dodawanie do MKV"),
+                cancel_requested=cancel_requested,
+            )
         _emit_file_progress(progress, "mux", 1.0, "Dodawanie do MKV")
         output_audio_streams = probe_audio_streams(ffprobe, output_video_path)
         progress(_format_output_audio_message(output_audio_streams, surround_label, create_stereo_track))
@@ -480,106 +522,112 @@ def _run_tts_job_prepared(
             _unlink_if_file(lektor_m4a_path)
             lektor_m4a_path = None
 
-    analysis_path = _run_report_path(lektor_dir, output_stem, "analysis")
-    analysis_payload = _build_run_analysis(
-        source_path=source_path,
-        input_subtitle_path=input_subtitle_path,
-        engine_id=engine_id,
-        output_stem=output_stem,
-        run_started_at=run_started_at,
-        segments=processed,
-        segment_analysis=segment_analysis,
-        config=config,
-        dictionary=dictionary,
-        quality_controls=quality_controls,
-        generation_seconds=generation_seconds,
-        pipeline_seconds=perf_counter() - job_started,
-        aac_bitrate=aac_bitrate,
-        lektor_lufs=lektor_lufs,
-        lektor_weight=lektor_weight,
-        background_lufs=background_lufs,
-        background_weight=background_weight,
-        lektor_delay_ms=lektor_delay_ms,
-        create_stereo_for_surround=create_stereo_for_surround,
-        diagnostics=diagnostics,
-        source_duration=source_duration,
-        source_audio_streams=source_audio_streams,
-        lektor_before_diagnostics=lektor_before_diagnostics,
-        lektor_after_diagnostics=lektor_after_diagnostics,
-        lektor_encoded_duration=lektor_encoded_duration,
-        lektor_encoded_audio_streams=lektor_encoded_audio_streams,
-    )
-    write_run_summary(analysis_path, analysis_payload)
+    analysis_path: Path | None = None
     if diagnostics["save_quality_report"]:
+        analysis_path = _run_report_path(lektor_dir, output_stem, "analysis")
+        analysis_payload = _build_run_analysis(
+            source_path=source_path,
+            input_subtitle_path=input_subtitle_path,
+            engine_id=engine_id,
+            output_stem=output_stem,
+            run_started_at=run_started_at,
+            segments=processed,
+            segment_analysis=segment_analysis,
+            config=config,
+            dictionary=dictionary,
+            quality_controls=quality_controls,
+            generation_seconds=generation_seconds,
+            pipeline_seconds=perf_counter() - job_started,
+            aac_bitrate=aac_bitrate,
+            lektor_lufs=lektor_lufs,
+            lektor_weight=lektor_weight,
+            background_lufs=background_lufs,
+            background_weight=background_weight,
+            lektor_delay_ms=lektor_delay_ms,
+            create_stereo_for_surround=create_stereo_for_surround,
+            diagnostics=diagnostics,
+            source_duration=source_duration,
+            source_audio_streams=source_audio_streams,
+            lektor_before_diagnostics=lektor_before_diagnostics,
+            lektor_after_diagnostics=lektor_after_diagnostics,
+            lektor_encoded_duration=lektor_encoded_duration,
+            lektor_encoded_audio_streams=lektor_encoded_audio_streams,
+        )
+        write_run_summary(analysis_path, analysis_payload)
         progress("Raport jakosci: zapisano")
 
-    summary_path = _run_report_path(lektor_dir, output_stem, "summary")
-    _emit_file_progress(progress, "summary", 0.5, "Podsumowanie przebiegu")
     pipeline_seconds = perf_counter() - job_started
-    write_run_summary(
-        summary_path,
-        {
-            "report_type": "summary",
-            "run_id": output_stem,
-            "run_timestamp": run_started_at.isoformat(timespec="seconds"),
-            "source_filename": source_path.name,
-            "source_stem": source_path.stem,
-            "tts_engine_short": engine_short_code(engine_id),
-            "llm_analysis_hint": "To skrot przebiegu. Do oceny jakosci ustawien TTS uzyj raportu jakosci, bo zawiera segmenty, proby, score i retry.",
-            "app_name": APP_NAME,
-            "app_version": APP_VERSION,
-            "source_path": str(source_path),
-            "source_name": source_path.name,
-            "input_subtitle_path": str(input_subtitle_path),
-            "engine_id": engine_id,
-            "output_stem": output_stem,
-            "input_segment_count": len(segments),
-            "segment_count": len(processed),
-            "skipped_empty_text_count": int(empty_text_count),
-            "dictionary_entry_count": int(len(dictionary)),
-            "generation_seconds": round(float(generation_seconds), 3),
-            "pipeline_seconds": round(float(pipeline_seconds), 3),
-            "qc_warning_count": int(qc_warning_count),
-            "quality_controls": quality_controls,
-            "audio_output": {
-                "codec": "AAC",
-                "bitrate": str(aac_bitrate),
-                "lektor_lufs": int(lektor_lufs),
-                "lektor_weight": float(lektor_weight),
-                "background_lufs": int(background_lufs),
-                "background_weight": float(background_weight),
-                "lektor_delay_ms": int(lektor_delay_ms),
-                "create_stereo_for_surround": bool(create_stereo_for_surround),
+    summary_path: Path | None = None
+    if diagnostics["save_run_reports"]:
+        summary_path = _run_report_path(lektor_dir, output_stem, "summary")
+        _emit_file_progress(progress, "summary", 0.5, "Podsumowanie przebiegu")
+        write_run_summary(
+            summary_path,
+            {
+                "report_type": "summary",
+                "run_id": output_stem,
+                "run_timestamp": run_started_at.isoformat(timespec="seconds"),
+                "source_filename": source_path.name,
+                "source_stem": source_path.stem,
+                "tts_engine_short": engine_short_code(engine_id),
+                "llm_analysis_hint": "To skrot przebiegu. Do oceny jakosci ustawien TTS uzyj raportu jakosci, bo zawiera segmenty, proby, score i retry.",
+                "app_name": APP_NAME,
+                "app_version": APP_VERSION,
+                "source_path": str(source_path),
+                "source_name": source_path.name,
+                "input_subtitle_path": str(input_subtitle_path),
+                "engine_id": engine_id,
+                "output_stem": output_stem,
+                "input_segment_count": len(segments),
+                "segment_count": len(processed),
+                "skipped_empty_text_count": int(empty_text_count),
+                "dictionary_entry_count": int(len(dictionary)),
+                "generation_seconds": round(float(generation_seconds), 3),
+                "pipeline_seconds": round(float(pipeline_seconds), 3),
+                "stage_seconds": timings.as_dict(),
+                "qc_warning_count": int(qc_warning_count),
+                "quality_controls": quality_controls,
+                "audio_output": {
+                    "codec": "AAC",
+                    "bitrate": str(aac_bitrate),
+                    "lektor_lufs": int(lektor_lufs),
+                    "lektor_weight": float(lektor_weight),
+                    "background_lufs": int(background_lufs),
+                    "background_weight": float(background_weight),
+                    "lektor_delay_ms": int(lektor_delay_ms),
+                    "create_stereo_for_surround": bool(create_stereo_for_surround),
+                },
+                "diagnostic_keep": diagnostics,
+                "audio_diagnostics": {
+                    "source_duration_s": round(float(source_duration or 0.0), 3),
+                    "source_primary_audio": audio_stream_summary(selected_background_audio_stream(source_audio_streams)),
+                    "lektor_before_normalization": lektor_before_diagnostics or {},
+                    "lektor_after_normalization": lektor_after_diagnostics or {},
+                    "lektor_encoded_duration_s": round(float(lektor_encoded_duration or 0.0), 3),
+                    "lektor_encoded_audio": audio_stream_summary(lektor_encoded_audio_streams[0] if lektor_encoded_audio_streams else None),
+                },
+                "workspace": str(workspace),
+                "files": {
+                    "subtitle": rel_path(subtitle_path, workspace),
+                    "manifest": rel_path(manifest_path, workspace),
+                    "skipped_segments": rel_path(skipped_manifest_path, workspace),
+                    "audio_qc": rel_path(lektor_dir / "audio_qc.csv", workspace) if (lektor_dir / "audio_qc.csv").exists() else "",
+                    "run_analysis": rel_path(analysis_path, workspace) if analysis_path is not None else "",
+                    "lektor_przed_normalizacja": rel_path_if_exists(lektor_before_normalization_path, workspace),
+                    "lektor_wav": rel_path_if_exists(lektor_wav_path, workspace),
+                    "lektor_po_normalizacji": rel_path_if_exists(lektor_wav_path, workspace),
+                    "lektor_m4a": rel_path_if_exists(lektor_m4a_path, workspace),
+                    "lektor_m4a_encoded": rel_path(encoded_lektor_m4a_path, workspace),
+                    "audio_tlo_zrodlowe": rel_path_if_exists(audio_mix_stage_files.get("source_audio"), workspace),
+                    "audio_pl_2_0": rel_path_if_exists(audio_mix_stage_files.get("pl_2_0"), workspace),
+                    "audio_pl_5_1": rel_path_if_exists(audio_mix_stage_files.get("pl_5_1"), workspace),
+                    "audio_pl_7_1": rel_path_if_exists(audio_mix_stage_files.get("pl_7_1"), workspace),
+                    "output_video": rel_path(output_video_path, workspace),
+                },
             },
-            "diagnostic_keep": diagnostics,
-            "audio_diagnostics": {
-                "source_duration_s": round(float(source_duration or 0.0), 3),
-                "source_primary_audio": audio_stream_summary(selected_background_audio_stream(source_audio_streams)),
-                "lektor_before_normalization": lektor_before_diagnostics or {},
-                "lektor_after_normalization": lektor_after_diagnostics or {},
-                "lektor_encoded_duration_s": round(float(lektor_encoded_duration or 0.0), 3),
-                "lektor_encoded_audio": audio_stream_summary(lektor_encoded_audio_streams[0] if lektor_encoded_audio_streams else None),
-            },
-            "workspace": str(workspace),
-            "files": {
-                "subtitle": rel_path(subtitle_path, workspace),
-                "manifest": rel_path(manifest_path, workspace),
-                "skipped_segments": rel_path(skipped_manifest_path, workspace),
-                "audio_qc": rel_path(lektor_dir / "audio_qc.csv", workspace) if (lektor_dir / "audio_qc.csv").exists() else "",
-                "run_analysis": rel_path(analysis_path, workspace) if diagnostics["save_quality_report"] else "",
-                "lektor_przed_normalizacja": rel_path_if_exists(lektor_before_normalization_path, workspace),
-                "lektor_wav": rel_path_if_exists(lektor_wav_path, workspace),
-                "lektor_po_normalizacji": rel_path_if_exists(lektor_wav_path, workspace),
-                "lektor_m4a": rel_path_if_exists(lektor_m4a_path, workspace),
-                "lektor_m4a_encoded": rel_path(encoded_lektor_m4a_path, workspace),
-                "audio_tlo_zrodlowe": rel_path_if_exists(audio_mix_stage_files.get("source_audio"), workspace),
-                "audio_pl_2_0": rel_path_if_exists(audio_mix_stage_files.get("pl_2_0"), workspace),
-                "audio_pl_5_1": rel_path_if_exists(audio_mix_stage_files.get("pl_5_1"), workspace),
-                "audio_pl_7_1": rel_path_if_exists(audio_mix_stage_files.get("pl_7_1"), workspace),
-                "output_video": rel_path(output_video_path, workspace),
-            },
-        },
-    )
+        )
+    for timing_line in timings.summary_lines():
+        progress(timing_line)
     if diagnostics["save_run_reports"]:
         progress("Podsumowanie przebiegu: zapisano")
     _emit_file_progress(progress, "done", 1.0, "Aktualny plik gotowy")
@@ -671,6 +719,18 @@ def _diagnostic_keep_flags(config: dict, keep_all_legacy: bool = False) -> dict[
     if keep_all_legacy:
         return {key: True for key in keys}
     return {key: _bool_config(config.get(key), False) for key in keys}
+
+
+def _should_run_final_audio_qc(diagnostics: dict[str, bool], ffmpeg_present: bool) -> bool:
+    if not ffmpeg_present:
+        return False
+    return bool(diagnostics.get("save_run_reports") or diagnostics.get("save_quality_report"))
+
+
+def _should_encode_standalone_lektor_audio(source_path: Path, diagnostics: dict[str, bool]) -> bool:
+    if not is_video_file(source_path):
+        return True
+    return bool(diagnostics.get("save_audio_mix_steps", False))
 
 
 def _cleanup_successful_video_run(
@@ -1150,7 +1210,7 @@ def _generate_edge_with_retry(
                 break
             if audio_attempt < audio_limit:
                 retry_summary.record_audio_retry(ordinal)
-                progress(_format_short_qc_retry_message("Edge", "kontrola audio", ordinal, total_segments, audio_attempt + 1, audio_limit))
+                progress(_format_short_qc_retry_message("Edge", "kontrola audio", ordinal, total_segments, audio_attempt + 1, audio_limit, score=score))
         score = audio_best_score
         warnings = audio_best_warnings
         whisper_similarity = None
@@ -1181,7 +1241,7 @@ def _generate_edge_with_retry(
             break
         if speech_attempt < speech_limit and candidate_no < len(retry_texts):
             retry_summary.record_speech_retry(ordinal)
-            progress(_format_short_qc_retry_message("Edge", "kontrola mowy", ordinal, total_segments, speech_attempt + 1, speech_limit))
+            progress(_format_short_qc_retry_message("Edge", "kontrola mowy", ordinal, total_segments, speech_attempt + 1, speech_limit, score=score))
     _mark_selected_attempt(attempt_details, best_attempt)
     return best_path, _builtin_segment_analysis(segment, best_path, attempt_details, best_attempt, best_score, best_warnings, best_whisper_text, best_whisper_similarity)
 
@@ -1394,7 +1454,7 @@ def _generate_openai_with_retry(
                 break
             if audio_attempt < audio_limit:
                 retry_summary.record_audio_retry(ordinal)
-                progress(_format_short_qc_retry_message("OpenAI", "kontrola audio", ordinal, total_segments, audio_attempt + 1, audio_limit))
+                progress(_format_short_qc_retry_message("OpenAI", "kontrola audio", ordinal, total_segments, audio_attempt + 1, audio_limit, score=score))
         score = audio_best_score
         warnings = audio_best_warnings
         whisper_similarity = None
@@ -1425,7 +1485,7 @@ def _generate_openai_with_retry(
             break
         if speech_attempt < speech_limit:
             retry_summary.record_speech_retry(ordinal)
-            progress(_format_short_qc_retry_message("OpenAI", "kontrola mowy", ordinal, total_segments, speech_attempt + 1, speech_limit))
+            progress(_format_short_qc_retry_message("OpenAI", "kontrola mowy", ordinal, total_segments, speech_attempt + 1, speech_limit, score=score))
     _mark_selected_attempt(attempt_details, best_attempt)
     return best_path, _builtin_segment_analysis(segment, best_path, attempt_details, best_attempt, best_score, best_warnings, best_whisper_text, best_whisper_similarity)
 
@@ -1706,9 +1766,13 @@ def _format_short_qc_retry_message(
     total_segments: int,
     next_attempt: int,
     retry_attempts: int,
+    score: int | None = None,
 ) -> str:
     module_name = "Audio QC" if "audio" in str(label).lower() else "Whisper QC"
-    return f"{module_name} - segment {ordinal}/{total_segments}, proba {next_attempt}/{retry_attempts}"
+    message = f"{module_name} - segment {ordinal}/{total_segments}, proba {next_attempt}/{retry_attempts}"
+    if score is not None:
+        message += f", score: {score}"
+    return message
 
 
 def _format_polish_count(count: int, singular: str, few: str, many: str) -> str:

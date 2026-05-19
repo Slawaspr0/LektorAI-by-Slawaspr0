@@ -162,7 +162,7 @@ class EngineManager:
         cache_key = str(python_path)
         devices = self._cuda_device_cache.get(cache_key)
         if devices is None:
-            devices = detect_cuda_devices(python_path)
+            devices = detect_cuda_devices(python_path, prefer_nvidia_smi=True)
             self._cuda_device_cache[cache_key] = devices
         return build_device_choices(devices, include_auto=include_auto)
 
@@ -221,7 +221,7 @@ class EngineManager:
             "Pakiety:",
             ]
         )
-        lines.extend(f"  {requirement}" for requirement in spec.requirements)
+        lines.extend(f"  {requirement}" for requirement in self._resolved_requirements(spec))
         if spec.no_deps_requirements:
             lines.append("Pakiety bez zaleznosci:")
             lines.extend(f"  {requirement}" for requirement in spec.no_deps_requirements)
@@ -243,7 +243,7 @@ class EngineManager:
         requirements_path = engine_dir / "requirements.txt"
         no_deps_requirements_path = engine_dir / "requirements.no-deps.txt"
         constraints_path = engine_dir / "constraints.txt"
-        requirements_path.write_text("\n".join(spec.requirements) + "\n", encoding="utf-8")
+        requirements_path.write_text("\n".join(self._resolved_requirements(spec)) + "\n", encoding="utf-8")
         if spec.no_deps_requirements:
             no_deps_requirements_path.write_text("\n".join(spec.no_deps_requirements) + "\n", encoding="utf-8")
         elif no_deps_requirements_path.exists():
@@ -271,6 +271,14 @@ class EngineManager:
                 log,
                 env=install_env,
             )
+            if spec.package_installer == "uv":
+                self._emit(progress, f"TTS {engine_id}: przygotowanie instalatora pakietow")
+                self._run_logged_step(
+                    "Przygotowanie uv",
+                    self._uv_bootstrap_command(venv_python),
+                    log,
+                    env=install_env,
+                )
             if spec.torch_requirements:
                 self._emit(progress, f"TTS {engine_id}: instalacja PyTorch")
                 self._run_logged_step(
@@ -837,9 +845,44 @@ class EngineManager:
             str(constraints_path),
         ]
 
+    def _resolved_requirements(self, spec) -> tuple[str, ...]:
+        requirements = list(spec.requirements)
+        if not getattr(spec, "local_repo_folder", ""):
+            return tuple(requirements)
+        source = self._editable_source_requirement(spec)
+        if requirements:
+            requirements[0] = source
+        else:
+            requirements.append(source)
+        return tuple(requirements)
+
+    def _editable_source_requirement(self, spec) -> str:
+        extra = str(getattr(spec, "editable_extra", "") or "").strip()
+        extra_suffix = f"[{extra}]" if extra else ""
+        local_folder = str(getattr(spec, "local_repo_folder", "") or "").strip()
+        if local_folder:
+            seen_bases: set[Path] = set()
+            for base in (self.paths.app_dir.parent, *self.paths.app_dir.parents):
+                if base in seen_bases:
+                    continue
+                seen_bases.add(base)
+                repo_dir = base / "repo" / local_folder
+                if repo_dir.is_dir():
+                    return f"-e {repo_dir.as_posix()}{extra_suffix}"
+        git_url = str(getattr(spec, "editable_git_url", "") or "").strip()
+        if git_url:
+            egg_name = str(getattr(spec, "requirements", ("",))[0] or spec.engine_id).split("[", 1)[0].strip()
+            return f"-e git+{git_url}#egg={egg_name}{extra_suffix}"
+        return str(spec.requirements[0] if spec.requirements else "")
+
     def _package_install_command(self, python_path: Path, spec, requirements_path: Path, constraints_path: Path, engine_dir: Path) -> list[str]:
-        if spec.package_installer == "uv" and self._uv_available():
-            return self._uv_requirements_install_command(python_path, requirements_path, constraints_path)
+        if spec.package_installer == "uv":
+            return self._uv_requirements_install_command(
+                python_path,
+                requirements_path,
+                constraints_path,
+                use_overrides=bool(spec.constraints),
+            )
         return self._requirements_install_command(python_path, requirements_path, constraints_path)
 
     def _no_deps_requirements_install_command(self, python_path: Path, requirements_path: Path) -> list[str]:
@@ -860,12 +903,21 @@ class EngineManager:
         ]
 
     def _no_deps_package_install_command(self, python_path: Path, spec, requirements_path: Path, engine_dir: Path) -> list[str]:
-        if spec.package_installer == "uv" and self._uv_available():
+        if spec.package_installer == "uv":
             return self._uv_no_deps_requirements_install_command(python_path, requirements_path)
         return self._no_deps_requirements_install_command(python_path, requirements_path)
 
-    def _uv_requirements_install_command(self, python_path: Path, requirements_path: Path, constraints_path: Path) -> list[str]:
-        return [
+    def _uv_requirements_install_command(
+        self,
+        python_path: Path,
+        requirements_path: Path,
+        constraints_path: Path,
+        *,
+        use_overrides: bool = False,
+    ) -> list[str]:
+        command = [
+            str(python_path),
+            "-m",
             "uv",
             "pip",
             "install",
@@ -876,9 +928,14 @@ class EngineManager:
             "-c",
             str(constraints_path),
         ]
+        if use_overrides:
+            command.extend(["--overrides", str(constraints_path)])
+        return command
 
     def _uv_no_deps_requirements_install_command(self, python_path: Path, requirements_path: Path) -> list[str]:
         return [
+            str(python_path),
+            "-m",
             "uv",
             "pip",
             "install",
@@ -890,19 +947,28 @@ class EngineManager:
         ]
 
     def _package_install_env(self, spec, engine_dir: Path, pip_env: dict[str, str], log) -> dict[str, str]:
-        if spec.package_installer == "uv" and self._uv_available():
+        if spec.package_installer == "uv":
             env = dict(pip_env)
             uv_cache_dir = engine_dir / "temp" / "uv-cache"
             uv_cache_dir.mkdir(parents=True, exist_ok=True)
             env["UV_CACHE_DIR"] = str(uv_cache_dir)
             return env
-        if spec.package_installer == "uv":
-            log.write("Instalator uv nie jest dostepny, uzywam pip.\n")
-            log.flush()
         return pip_env
 
-    def _uv_available(self) -> bool:
-        return shutil.which("uv") is not None
+    def _uv_bootstrap_command(self, python_path: Path) -> list[str]:
+        return [
+            str(python_path),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--retries",
+            "2",
+            "--timeout",
+            "30",
+            "--prefer-binary",
+            "uv",
+        ]
 
     def _build_tools_install_command(self, python_path: Path) -> list[str]:
         return [
